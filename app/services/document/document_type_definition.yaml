@@ -1,0 +1,1408 @@
+openapi: 3.1.0
+info:
+  title: Document Definition Management API
+  version: 1.0.0
+servers:
+- url: /api/v1
+tags:
+- name: DocumentTypeDefinition
+  description: 文档类型定义管理（唯一写入入口）
+- name: DocumentProcessorDefinition
+  description: 文件前处理定义查询（只读）
+- name: DocumentRetrievalDefinition
+  description: 检索定义查询（只读）
+- name: Documents
+  description: 文档运行时管理
+- name: Document Chunks
+  description: 文档 Chunk 管理
+paths:
+  /documents:
+    get:
+      tags:
+      - Documents
+      summary: List documents
+      operationId: listDocuments
+      description: 'Paginated document list for the document management table.
+
+        keyword matches title / document_key (case-insensitive contains).
+
+        Sorted by created_at descending.
+
+        '
+      parameters:
+      - name: keyword
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: status
+        in: query
+        required: false
+        schema:
+          type: string
+          enum:
+          - active
+          - deleted
+      - name: page
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          default: 1
+      - name: page_size
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 20
+      responses:
+        '200':
+          description: Document list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListDocumentsResponse'
+  /documents/{document_id}:
+    get:
+      tags:
+      - Documents
+      summary: Get Document detail
+      operationId: getDocument
+      description: 'Main endpoint used by the document detail page.
+
+
+        The response includes the Document itself, the current version,
+
+        historical versions, per-version processing status, processor/index
+
+        status, and the Canonical Chunk IDs needed by the frontend.
+
+
+        The frontend does not need a separate version-detail endpoint merely
+
+        to switch between versions.
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/document_id'
+      - name: version_id
+        in: query
+        required: false
+        description: '前端在版本下拉框切换时传入，用于重载该版本的处理器状态
+
+          与 Canonical Chunk。必须属于该 Document，否则回落到
+
+          当前生效版本（current_document_version_id）。
+
+          '
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Document detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentDetail'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Document not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    put:
+      tags:
+      - Documents
+      summary: Update a Document by appending a new version
+      operationId: updateDocument
+      parameters:
+      - $ref: '#/components/parameters/document_id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDocumentRequest'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateDocumentResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /document-chunks:
+    get:
+      tags:
+      - Document Chunks
+      summary: List Document Chunks
+      operationId: listDocumentChunks
+      description: 'Query DocumentChunk resources using optional filters.
+
+
+        document_version_id and document_processor_definition_id are query filters,
+
+        not hierarchical authorization parameters.
+
+
+        When only document_version_id is supplied, the frontend can use the
+
+        result for the standard Canonical DocumentChunk dataset.
+
+
+        The API itself does not validate or expose a canonical/non-canonical
+
+        decision as part of the resource lookup contract.
+
+        '
+      parameters:
+      - name: document_version_id
+        in: query
+        required: false
+        description: DocumentVersion database ID used as a query filter.
+        schema:
+          type: string
+          format: uuid
+      - name: document_processor_definition_id
+        in: query
+        required: false
+        description: ProcessorDefinition database ID used as a query filter.
+        schema:
+          type: string
+          format: uuid
+      - name: chunk_index
+        in: query
+        required: false
+        description: Exact chunk_index filter.
+        schema:
+          type: integer
+          minimum: 0
+      - name: keyword
+        in: query
+        required: false
+        description: Keyword filter against chunk content.
+        schema:
+          type: string
+      - name: page
+        in: query
+        required: false
+        description: Page number, starting from 1.
+        schema:
+          type: integer
+          minimum: 1
+          default: 1
+      - name: page_size
+        in: query
+        required: false
+        description: Number of items per page.
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 50
+      responses:
+        '200':
+          description: Chunk list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentChunkListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /document-chunks/{document_chunk_id}:
+    get:
+      tags:
+      - Document Chunks
+      summary: Get a DocumentChunk by ID
+      operationId: getDocumentChunk
+      description: 'Returns one DocumentChunk using only document_chunk_id.
+
+
+        The endpoint does not require document_id, document_version_id,
+
+        or document_processor_definition_id to be supplied by the caller.
+
+        Ownership and permission checks are performed by the backend.
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/document_chunk_id'
+      responses:
+        '200':
+          description: DocumentChunk detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentChunk'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: DocumentChunk not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /document-type-definitions:
+    get:
+      tags:
+      - DocumentTypeDefinition
+      summary: List document type definitions
+      operationId: listDocumentTypeDefinitions
+      parameters:
+      - name: tenant_id
+        in: query
+        schema: &id004
+          type: string
+          format: uuid
+      - name: modality_type
+        in: query
+        schema:
+          $ref: '#/components/schemas/ModalityType'
+      - name: keyword
+        in: query
+        schema:
+          type: string
+      - &id005
+        name: status
+        in: query
+        schema:
+          $ref: '#/components/schemas/DefinitionStatus'
+      - &id006
+        name: include_deleted
+        in: query
+        schema:
+          type: boolean
+          default: false
+      - &id007
+        name: page
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          default: 1
+      - &id008
+        name: page_size
+        in: query
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 20
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentTypeDefinitionListResponse'
+    post:
+      tags:
+      - DocumentTypeDefinition
+      summary: Create document type definition
+      operationId: createDocumentTypeDefinition
+      description: '创建类型定义，并级联创建 processors / retrievals / bindings。
+
+
+        子项按自然键识别（processor 用 file_extension，retrieval 用 retrieval_type），创建时不需要子项 id。
+
+        bindings 用下标引用同一次 payload 中的这两个数组。'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentTypeDefinitionCreateRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentTypeDefinitionDetailResponse'
+        '400': &id001
+          description: '级联校验失败。details 中给出具体位置，例如：
+
+            "bindings[2].retrieval_type": "graph 不在 retrievals 中"
+
+            "processors[1].file_extension": "与 processors[0] 重复"'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409': &id003
+          $ref: '#/components/responses/Conflict'
+  /document-type-definitions/{document_type_definition_id}:
+    get:
+      tags:
+      - DocumentTypeDefinition
+      summary: Get document type definition
+      operationId: getDocumentTypeDefinition
+      parameters:
+      - $ref: '#/components/parameters/DocumentTypeDefinitionId'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentTypeDefinitionDetailResponse'
+        '404': &id002
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags:
+      - DocumentTypeDefinition
+      summary: Update document type definition
+      operationId: updateDocumentTypeDefinition
+      description: '级联全量替换。
+
+
+        **子项语义 = 完全替换**：payload 中出现的子项即其最终状态，未出现在 payload 中的既有子项会被软删除；父级顶层字段仍为部分更新（未提供则保持不变）。
+
+
+        **子项按自然键识别**（processor 用 file_extension，retrieval 用 retrieval_type），不传子项 id。因此创建与更新使用同一套 payload
+        结构。
+
+
+        **bindings 用下标引用同一次 payload 中的子项**：
+
+        - bindings[].processor_index 必须落在 processors 范围内
+
+        - bindings[].retrieval_index 必须落在 retrievals 范围内
+
+        - (processor_index, retrieval_index) 不可重复
+
+        - 因此 bindings 必须与 processors / retrievals 一起提交，单独提交会被拒绝
+
+        违反时返回 400，details 指明具体下标。
+
+
+        **乐观锁**：更新必须回传 GET 得到的 revision，不匹配返回 409。'
+      parameters:
+      - $ref: '#/components/parameters/DocumentTypeDefinitionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentTypeDefinitionUpdateRequest'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentTypeDefinitionDetailResponse'
+        '400': *id001
+        '404': *id002
+        '409': *id003
+    delete:
+      tags:
+      - DocumentTypeDefinition
+      summary: Soft delete document type definition
+      operationId: deleteDocumentTypeDefinition
+      description: 逻辑删除该类型定义及其全部子项。不物理删除。
+      parameters:
+      - $ref: '#/components/parameters/DocumentTypeDefinitionId'
+      responses:
+        '204':
+          description: Deleted
+        '404': *id002
+  /document-processors:
+    get:
+      tags:
+      - DocumentProcessorDefinition
+      summary: List document-processors
+      operationId: listDocumentProcessors
+      description: 扁平列表。按所属类型过滤请用 query 参数 document_type_definition_id，而不是路径嵌套。
+      parameters:
+      - name: document_type_definition_id
+        in: query
+        description: 按所属 DocumentTypeDefinition 过滤
+        schema: *id004
+      - name: file_extension
+        in: query
+        schema:
+          type: string
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentProcessorDefinitionListResponse'
+  /document-processors/{document_processor_definition_id}:
+    get:
+      tags:
+      - DocumentProcessorDefinition
+      summary: Get a processor_definition by ID
+      operationId: getDocumentProcessor
+      description: 扁平读取。资源归属由响应中的 document_type_definition_id 给出，鉴权需从子行反查父级。
+      parameters:
+      - $ref: '#/components/parameters/ProcessorDefinitionId'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentProcessorDefinitionResponse'
+        '404': *id002
+  /document-retrievals:
+    get:
+      tags:
+      - DocumentRetrievalDefinition
+      summary: List document-retrievals
+      operationId: listDocumentRetrievals
+      description: 扁平列表。按所属类型过滤请用 query 参数 document_type_definition_id，而不是路径嵌套。
+      parameters:
+      - name: document_type_definition_id
+        in: query
+        description: 按所属 DocumentTypeDefinition 过滤
+        schema: *id004
+      - name: retrieval_type
+        in: query
+        schema:
+          $ref: '#/components/schemas/RetrievalType'
+      - *id005
+      - *id006
+      - *id007
+      - *id008
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentRetrievalDefinitionListResponse'
+  /document-retrievals/{retrieval_definition_id}:
+    get:
+      tags:
+      - DocumentRetrievalDefinition
+      summary: Get a retrieval_definition by ID
+      operationId: getDocumentRetrieval
+      description: 扁平读取。资源归属由响应中的 document_type_definition_id 给出，鉴权需从子行反查父级。
+      parameters:
+      - $ref: '#/components/parameters/RetrievalDefinitionId'
+      responses:
+        '200':
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentRetrievalDefinitionResponse'
+        '404': *id002
+components:
+  parameters:
+    DocumentTypeDefinitionId:
+      name: document_type_definition_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ProcessorDefinitionId:
+      name: document_processor_definition_id
+      in: path
+      required: true
+      schema: *id004
+    document_id:
+      name: document_id
+      in: path
+      required: true
+      description: Document database ID.
+      schema:
+        type: string
+        format: uuid
+    document_chunk_id:
+      name: document_chunk_id
+      in: path
+      required: true
+      description: DocumentChunk database ID.
+      schema:
+        type: string
+        format: uuid
+    RetrievalDefinitionId:
+      name: retrieval_definition_id
+      in: path
+      required: true
+      schema: *id004
+  schemas:
+    CreateDocumentRequest:
+      type: object
+      required:
+      - file_id
+      - document_type_definition_id
+      properties:
+        file_id:
+          type: string
+          format: uuid
+          description: Already uploaded File database ID.
+        document_type_definition_id:
+          type: string
+          format: uuid
+          description: DocumentTypeDefinition database ID.
+        document_key:
+          type: string
+          maxLength: 255
+          description: Business document key.
+        title:
+          type: string
+          maxLength: 500
+          description: Document title.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Business metadata.
+        meta_data:
+          type: object
+          additionalProperties: true
+          description: 首个 DocumentVersion 的版本级 metadata。
+    CreateDocumentResponse:
+      type: object
+      required:
+      - document_id
+      - current_document_version_id
+      - status
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        current_document_version_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/DocumentStatus'
+        message:
+          type: string
+    DocumentDetail:
+      type: object
+      required:
+      - document_id
+      - tenant_id
+      - document_type_definition_id
+      - status
+      - versions
+      - canonical_chunk_ids
+      - processor_statuses
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        tenant_id:
+          type: string
+          format: uuid
+        document_key:
+          type: string
+        title:
+          type: string
+        document_type_definition_id:
+          type: string
+          format: uuid
+        current_document_version_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        status:
+          $ref: '#/components/schemas/DocumentStatus'
+        metadata:
+          type: object
+          additionalProperties: true
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentVersionSummary'
+        canonical_chunk_ids:
+          type: array
+          description: 'Canonical Chunk IDs associated with the version currently selected
+
+            by the frontend context. The frontend fetches individual chunks by
+
+            document_chunk_id.
+
+            '
+          items:
+            type: string
+            format: uuid
+        processor_statuses:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProcessorStatusSummary'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    DocumentVersionSummary:
+      type: object
+      required:
+      - document_version_id
+      - document_id
+      - version_number
+      - status
+      - meta_data
+      properties:
+        document_version_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        file_id:
+          type: string
+          format: uuid
+        version_number:
+          type: integer
+          minimum: 1
+        status:
+          $ref: '#/components/schemas/ProcessingStatus'
+        meta_data:
+          type: object
+          additionalProperties: true
+          description: 版本级业务 metadata，JSON 对象。
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    ProcessorStatusSummary:
+      type: object
+      required:
+      - document_processor_definition_id
+      - processor_key
+      - status
+      properties:
+        document_processor_definition_id:
+          type: string
+          format: uuid
+        processor_key:
+          type: string
+        version_number:
+          type: integer
+          minimum: 1
+        file_extension:
+          type: string
+          description: File suffix handled by the processor, e.g. .pdf or .md.
+        mime_type:
+          type:
+          - string
+          - 'null'
+        backend_type:
+          type:
+          - string
+          - 'null'
+          description: Actual projection/index backend type.
+        index_identifier:
+          type:
+          - string
+          - 'null'
+          description: Concrete index identifier from DocumentIndexBinding.
+        status:
+          $ref: '#/components/schemas/ProcessingStatus'
+        error_message:
+          type:
+          - string
+          - 'null'
+        is_canonical:
+          type: boolean
+          description: 'Whether this Pipeline is the Canonical Pipeline for its file extension. The frontend
+            uses it to default-select the main pipeline.
+
+            '
+    DocumentChunk:
+      type: object
+      required:
+      - document_chunk_id
+      - document_version_id
+      - document_processor_definition_id
+      - chunk_index
+      - content
+      properties:
+        document_chunk_id:
+          type: string
+          format: uuid
+        document_version_id:
+          type: string
+          format: uuid
+        document_processor_definition_id:
+          type: string
+          format: uuid
+        chunk_index:
+          type: integer
+          minimum: 0
+        content:
+          type: string
+        content_hash:
+          type:
+          - string
+          - 'null'
+        token_count:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        char_count:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        locator:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    DocumentChunkListResponse:
+      type: object
+      required:
+      - items
+      - page
+      - page_size
+      - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentChunk'
+        page:
+          type: integer
+          minimum: 1
+        page_size:
+          type: integer
+          minimum: 1
+        total:
+          type: integer
+          minimum: 0
+    DocumentStatus:
+      type: string
+      enum:
+      - active
+      - deleted
+    ProcessingStatus:
+      type: string
+      enum:
+      - pending
+      - processing
+      - completed
+      - failed
+    ErrorResponse:
+      type: object
+      required:
+      - code
+      - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+    VersionMode:
+      type: string
+      enum:
+      - versioned
+      - immutable
+    AnalysisMode:
+      type: string
+      enum:
+      - default
+      - config
+      - none
+      description: default=使用系统预制后缀名 Reader，不建 ProcessorDefinition，该类型下全部 retrieval 都参与；config=使用自定义 ProcessorDefinition，缺少匹配后缀名时不允许上传；none=不解析文件
+    ModalityType:
+      type: string
+      enum:
+      - text
+      - structured
+      - image
+      - audio
+      - video
+      - multimodal
+      description: 一个 DocumentTypeDefinition 只有一种 modality_type，创建后不可修改
+    RetrievalType:
+      type: string
+      enum:
+      - document
+      - keyword
+      - sparse_vector
+      - dense_vector
+      - graph
+    StorageBackend:
+      type: string
+      enum:
+      - postgresql
+      - elasticsearch
+      - milvus
+      - neo4j
+      description: 不传时由 retrieval_type 默认映射得到
+    DefinitionStatus:
+      type: string
+      enum:
+      - active
+      - deleted
+    DocumentListItem:
+      type: object
+      required:
+      - document_id
+      - document_type_definition_id
+      - document_type_code
+      - status
+      - created_at
+      - updated_at
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        document_type_definition_id:
+          type: string
+          format: uuid
+        document_type_code:
+          type: string
+        tenant_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        document_key:
+          type:
+          - string
+          - 'null'
+        title:
+          type:
+          - string
+          - 'null'
+        status:
+          $ref: '#/components/schemas/DocumentStatus'
+        current_version_number:
+          type:
+          - integer
+          - 'null'
+        current_version_status:
+          oneOf:
+          - $ref: '#/components/schemas/ProcessingStatus'
+          - type: 'null'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ListDocumentsResponse:
+      type: object
+      required:
+      - items
+      - page
+      - page_size
+      - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentListItem'
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+        total_pages:
+          type: integer
+    DocumentProcessorDefinitionRequest:
+      type: object
+      description: 按 file_extension 自然键识别，不传 id
+      required:
+      - file_extension
+      - loader_name
+      properties:
+        file_extension:
+          type: string
+          maxLength: 32
+          description: 同一类型下唯一，例如 .pdf
+        mime_types:
+          type: array
+          items:
+            type: string
+        loader_name:
+          type: string
+          maxLength: 128
+          description: 如 pdf_loader；该字段决定能否解析该后缀名
+        loader_config: &id009
+          type: object
+          additionalProperties: true
+        processor_name:
+          type:
+          - string
+          - 'null'
+          maxLength: 128
+        processor_config: *id009
+    DocumentRetrievalDefinitionRequest:
+      type: object
+      description: 按 retrieval_type 自然键识别，不传 id
+      required:
+      - retrieval_type
+      properties:
+        retrieval_type:
+          $ref: '#/components/schemas/RetrievalType'
+        chunker_name:
+          type:
+          - string
+          - 'null'
+          maxLength: 128
+        chunker_config: *id009
+        retriever_name:
+          type:
+          - string
+          - 'null'
+          maxLength: 128
+        retriever_config: *id009
+        storage_backend:
+          $ref: '#/components/schemas/StorageBackend'
+        storage_config: *id009
+    ProcessorRetrievalBindingRequest:
+      type: object
+      description: '用同一次 payload 中两个数组的**下标**描述一条绑定。
+
+
+        processor_index -> processors[processor_index]
+
+        retrieval_index -> retrievals[retrieval_index]
+
+
+        为什么用下标而不是自然键：绑定关系只在这份 payload 内有意义，下标不受大小写、空格、别名等匹配问题影响。
+
+
+        代价：下标是位置相关的，因此 bindings 必须与 processors / retrievals 在同一次请求中一起提交，不能单独提交。'
+      required:
+      - processor_index
+      - retrieval_index
+      properties:
+        processor_index:
+          type: integer
+          minimum: 0
+          description: processors 数组中的下标。
+        retrieval_index:
+          type: integer
+          minimum: 0
+          description: retrievals 数组中的下标。
+    DocumentTypeDefinitionCreateRequest:
+      type: object
+      required:
+      - type_key
+      - name
+      - modality_type
+      properties:
+        tenant_id: &id010
+          type:
+          - string
+          - 'null'
+          format: uuid
+        type_key: &id011
+          type: string
+          maxLength: 100
+          description: 创建后不可修改
+        name: &id012
+          type: string
+          maxLength: 255
+        description: &id013
+          type:
+          - string
+          - 'null'
+        modality_type: &id014
+          $ref: '#/components/schemas/ModalityType'
+        analysis_mode: &id015
+          $ref: '#/components/schemas/AnalysisMode'
+        allow_update: &id016
+          type: boolean
+          default: true
+        version_mode: &id017
+          $ref: '#/components/schemas/VersionMode'
+        fusion_strategy: &id018
+          type:
+          - string
+          - 'null'
+        fusion_config: *id009
+        rerank_strategy: &id019
+          type:
+          - string
+          - 'null'
+        rerank_config: *id009
+        metadata: *id009
+        processors:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentProcessorDefinitionRequest'
+        retrievals:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentRetrievalDefinitionRequest'
+        bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProcessorRetrievalBindingRequest'
+    DocumentTypeDefinitionUpdateRequest:
+      type: object
+      required:
+      - revision
+      properties:
+        revision:
+          type: integer
+          description: 乐观锁。必须回传 GET 得到的 revision，不匹配返回 409
+        name:
+          type: string
+          maxLength: 255
+        description:
+          type:
+          - string
+          - 'null'
+        analysis_mode:
+          $ref: '#/components/schemas/AnalysisMode'
+        allow_update:
+          type: boolean
+        version_mode:
+          $ref: '#/components/schemas/VersionMode'
+        fusion_strategy:
+          type:
+          - string
+          - 'null'
+        fusion_config: *id009
+        rerank_strategy:
+          type:
+          - string
+          - 'null'
+        rerank_config: *id009
+        metadata: *id009
+        processors:
+          type:
+          - array
+          - 'null'
+          description: null=不触碰子表；数组=全量替换，未出现的既有 processor 会被软删除
+          items:
+            $ref: '#/components/schemas/DocumentProcessorDefinitionRequest'
+        retrievals:
+          type:
+          - array
+          - 'null'
+          description: null=不触碰子表；数组=全量替换，未出现的既有 retrieval 会被软删除
+          items:
+            $ref: '#/components/schemas/DocumentRetrievalDefinitionRequest'
+        bindings:
+          type:
+          - array
+          - 'null'
+          description: null=不触碰绑定；数组=全量替换。用下标引用同一次 payload 中的 processors / retrievals，因此必须与这两个数组一起提交。
+          items:
+            $ref: '#/components/schemas/ProcessorRetrievalBindingRequest'
+    DocumentTypeDefinitionResponse:
+      type: object
+      required:
+      - document_type_definition_id
+      - revision
+      - type_key
+      - name
+      - modality_type
+      - analysis_mode
+      - allow_update
+      - version_mode
+      - status
+      - created_at
+      - updated_at
+      properties:
+        document_type_definition_id: *id004
+        revision:
+          type: integer
+          description: 乐观锁版本号，每次成功更新 +1
+        tenant_id: *id010
+        type_key: *id011
+        name: *id012
+        description: *id013
+        modality_type: *id014
+        analysis_mode: *id015
+        allow_update: *id016
+        version_mode: *id017
+        fusion_strategy: *id018
+        fusion_config: *id009
+        rerank_strategy: *id019
+        rerank_config: *id009
+        metadata: *id009
+        status:
+          $ref: '#/components/schemas/DefinitionStatus'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    DocumentTypeDefinitionDetailResponse:
+      allOf:
+      - $ref: '#/components/schemas/DocumentTypeDefinitionResponse'
+      - type: object
+        properties:
+          processors:
+            type: array
+            items:
+              $ref: '#/components/schemas/DocumentProcessorDefinitionResponse'
+          retrievals:
+            type: array
+            items:
+              $ref: '#/components/schemas/DocumentRetrievalDefinitionResponse'
+          bindings:
+            type: array
+            items:
+              $ref: '#/components/schemas/ProcessorRetrievalBindingResponse'
+    DocumentTypeDefinitionListResponse:
+      type: object
+      required:
+      - items
+      - page
+      - page_size
+      - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentTypeDefinitionResponse'
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+        total_pages:
+          type: integer
+    DocumentProcessorDefinitionResponse:
+      type: object
+      required:
+      - document_processor_definition_id
+      - document_type_definition_id
+      - file_extension
+      - loader_name
+      - status
+      - created_at
+      - updated_at
+      properties:
+        document_processor_definition_id: *id004
+        document_type_definition_id: *id004
+        file_extension:
+          type: string
+        mime_types:
+          type: array
+          items:
+            type: string
+        loader_name:
+          type: string
+        loader_config: *id009
+        processor_name:
+          type:
+          - string
+          - 'null'
+        processor_config: *id009
+        retrieval_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/RetrievalType'
+          description: 只读。该前处理定义当前绑定到的 retrieval，由 bindings 推导
+        status:
+          $ref: '#/components/schemas/DefinitionStatus'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    DocumentProcessorDefinitionListResponse:
+      type: object
+      required:
+      - items
+      - page
+      - page_size
+      - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentProcessorDefinitionResponse'
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+        total_pages:
+          type: integer
+    DocumentRetrievalDefinitionResponse:
+      type: object
+      required:
+      - retrieval_definition_id
+      - document_type_definition_id
+      - retrieval_type
+      - storage_backend
+      - status
+      - created_at
+      - updated_at
+      properties:
+        retrieval_definition_id: *id004
+        document_type_definition_id: *id004
+        retrieval_type:
+          $ref: '#/components/schemas/RetrievalType'
+        chunker_name:
+          type:
+          - string
+          - 'null'
+        chunker_config: *id009
+        retriever_name:
+          type:
+          - string
+          - 'null'
+        retriever_config: *id009
+        storage_backend:
+          $ref: '#/components/schemas/StorageBackend'
+        storage_config: *id009
+        file_extensions:
+          type: array
+          items:
+            type: string
+          description: 只读。绑定到该 retrieval 的文件后缀名，由 bindings 推导
+        status:
+          $ref: '#/components/schemas/DefinitionStatus'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    DocumentRetrievalDefinitionListResponse:
+      type: object
+      required:
+      - items
+      - page
+      - page_size
+      - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentRetrievalDefinitionResponse'
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+        total_pages:
+          type: integer
+    ProcessorRetrievalBindingResponse:
+      type: object
+      required:
+      - file_extension
+      - retrieval_type
+      properties:
+        file_extension:
+          type: string
+        retrieval_type:
+          $ref: '#/components/schemas/RetrievalType'
+    UpdateDocumentRequest:
+      type: object
+      description: 用一个新的已上传 File 为当前 Document 追加一个新的 DocumentVersion，并触发对应的处理流水线。
+      required:
+      - file_id
+      properties:
+        file_id:
+          type: string
+          format: uuid
+          description: 新版本对应的源文件 File ID。
+        title:
+          type:
+          - string
+          - 'null'
+          maxLength: 500
+          description: None 表示不修改。
+        document_key:
+          type:
+          - string
+          - 'null'
+          maxLength: 255
+          description: None 表示不修改。
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Document 级 metadata；null 表示不修改。
+        meta_data:
+          type: object
+          additionalProperties: true
+          description: 本次追加的新 DocumentVersion 的版本级 metadata，只作用于新版本。
+    UpdateDocumentResponse:
+      type: object
+      required:
+      - document_id
+      - document_version_id
+      - version_number
+      - processing_status
+      properties:
+        document_id: &id020
+          type: string
+          format: uuid
+        document_version_id: *id020
+        version_number:
+          type: integer
+        previous_document_version_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        processing_status:
+          $ref: '#/components/schemas/ProcessingStatus'
+        current_document_version_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        message:
+          type: string
+  responses:
+    BadRequest:
+      description: Invalid request parameters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: Permission denied.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: Conflict with existing data.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Resource not found

@@ -1,0 +1,706 @@
+openapi: 3.1.0
+info:
+  title: Document Service API
+  description: "Document Service API.\n\nDocument 表示业务上的逻辑文档。\nDocumentVersion 表示 Document 的具体版本。\n\n\
+    版本管理规则：\n- POST /documents 创建 Document 时自动创建 Version 1。\n- PUT /documents/{document_id} 提供两种不同操作：\n\
+    \  1. file_id：上传新文件并创建新的 DocumentVersion。\n  2. current_document_version_id：切换当前生效版本，不创建新版本。\n- file_id\
+    \ 与 current_document_version_id 不能同时提供。\n- title / metadata 仅修改 Document 本身，不创建新版本。\n- DocumentVersion\
+    \ 不提供独立的创建、修改、删除接口。\n"
+  version: 1.0.0
+servers:
+- url: /api
+tags:
+- name: Document
+  description: Document management
+- name: DocumentVersion
+  description: Document version query
+paths:
+  /documents:
+    post:
+      tags:
+      - Document
+      summary: Create Document
+      description: '创建一个逻辑 Document，并自动创建 Version 1。
+
+
+        创建 Document 时必须提供 file_id。
+
+        file_id 对应 File Service 中已经上传完成的文件。
+
+
+        DocumentTypeDefinition 在 Document 创建后不可修改。
+
+        '
+      operationId: createDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentCreateRequest'
+      responses:
+        '201':
+          description: Document created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: Referenced resource not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    get:
+      tags:
+      - Document
+      summary: List Documents
+      operationId: listDocuments
+      parameters:
+      - name: tenant_id
+        in: query
+        required: false
+        schema:
+          type: string
+          format: uuid
+      - name: document_type_definition_id
+        in: query
+        required: false
+        schema:
+          type: string
+          format: uuid
+      - name: status
+        in: query
+        required: false
+        schema:
+          $ref: '#/components/schemas/DocumentStatus'
+      - name: keyword
+        in: query
+        required: false
+        description: Search by document_key or title
+        schema:
+          type: string
+      - name: page
+        in: query
+        required: false
+        default: 1
+        minimum: 1
+        schema:
+          type: integer
+      - name: page_size
+        in: query
+        required: false
+        default: 20
+        minimum: 1
+        maximum: 100
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: Document list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentListResponse'
+  /documents/{document_id}:
+    parameters:
+    - name: document_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    get:
+      tags:
+      - Document
+      summary: Get Document
+      description: '获取 Document 详情。
+
+
+        返回：
+
+        - Document 基本信息
+
+        - current_document_version_id
+
+        - 当前版本信息
+
+        - Document 历史版本摘要
+
+        '
+      operationId: getDocument
+      responses:
+        '200':
+          description: Document detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentDetailResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags:
+      - Document
+      summary: Update Document
+      description: "更新 Document。\n\nPUT 支持三种互斥行为：\n\n1. file_id\n   - 使用新的 File 创建一个新的 DocumentVersion。\n\
+        \   - version_number 自动递增。\n   - 不修改 DocumentTypeDefinition。\n   - 新版本处理完成后，可更新 current_document_version_id。\n\
+        \n2. current_document_version_id\n   - 将当前生效版本切换到指定历史版本。\n   - 不创建新的 DocumentVersion。\n   - 指定版本必须属于当前\
+        \ Document。\n\n3. title / metadata\n   - 仅修改 Document 业务信息。\n   - 不创建新的 DocumentVersion。\n\nfile_id\
+        \ 与 current_document_version_id 不能同时提供。\n\n如果 file_id 对应文件与当前版本使用的文件 checksum 相同，\n则不会创建无意义的新版本，并返回冲突。\n"
+      operationId: updateDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentUpdateRequest'
+      responses:
+        '200':
+          description: Document updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: 'Conflict.
+
+
+            Possible reasons:
+
+            - file_id and current_document_version_id are provided together.
+
+            - file_id has the same checksum as the current version.
+
+            - current_document_version_id does not belong to this Document.
+
+            '
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags:
+      - Document
+      summary: Delete Document
+      description: '逻辑删除 Document。
+
+
+        DocumentVersion 不提供独立删除接口。
+
+        删除 Document 后，其历史版本不再作为正常 Document 使用。
+
+        '
+      operationId: deleteDocument
+      responses:
+        '204':
+          description: Document deleted successfully
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /documents/{document_id}/versions:
+    parameters:
+    - name: document_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    get:
+      tags:
+      - DocumentVersion
+      summary: List Document Versions
+      description: '查询指定 Document 的全部历史版本。
+
+
+        返回版本列表时同时返回：
+
+        - document_version_id
+
+        - version_number
+
+        - file_id
+
+        - 是否为当前版本
+
+        - 版本状态
+
+        - 创建时间
+
+        '
+      operationId: listDocumentVersions
+      parameters:
+      - name: status
+        in: query
+        required: false
+        schema:
+          $ref: '#/components/schemas/VersionStatus'
+      - name: page
+        in: query
+        required: false
+        default: 1
+        minimum: 1
+        schema:
+          type: integer
+      - name: page_size
+        in: query
+        required: false
+        default: 20
+        minimum: 1
+        maximum: 100
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: Document version list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentVersionListResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /documents/{document_id}/versions/{document_version_id}:
+    parameters:
+    - name: document_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    - name: document_version_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    get:
+      tags:
+      - DocumentVersion
+      summary: Get Document Version
+      description: '获取指定 DocumentVersion 的详细信息。
+
+
+        DocumentVersion 是 Document 的历史版本实体，
+
+        仅提供查询，不允许直接修改。
+
+
+        返回该版本实际执行时使用的 pipeline_config，
+
+        用于追踪该版本的解析、processor、retrieval 配置。
+
+        '
+      operationId: getDocumentVersion
+      responses:
+        '200':
+          description: Document version detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentVersionDetailResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+components:
+  schemas:
+    DocumentCreateRequest:
+      type: object
+      required:
+      - document_type_definition_id
+      - file_id
+      properties:
+        document_type_definition_id:
+          type: string
+          format: uuid
+          description: 'DocumentTypeDefinition ID。
+
+            Document 创建后不可修改。
+
+            '
+        tenant_id:
+          type: string
+          format: uuid
+          nullable: true
+        document_key:
+          type: string
+          maxLength: 500
+          nullable: true
+          description: '业务侧可选稳定标识。
+
+            用于业务系统关联 Document。
+
+            '
+        title:
+          type: string
+          maxLength: 500
+          nullable: true
+        file_id:
+          type: string
+          format: uuid
+          description: 'File Service 中已经上传完成的文件 ID。
+
+            创建 Document 时自动生成 DocumentVersion 1。
+
+            '
+        metadata:
+          type: object
+          additionalProperties: true
+          default: {}
+    DocumentUpdateRequest:
+      type: object
+      description: "file_id、current_document_version_id、title、metadata 均为可选。\n\nfile_id 与 current_document_version_id\
+        \ 互斥。\n\nfile_id：\n  创建新的 DocumentVersion。\n\ncurrent_document_version_id：\n  切换当前版本。\n\ntitle\
+        \ / metadata：\n  修改 Document 本身，不创建版本。\n"
+      minProperties: 1
+      properties:
+        title:
+          type: string
+          maxLength: 500
+          nullable: true
+        metadata:
+          type: object
+          additionalProperties: true
+        file_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: '新文件 ID。
+
+            提供后创建新的 DocumentVersion。
+
+            '
+        current_document_version_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: '指定已有 DocumentVersion 作为当前版本。
+
+            不创建新版本。
+
+            '
+      allOf:
+      - if:
+          required:
+          - file_id
+        then:
+          not:
+            required:
+            - current_document_version_id
+      - if:
+          required:
+          - current_document_version_id
+        then:
+          not:
+            required:
+            - file_id
+    DocumentResponse:
+      type: object
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        document_type_definition_id:
+          type: string
+          format: uuid
+        tenant_id:
+          type: string
+          format: uuid
+          nullable: true
+        document_key:
+          type: string
+          nullable: true
+        title:
+          type: string
+          nullable: true
+        current_document_version_id:
+          type: string
+          format: uuid
+          nullable: true
+        status:
+          $ref: '#/components/schemas/DocumentStatus'
+        metadata:
+          type: object
+          additionalProperties: true
+        created_by:
+          type: string
+          format: uuid
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+    DocumentDetailResponse:
+      allOf:
+      - $ref: '#/components/schemas/DocumentResponse'
+      properties:
+        current_document_version:
+          $ref: '#/components/schemas/DocumentVersionSummary'
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentVersionSummary'
+    DocumentListResponse:
+      type: object
+      required:
+      - items
+      - page
+      - page_size
+      - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentResponse'
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+    DocumentVersionSummary:
+      type: object
+      properties:
+        document_version_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        version_number:
+          type: integer
+        file_id:
+          type: string
+          format: uuid
+        document_processor_definition_id:
+          type: string
+          format: uuid
+          nullable: true
+        version_status:
+          $ref: '#/components/schemas/VersionStatus'
+        is_current:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        meta_data:
+          type: object
+          additionalProperties: true
+          description: '版本级 metadata。
+
+
+            当前存放 pipeline_config（当次执行的参数快照），未来可承载版本级业务语义，例如来源批次、关联出来的图片或资源引用。
+
+
+            注意：pipeline_config 已单独暴露为顶层字段，这里会重复出现一次，前端取其一即可。'
+      required:
+      - meta_data
+    DocumentVersionDetailResponse:
+      type: object
+      properties:
+        document_version_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        version_number:
+          type: integer
+        file_id:
+          type: string
+          format: uuid
+        document_processor_definition_id:
+          type: string
+          format: uuid
+          nullable: true
+        version_status:
+          $ref: '#/components/schemas/VersionStatus'
+        is_current:
+          type: boolean
+        pipeline_config:
+          $ref: '#/components/schemas/PipelineConfigSnapshot'
+        meta_data:
+          type: object
+          additionalProperties: true
+          description: '版本级 metadata。
+
+
+            当前存放 pipeline_config（当次执行的参数快照），未来可承载版本级业务语义，例如来源批次、关联出来的图片或资源引用。
+
+
+            注意：pipeline_config 已单独暴露为顶层字段，这里会重复出现一次，前端取其一即可。'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+      - meta_data
+    DocumentVersionListResponse:
+      type: object
+      required:
+      - items
+      - page
+      - page_size
+      - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentVersionSummary'
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+    PipelineConfigSnapshot:
+      type: object
+      description: 'DocumentVersion 创建/处理时实际使用的完整 pipeline 配置快照。
+
+
+        该配置用于：
+
+        - 记录该版本实际使用的 loader / parser
+
+        - 记录 processor mode 与 processor config
+
+        - 记录实际绑定的 retrieval definitions
+
+        - 记录实际使用的 index/storage
+
+        - 支持按照历史配置重新处理
+
+        - 支持按照当前最新配置重新处理
+
+
+        该对象属于版本执行 provenance，不属于 Document 业务 metadata。
+
+        '
+      additionalProperties: true
+      properties:
+        modality_type:
+          type: string
+          description: '当前 DocumentTypeDefinition 对应的 LLM 输入 modality。
+
+            例如 text、image、audio、video 等。
+
+            '
+        loader:
+          type: object
+          nullable: true
+          additionalProperties: true
+          description: '本次 ingestion 实际使用的 loader / format reader。
+
+            该配置由文件类型解析规则确定。
+
+            '
+        processor:
+          type: object
+          nullable: true
+          additionalProperties: true
+          properties:
+            mode:
+              type: string
+              enum:
+              - none
+              - common
+              - config
+            config:
+              type: object
+              nullable: true
+              additionalProperties: true
+        retrievals:
+          type: array
+          description: '本次版本实际执行的 N 个 retrieval definition。
+
+            '
+          items:
+            type: object
+            additionalProperties: true
+            properties:
+              document_retrieval_definition_id:
+                type: string
+                format: uuid
+              retrieval_type:
+                type: string
+              retrieval_config:
+                type: object
+                additionalProperties: true
+              index_bindings:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+    DocumentStatus:
+      type: string
+      enum:
+      - active
+      - deleted
+    ErrorResponse:
+      type: object
+      required:
+      - code
+      - message
+      properties:
+        code:
+          type: string
+          example: DOCUMENT_CONTENT_UNCHANGED
+        message:
+          type: string
+          example: The uploaded file is identical to the current document version.
+        details:
+          type: object
+          additionalProperties: true
+    VersionStatus:
+      type: string
+      description: 'DocumentVersion 的生命周期状态，取自 document_version.version_status。
+
+
+        pending    已创建，尚未成为可用版本
+
+        active     当前可用
+
+        superseded 已被更新的版本替代
+
+        failed     处理失败，不可用
+
+        deleted    逻辑删除
+
+
+        注意：processing_status（处理进度）暂不对外暴露，后续通过 progress 相关接口提供。'
+      enum:
+      - pending
+      - active
+      - superseded
+      - failed
+      - deleted
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'

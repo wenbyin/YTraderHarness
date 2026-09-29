@@ -1,0 +1,1562 @@
+openapi: 3.1.0
+info:
+  title: Document Pipeline API
+  version: 1.0.0
+  description: '文档处理流水线的运行、进度与节点目录接口。
+
+
+    维度约定
+
+    --------
+
+    一个 DocumentVersion 对应一次处理，一次处理产生一条 PipelineRun。
+
+    一个文件按后缀绑定**唯一一个** DocumentProcessorDefinition，
+
+    以及 **N 个** DocumentRetrievalDefinition（即扇出 N 路）。
+
+    因此进度有两个层级：
+
+    - DocumentVersion 级：这个版本处理到哪了（业务视角）
+
+    - PipelineRun 级：这一次运行跑到哪个节点了（执行视角）
+
+
+    两类状态不要混用
+
+    ----------------
+
+    ProcessingStatus（pending/processing/completed/failed）
+
+    业务状态，回答"这个版本能不能用"。同一版本只有一份。
+
+    RunStatus（pending/running/completed/failed/partial/cancelled）
+
+    执行状态，回答"这一次跑得怎么样"。每次运行各有一份。
+
+    RunStatus 里多出的 partial 表示多路 retrieval 部分成功
+
+    （例如 ES 挂了但 Milvus 成了）。它在业务侧没有对应值，
+
+    映射回 ProcessingStatus 时按 failed 处理 —— 业务只回答能用/不能用。
+
+
+    前端轮询建议
+
+    ------------
+
+    进度轮询用 GET /pipeline-runs/{pipeline_run_id}/progress，
+
+    不要用 GET /pipeline-runs/{pipeline_run_id}。
+
+    后者会返回全部节点行（扇出后可能有几十行），做秒级轮询过重。
+
+    '
+servers:
+- url: /api/v1
+tags:
+- name: Document Pipeline Runs
+  description: 流水线运行记录与节点明细（执行视角）
+- name: Document Pipeline Progress
+  description: 流水线与文档的处理进度（业务视角）
+- name: Document Pipeline Nodes
+  description: 流水线节点目录（node_id 契约表）
+paths:
+  /document-progress:
+    get:
+      tags:
+      - Document Pipeline Progress
+      summary: Batch document progress
+      operationId: getDocumentProgressBatch
+      description: '批量查询多个 Document 当前的处理进度，供文档列表页使用。
+
+
+        存在的意义是避免 N+1：列表页有 20 行，不该发 20 个请求。
+
+        返回的是**轻量摘要**，不含节点明细与 retrieval 拆解。
+
+        需要细节时再按 current_document_version_id 调
+
+        GET /document-versions/{document_version_id}/progress。
+
+
+        查不到或已逻辑删除的 document_id 会出现在
+
+        missing_document_ids 里，而不是让整个请求失败 ——
+
+        列表页局部失效不该拖垮整页。
+
+
+        document_ids 上限 100 个，超出返回 400。
+
+        '
+      parameters:
+      - name: document_ids
+        in: query
+        required: true
+        description: '逗号分隔的 Document ID 列表，最多 100 个。
+
+          '
+        schema:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            format: uuid
+        style: form
+        explode: false
+      responses:
+        '200':
+          description: Progress summaries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentProgressListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /document-pipeline-nodes:
+    get:
+      tags:
+      - Document Pipeline Nodes
+      summary: List pipeline node catalog
+      operationId: listPipelineNodeCatalog
+      description: '当前图版本的节点目录。
+
+
+        node_id 是**稳定契约键**，前端用它把节点行翻译成展示信息。
+
+        三条硬规则：
+
+        - node_id 一旦发布永不复用（退役的永久保留并标 deprecated）
+
+        - sequence 永不重编号，新节点只往后追加
+
+        - 任何拓扑变更必须 bump graph_version
+
+
+        退役节点会以 deprecated=true 列出并给出 replaced_by，
+
+        因此历史运行里的旧 node_id 永远能在这里查到解释。
+
+        '
+      responses:
+        '200':
+          description: Node catalog of the current graph version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineNodeCatalogResponse'
+  /document-pipeline-nodes/{node_id}:
+    get:
+      tags:
+      - Document Pipeline Nodes
+      summary: Get one pipeline node
+      operationId: getPipelineNode
+      description: '按 node_id 查单个节点。
+
+
+        给前端解析一个"不认识的 node_id"用 —— 不必为了一个节点
+
+        拉整个目录。
+
+        '
+      parameters:
+      - name: node_id
+        in: path
+        required: true
+        description: '稳定节点标识，例如 parsing / chunking / finalize_version。
+
+          '
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Node catalog entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineNodeCatalogEntry'
+        '404':
+          description: 'Unknown node_id for the current graph version.
+
+            '
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /document-versions/{document_version_id}/progress:
+    get:
+      tags:
+      - Document Pipeline Progress
+      summary: Get DocumentVersion processing progress
+      operationId: getDocumentVersionProgress
+      description: '某个 DocumentVersion 当前的处理进度。
+
+
+        这是进度页的核心接口，**不依赖 pipeline_run_id**。
+
+        创建文档时返回体里只有 document_id 与
+
+        current_document_version_id，没有 run_id，
+
+        因此前端只能按版本轮询。
+
+
+        返回内容分三层：
+
+        - 业务层：version_status 与聚合出的 processing_status
+
+        - 执行层：最近一次运行的进度摘要
+
+        - 拆解层：1 个 processor + N 个 retrieval 各自的处理结果
+
+
+        processor 是单个（一个文件后缀只绑定一个前处理定义），
+
+        retrieval 是 N 个（扇出），两者都不分页 —— 数量级很小。
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/document_version_id'
+      responses:
+        '200':
+          description: Version processing progress.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentVersionProgressResponse'
+        '404':
+          description: DocumentVersion not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /document-versions/{document_version_id}/reprocess:
+    post:
+      tags:
+      - Document Pipeline Runs
+      summary: Reprocess a DocumentVersion
+      operationId: reprocessDocumentVersion
+      description: '重新处理某个 DocumentVersion，返回 202 与本次运行的 job_id。
+
+
+        只**登记**一次调度，不在这里跑流水线 ——
+
+        实际触发由后端在事务提交后进行。
+
+
+        document_processor_definition_ids 的语义：
+
+        - 留空：按现有规则重跑全部适用的 retrieval
+
+        - 非空：只重跑这些 processor 映射到的 retrieval
+
+
+        force：
+
+        - true 时绕过"已完成即跳过"的短路
+
+
+        返回的 job_id 就是本次运行的 pipeline_run_id，
+
+        拿它去 GET /pipeline-runs/{pipeline_run_id}/progress 查进度。
+
+
+        多次 reprocess 会串成链，新运行的
+
+        parent_pipeline_run_id 指向上一次运行。
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/document_version_id'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReprocessDocumentVersionRequest'
+      responses:
+        '202':
+          description: Reprocessing accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReprocessDocumentVersionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: DocumentVersion not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: 'Current state does not allow reprocessing
+
+            (for example the version has been logically deleted).
+
+            '
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /documents/{document_id}/versions/{document_version_id}/pipeline-runs:
+    get:
+      tags:
+      - Document Pipeline Runs
+      summary: List pipeline runs of a DocumentVersion
+      operationId: listDocumentVersionPipelineRuns
+      description: '某个版本的运行历史，按开始时间倒序。
+
+
+        正常至少有一条（create_document 触发的那次）。
+
+        每 reprocess 一次追加一条，靠 parent_pipeline_run_id
+
+        串成链。
+
+
+        注意本接口**不含节点明细**。需要时按
+
+        pipeline_run_id 调 GET /pipeline-runs/{pipeline_run_id}。
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/document_id'
+      - $ref: '#/components/parameters/document_version_id'
+      - name: status
+        in: query
+        required: false
+        description: '按执行状态过滤。
+
+          '
+        schema:
+          $ref: '#/components/schemas/RunStatus'
+      - name: trigger_source
+        in: query
+        required: false
+        description: '按触发来源过滤。
+
+          '
+        schema:
+          type: string
+          enum:
+          - create_document
+          - update_document
+          - reprocess
+          - resume
+          - retry
+          - manual
+      - name: started_from
+        in: query
+        required: false
+        schema:
+          type: string
+          format: date-time
+      - name: started_to
+        in: query
+        required: false
+        schema:
+          type: string
+          format: date-time
+      - $ref: '#/components/parameters/page'
+      - $ref: '#/components/parameters/page_size'
+      responses:
+        '200':
+          description: Paginated run history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineRunListResponse'
+        '404':
+          description: DocumentVersion not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /pipeline-runs/{pipeline_run_id}:
+    get:
+      tags:
+      - Document Pipeline Runs
+      summary: Get pipeline run detail
+      operationId: getPipelineRun
+      description: '运行详情：run 行 + **全部**节点行 + 该次运行的拓扑快照。
+
+
+        节点行数不是固定的：
+
+        线性节点 6 个 + 控制节点 1 个，各 1 行；
+
+        扇出 4 个阶段，各 N 行（N = 本次参与的 retrieval 数）。
+
+        因此 retrieval 较多时详情会很大，秒级轮询请改用
+
+        GET /pipeline-runs/{pipeline_run_id}/progress。
+
+
+        拓扑快照是**该次运行自己的**，不是当前图的。
+
+        按它渲染，不要用前端写死的节点列表 ——
+
+        这是历史运行在图演进后仍能正确展示的主机制。
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/pipeline_run_id'
+      responses:
+        '200':
+          description: Run detail with node rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineRunDetailResponse'
+        '404':
+          description: PipelineRun not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /pipeline-runs/{pipeline_run_id}/nodes:
+    get:
+      tags:
+      - Document Pipeline Runs
+      summary: List node runs of a pipeline run
+      operationId: listPipelineNodeRuns
+      description: '节点行分页。
+
+
+        详情接口会一次返回全部节点行；扇出很多时前端可以改用本接口
+
+        单独翻页。
+
+
+        同一 node_id 下可能有多个 branch_key（扇出分支），
+
+        用 document_retrieval_definition_id / branch_key 区分。
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/pipeline_run_id'
+      - $ref: '#/components/parameters/page'
+      - name: page_size
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 200
+      responses:
+        '200':
+          description: Paginated node rows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineNodeRunListResponse'
+        '404':
+          description: PipelineRun not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /pipeline-runs/{pipeline_run_id}/progress:
+    get:
+      tags:
+      - Document Pipeline Progress
+      summary: Get pipeline run progress
+      operationId: getPipelineRunProgress
+      description: '运行的轻量进度摘要，专供轮询。
+
+
+        只返回计数、百分比与当前节点，约 100 字节量级。
+
+        与详情接口（返回全部节点行）的区别就是这个 ——
+
+        前端每 1~2 秒轮询一次不会把网络和序列化打满。
+
+
+        running_node_id 仅在 status=running 时有值，
+
+        前端据此显示"正在做什么"。
+
+
+        progress_percent 的**分母会跳变**，这是刻意的：
+
+
+        扇出前不知道 N（要读库才知道有几路 retrieval），
+
+        因此：
+
+        - 阶段 1~6：分母 = 7（6 线性 + 1 控制）
+
+        - 阶段 6 跑完后：分母 = 7 + 4 x N
+
+
+        进度条会从例如 3/7 = 43% 变成 3/(7+8) = 20%，
+
+        视觉上"倒退"。这个跳变反映的是**分母确实变了** ——
+
+        此刻才展开出子任务。前端应把它解释为"正在展开处理分支"，
+
+        而不是异常。
+
+
+        skipped_steps 不计入分母：
+
+        progress_percent = completed / (total - skipped) x 100
+
+
+        后续会通过图的条件边控制某些阶段是否跳过生成
+
+        （例如纯关键词检索不需要 embedding）。
+
+        被跳过的节点会是 skipped 而不是 failed，
+
+        否则进度条永远到不了 100%。
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/pipeline_run_id'
+      responses:
+        '200':
+          description: Run progress summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineRunProgressResponse'
+        '404':
+          description: PipelineRun not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+components:
+  parameters:
+    document_id:
+      name: document_id
+      in: path
+      required: true
+      description: Document database ID.
+      schema:
+        type: string
+        format: uuid
+    document_version_id:
+      name: document_version_id
+      in: path
+      required: true
+      description: DocumentVersion database ID.
+      schema:
+        type: string
+        format: uuid
+    pipeline_run_id:
+      name: pipeline_run_id
+      in: path
+      required: true
+      description: PipelineRun database ID.
+      schema:
+        type: string
+        format: uuid
+    page:
+      name: page
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    page_size:
+      name: page_size
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+  responses:
+    BadRequest:
+      description: Invalid request parameters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+
+    # ========================================================
+    # Enums
+    # ========================================================
+
+    ErrorResponse:
+      type: object
+      required:
+      - detail
+      properties:
+        detail:
+          type: string
+
+    ProcessingStatus:
+      type: string
+      description: '业务处理状态。回答"这个版本能不能用"。
+
+
+        与 RunStatus 的区别：本枚举同一版本只有一份，
+
+        表示所有 retrieval 的聚合结果；RunStatus 每次运行各一份。
+
+
+        注意这里**没有** partial —— 业务只回答能用/不能用。
+
+        运行层的 partial 映射回本枚举时按 failed 处理。
+
+        '
+      enum:
+      - pending
+      - processing
+      - completed
+      - failed
+    RunStatus:
+      type: string
+      description: '执行状态。回答"这一次跑得怎么样"。
+
+
+        partial：
+
+        多路 retrieval 部分成功 —— 至少一路成功且至少一路失败。
+
+        例如 ES 挂了但 Milvus 成了，文档在那部分索引里是**真实
+
+        可检索**的，不该笼统报 failed。
+
+
+        本枚举只出现在观测接口，**永远不会**写回
+
+        DocumentVersion.processing_status。
+
+        '
+      enum:
+      - pending
+      - running
+      - completed
+      - failed
+      - partial
+      - cancelled
+    NodeRunStatus:
+      type: string
+      description: '单个节点单次尝试的执行状态。
+
+
+        skipped：
+
+        被图的条件边跳过，不是失败。**不计入进度的分母** ——
+
+        否则进度条永远到不了 100%。
+
+
+        attempt：
+
+        同一节点重试会产生多行，用 attempt 区分（1 起）。
+
+        '
+      enum:
+      - pending
+      - running
+      - completed
+      - failed
+      - skipped
+    VersionStatus:
+      type: string
+      description: '版本的业务生命周期状态。
+
+
+        与 ProcessingStatus 是两个维度：
+
+        version_status 回答"这一版还算不算数"
+
+        （被新版替代后是 superseded），
+
+        processing_status 回答"这一版处理完了没"。
+
+        '
+      enum:
+      - pending
+      - active
+      - superseded
+      - failed
+      - deleted
+    RetrievalType:
+      type: string
+      description: '检索类型。一个 DocumentVersion 下有 N 个（扇出）。
+
+        '
+      enum:
+      - document
+      - keyword
+      - sparse_vector
+      - dense_vector
+      - graph
+    StorageBackend:
+      type: string
+      description: '实际的存储 / 索引后端。
+
+        '
+      enum:
+      - postgresql
+      - elasticsearch
+      - milvus
+      - neo4j
+
+    # ========================================================
+    # Node catalog
+    # ========================================================
+
+    PipelineNodeCatalogEntry:
+      type: object
+      description: '节点目录中的一项。
+
+
+        目录是 node_id 的**契约表**：退役节点永久保留，
+
+        标 deprecated 并给出 replaced_by，
+
+        这样历史运行里的旧 node_id 永远能查到解释。
+
+        '
+      required:
+      - node_id
+      - label
+      - group
+      - sequence
+      - deprecated
+      properties:
+        node_id:
+          type: string
+          description: '稳定标识，例如 ingestion / parsing / chunking。
+
+            不是下标，一旦发布永不复用。
+
+            '
+        label:
+          type: string
+          description: '展示名，例如"解析"。
+
+            '
+        group:
+          type: string
+          description: 'linear / fanout / control。
+
+            '
+          enum:
+          - linear
+          - fanout
+          - control
+        sequence:
+          type: integer
+          description: '拓扑序号，从 0 递增。
+
+            **不要假设连续或从 0 开始** —— 它是冻结的历史值，
+
+            新节点只往后追加。
+
+            '
+        description:
+          type: string
+        deprecated:
+          type: boolean
+          description: '已不在当前图中，但历史运行可能仍有它的行。
+
+            '
+        replaced_by:
+          type:
+          - string
+          - 'null'
+          description: '若已被替代，给出替代节点的 node_id。
+
+            '
+    PipelineNodeCatalogResponse:
+      type: object
+      required:
+      - graph_name
+      - graph_version
+      - topology_fingerprint
+      - nodes
+      properties:
+        graph_name:
+          type: string
+        graph_version:
+          type: string
+          description: '任何拓扑变更都会 bump 它。
+
+            '
+        topology_fingerprint:
+          type: string
+          description: '拓扑指纹（sha256）。
+
+            '
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/PipelineNodeCatalogEntry'
+
+    # ========================================================
+    # Node run
+    # ========================================================
+
+    PipelineNodeRunResponse:
+      type: object
+      description: '单个节点单次尝试。
+
+
+        一次运行的节点行总数 = 线性 6 + 控制 1 + 扇出 4 x N。
+
+        看单个阶段有几个分支，按 node_id 分组后数 branch_key。
+
+        '
+      required:
+      - pipeline_node_run_id
+      - pipeline_run_id
+      - node_id
+      - node_label
+      - node_group
+      - sequence
+      - branch_key
+      - attempt
+      - status
+      properties:
+        pipeline_node_run_id:
+          type: string
+          format: uuid
+        pipeline_run_id:
+          type: string
+          format: uuid
+        node_id:
+          type: string
+          description: '用它在节点目录里查展示信息。
+
+            '
+        node_label:
+          type: string
+          description: '展示名，**写入时冻结**。
+
+
+            目录里查不到 node_id 时用它兜底渲染 ——
+
+            即便该节点今天已从图里删掉，这一行仍然正确。
+
+            '
+        node_group:
+          type: string
+          enum:
+          - linear
+          - fanout
+          - control
+        sequence:
+          type: integer
+        document_retrieval_definition_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: '扇出节点所属的 RetrievalDefinition。
+
+            线性 / 控制节点为空。
+
+            '
+        branch_key:
+          type: string
+          description: '分支键：线性 / 控制节点为空串，扇出为 retrieval id。
+
+
+            同一 node_id 下用它区分不同分支。
+
+            刻意用空串而不是 null —— 它是唯一键的一部分，
+
+            而 Postgres 的唯一约束不约束 NULL。
+
+            '
+        attempt:
+          type: integer
+          minimum: 1
+          description: '重试计数，1 起。大于 1 说明之前失败过。
+
+            '
+        status:
+          $ref: '#/components/schemas/NodeRunStatus'
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        duration_ms:
+          type:
+          - integer
+          - 'null'
+        input_summary:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+          description: '输入摘要。只有 id、checksum 与计数，**绝不含正文**。
+
+            '
+        output_summary:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+          description: '输出摘要。其中的 preview 是唯一允许出现的
+
+            内容片段，上限 512 字符，供 UI 快速确认"这一步产出的
+
+            是不是我以为的东西"。
+
+            '
+        metrics:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+          description: '业务指标：chunk_count / token_count /
+
+            embedding_dimensions / vector_count 等。
+
+            当前占位实现会带 placeholder=true。
+
+            '
+        error_type:
+          type:
+          - string
+          - 'null'
+        error_message:
+          type:
+          - string
+          - 'null'
+
+    PipelineNodeRunListResponse:
+      type: object
+      required:
+      - items
+      - page
+      - page_size
+      - total
+      - total_pages
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PipelineNodeRunResponse'
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+        total_pages:
+          type: integer
+
+    # ========================================================
+    # Run
+    # ========================================================
+
+    PipelineRunResponse:
+      type: object
+      description: '运行记录（列表视图）。不含拓扑快照与节点明细。
+
+        '
+      required:
+      - pipeline_run_id
+      - document_id
+      - document_version_id
+      - document_type_definition_id
+      - trigger_source
+      - status
+      - node_count
+      - failed_node_count
+      - created_at
+      properties:
+        pipeline_run_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        document_version_id:
+          type: string
+          format: uuid
+        document_type_definition_id:
+          type: string
+          format: uuid
+        trigger_source:
+          type: string
+          description: '触发来源。
+
+            '
+          enum:
+          - create_document
+          - update_document
+          - reprocess
+          - resume
+          - retry
+          - manual
+        triggered_by:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        parent_pipeline_run_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+          description: 'reprocess 链上的上一次运行。
+
+            '
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        duration_ms:
+          type:
+          - integer
+          - 'null'
+        resumed_from_checkpoint_id:
+          type:
+          - string
+          - 'null'
+          description: '非空表示本次是从 checkpoint 续跑而来。
+
+            '
+        error_type:
+          type:
+          - string
+          - 'null'
+        error_node_id:
+          type:
+          - string
+          - 'null'
+          description: '失败发生在哪个节点，配合节点目录定位。
+
+            '
+        error_message:
+          type:
+          - string
+          - 'null'
+        node_count:
+          type: integer
+          description: '本次落下的节点行数（含各扇出分支）。
+
+            '
+        failed_node_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+
+    PipelineRunDetailResponse:
+      allOf:
+      - $ref: '#/components/schemas/PipelineRunResponse'
+      - type: object
+        description: '运行详情。
+
+
+          topology_snapshot 是**该次运行自己的**拓扑，按它渲染。
+
+          不要用当前图的节点列表 —— 这是历史运行不失真的主机制。
+
+          '
+        required:
+        - graph_name
+        - graph_version
+        - topology_fingerprint
+        - nodes
+        - unknown_nodes
+        properties:
+          graph_name:
+            type: string
+          graph_version:
+            type: string
+          topology_fingerprint:
+            type: string
+          topology_snapshot:
+            type: object
+            additionalProperties: true
+            description: '{nodes:[{node_id,label,group,sequence}], edges:[[from,to]]}。
+
+              冻结于运行开始时。
+
+              '
+          run_config:
+            type: object
+            additionalProperties: true
+            description: '本次运行的配置快照。
+
+              '
+          nodes:
+            type: array
+            items:
+              $ref: '#/components/schemas/PipelineNodeRunResponse'
+          unknown_nodes:
+            type: boolean
+            description: '该次运行的拓扑里有节点不在当前目录中。
+
+
+              为 true 时前端应提示「此运行使用旧版流水线」，
+
+              并依靠每行冻结的 node_label + sequence 渲染 ——
+
+              不要丢弃这些行。
+
+              '
+
+    PipelineRunListResponse:
+      type: object
+      required:
+      - items
+      - page
+      - page_size
+      - total
+      - total_pages
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PipelineRunResponse'
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+        total_pages:
+          type: integer
+
+    # ========================================================
+    # Progress
+    # ========================================================
+
+    PipelineRunProgressResponse:
+      type: object
+      description: '运行的轻量进度摘要，专供轮询。
+
+
+        只返回计数与当前节点，不含节点明细。
+
+        '
+      required:
+      - pipeline_run_id
+      - document_version_id
+      - status
+      - progress_percent
+      - total_steps
+      - completed_steps
+      - failed_steps
+      - skipped_steps
+      properties:
+        pipeline_run_id:
+          type: string
+          format: uuid
+        document_version_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        progress_percent:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          description: 'completed / (total - skipped) x 100。
+
+
+            **分母会跳变**：扇出前为 7，阶段 1~6 跑完后变为
+
+            7 + 4 x N。进度条会视觉上"倒退"，这是刻意的 ——
+
+            此刻才展开出子任务，前端应解释为"正在展开处理分支"。
+
+            '
+        total_steps:
+          type: integer
+          minimum: 0
+          description: '计划执行的步骤数，含扇出展开后的分支。
+
+            '
+        completed_steps:
+          type: integer
+          minimum: 0
+        failed_steps:
+          type: integer
+          minimum: 0
+        skipped_steps:
+          type: integer
+          minimum: 0
+          description: '被条件边跳过、**不计入分母**的步骤数。
+
+            '
+        running_node_id:
+          type:
+          - string
+          - 'null'
+          description: '当前正在执行的节点。仅在 status=running 时有值。
+
+            '
+        running_node_label:
+          type:
+          - string
+          - 'null'
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        duration_ms:
+          type:
+          - integer
+          - 'null'
+        error_node_id:
+          type:
+          - string
+          - 'null'
+        error_message:
+          type:
+          - string
+          - 'null'
+
+    ProcessorProgress:
+      type: object
+      description: '本次处理使用的文件前处理定义。
+
+
+        **只有一个** —— 一个文件按后缀只绑定一个
+
+        DocumentProcessorDefinition。
+
+        该版本走系统默认 Reader 时 document_processor_definition_id
+
+        为空。
+
+        '
+      properties:
+        document_processor_definition_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        loader_name:
+          type:
+          - string
+          - 'null'
+        processor_name:
+          type:
+          - string
+          - 'null'
+        file_extension:
+          type:
+          - string
+          - 'null'
+        processing_status:
+          $ref: '#/components/schemas/ProcessingStatus'
+
+    RetrievalProgressItem:
+      type: object
+      description: '一路 retrieval 的处理结果。一个版本有 N 个（扇出）。
+
+        '
+      required:
+      - document_retrieval_definition_id
+      - processing_status
+      properties:
+        document_retrieval_definition_id:
+          type: string
+          format: uuid
+        retrieval_type:
+          $ref: '#/components/schemas/RetrievalType'
+        chunker_name:
+          type:
+          - string
+          - 'null'
+        retriever_name:
+          type:
+          - string
+          - 'null'
+        storage_backend:
+          $ref: '#/components/schemas/StorageBackend'
+        document_index_binding_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        index_identifier:
+          type:
+          - string
+          - 'null'
+          description: '实际写入的索引实例标识。
+
+            PostgreSQL document retrieval 这类没有独立索引实例的为空。
+
+            '
+        processing_status:
+          $ref: '#/components/schemas/ProcessingStatus'
+        error_message:
+          type:
+          - string
+          - 'null'
+        chunk_count:
+          type:
+          - integer
+          - 'null'
+          description: '该路产出的 chunk 数，取自最近一次运行的节点指标。
+
+            '
+        token_count:
+          type:
+          - integer
+          - 'null'
+        duration_ms:
+          type:
+          - integer
+          - 'null'
+          description: '该路处理的耗时，取自最近一次运行的节点指标。
+
+            '
+        updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+
+    DocumentVersionProgressResponse:
+      type: object
+      description: '某个版本的处理进度，进度页的核心响应。
+
+
+        三层信息：
+
+        - 业务层 version_status / processing_status
+
+        - 执行层 latest_run
+
+        - 拆解层 processor（1 个）+ retrievals（N 个）
+
+        '
+      required:
+      - document_version_id
+      - document_id
+      - version_number
+      - version_status
+      - processing_status
+      - progress_percent
+      - retrievals
+      properties:
+        document_version_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        version_number:
+          type: integer
+          minimum: 1
+        version_status:
+          $ref: '#/components/schemas/VersionStatus'
+        processing_status:
+          $ref: '#/components/schemas/ProcessingStatus'
+          description: '由该版本全部 retrieval 的绑定状态聚合而来。
+
+
+            规则：全部 completed 才是 completed；任一 failed 即 failed；
+
+            任一 processing 即 processing；否则 pending。
+
+            '
+        progress_percent:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          description: '与最近一次运行的 progress_percent 一致。
+
+            尚无运行时为 0。
+
+            '
+        processor:
+          oneOf:
+          - $ref: '#/components/schemas/ProcessorProgress'
+          - type: 'null'
+        retrievals:
+          type: array
+          description: '扇出的 N 路 retrieval，不分页（数量级很小）。
+
+            '
+          items:
+            $ref: '#/components/schemas/RetrievalProgressItem'
+        latest_run:
+          oneOf:
+          - $ref: '#/components/schemas/PipelineRunProgressResponse'
+          - type: 'null'
+          description: '最近一次运行。尚无运行时为 null。
+
+            '
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        completed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+        updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+
+    DocumentProgressResponse:
+      type: object
+      description: '文档级进度摘要，供列表页使用。**不含**节点明细与
+
+        retrieval 拆解 —— 需要细节时按 current_document_version_id
+
+        调版本进度接口。
+
+        '
+      required:
+      - document_id
+      - processing_status
+      - progress_percent
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        title:
+          type:
+          - string
+          - 'null'
+        current_document_version_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        processing_status:
+          $ref: '#/components/schemas/ProcessingStatus'
+        progress_percent:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+        latest_run_status:
+          oneOf:
+          - $ref: '#/components/schemas/RunStatus'
+          - type: 'null'
+        error_message:
+          type:
+          - string
+          - 'null'
+        updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+
+    DocumentProgressListResponse:
+      type: object
+      required:
+      - items
+      - missing_document_ids
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentProgressResponse'
+        missing_document_ids:
+          type: array
+          description: '查不到的 document_id（不存在或已逻辑删除）。
+
+
+            放在这里而不是让整个请求失败 —— 列表页局部失效
+
+            不该拖垮整页。
+
+            '
+          items:
+            type: string
+            format: uuid
+
+    # ========================================================
+    # Reprocess
+    # ========================================================
+
+    ReprocessDocumentVersionRequest:
+      type: object
+      properties:
+        document_processor_definition_ids:
+          type: array
+          description: '留空表示重跑全部适用的 retrieval。
+
+            非空表示只重跑这些 processor 映射到的 retrieval。
+
+            '
+          items:
+            type: string
+            format: uuid
+        force:
+          type: boolean
+          default: false
+          description: '绕过"已完成即跳过"的短路。
+
+            '
+    ReprocessDocumentVersionResponse:
+      type: object
+      required:
+      - document_version_id
+      - status
+      properties:
+        document_version_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/ProcessingStatus'
+          description: '受理时该版本的聚合处理状态。不是本次运行的状态 ——
+
+            本次运行刚被受理，还没开始跑。
+
+            '
+        job_id:
+          type:
+          - string
+          - 'null'
+          description: '本次运行的 pipeline_run_id。
+
+
+            拿它去 GET /pipeline-runs/{pipeline_run_id}/progress 查进度。
+
+            派发器未接线时为空。
+
+            '
+        message:
+          type: string

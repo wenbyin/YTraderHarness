@@ -1,0 +1,789 @@
+openapi: 3.1.0
+
+info:
+  title: Tool Definition Management API
+  version: 1.0.0
+  description: |
+    Tool Definition Management.
+
+    Responsibilities:
+      - Discover and synchronize tool definitions from code/runtime sources.
+      - Expose code-owned tool metadata.
+      - Manage documentation overrides.
+      - Manage business classifications used by LLM and JEV.
+
+    Non-responsibilities:
+      - Group management
+      - Permission management
+      - Tag management
+      - Processor chain management
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Tools
+    description: Tool definition management
+  - name: Tool Documentation
+    description: Tool docstring overrides
+  - name: Tool Classifications
+    description: Tool business classification
+  - name: Classifications
+    description: Classification taxonomy management
+  - name: Discovery
+    description: Tool discovery and synchronization
+
+
+paths:
+
+  /tools:
+    get:
+      tags:
+        - Tools
+      summary: List tool definitions
+      operationId: listTools
+      parameters:
+        - name: keyword
+          in: query
+          schema:
+            type: string
+
+        - name: source_type
+          in: query
+          schema:
+            type: string
+
+        - name: classification_code
+          in: query
+          schema:
+            type: string
+
+        - name: source_state
+          in: query
+          schema:
+            type: string
+            enum:
+              - ACTIVE
+              - MISSING
+
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 20
+
+      responses:
+        '200':
+          description: Tool list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PagedToolSummaryResponse'
+
+
+  /tools/{tool_id}:
+    get:
+      tags:
+        - Tools
+      summary: Get tool definition
+      operationId: getTool
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+
+      responses:
+        '200':
+          description: Tool definition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolDefinitionDetail'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+  /tools/discovery/sync:
+    post:
+      tags:
+        - Discovery
+      summary: Synchronize tool definitions
+      operationId: syncTools
+
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolSyncRequest'
+
+      responses:
+        '200':
+          description: Synchronization result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolSyncResult'
+
+
+  /tools/{tool_id}/documentation:
+    get:
+      tags:
+        - Tool Documentation
+      summary: Get tool documentation
+      operationId: getToolDocumentation
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+
+      responses:
+        '200':
+          description: Documentation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolDocumentation'
+
+    put:
+      tags:
+        - Tool Documentation
+      summary: Replace tool documentation overrides
+      operationId: replaceToolDocumentation
+
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolDocumentationUpdate'
+
+      responses:
+        '200':
+          description: Updated documentation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolDocumentation'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+  /tools/{tool_id}/classifications:
+    get:
+      tags:
+        - Tool Classifications
+      summary: Get tool classifications
+      operationId: getToolClassifications
+
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+
+      responses:
+        '200':
+          description: Classification list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Classification'
+
+    put:
+      tags:
+        - Tool Classifications
+      summary: Replace tool classifications
+      operationId: replaceToolClassifications
+
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolClassificationUpdate'
+
+      responses:
+        '200':
+          description: Updated classifications
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Classification'
+
+
+  /classifications:
+    get:
+      tags:
+        - Classifications
+      summary: List classification taxonomy
+      operationId: listClassifications
+
+      parameters:
+        - name: parent_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+            nullable: true
+
+        - name: keyword
+          in: query
+          schema:
+            type: string
+
+        - name: is_active
+          in: query
+          schema:
+            type: boolean
+
+      responses:
+        '200':
+          description: Classification list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Classification'
+
+    post:
+      tags:
+        - Classifications
+      summary: Create classification
+      operationId: createClassification
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClassificationCreate'
+
+      responses:
+        '201':
+          description: Classification created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Classification'
+
+
+  /classifications/{classification_id}:
+    get:
+      tags:
+        - Classifications
+      summary: Get classification
+      operationId: getClassification
+
+      parameters:
+        - $ref: '#/components/parameters/ClassificationId'
+
+      responses:
+        '200':
+          description: Classification
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Classification'
+
+    patch:
+      tags:
+        - Classifications
+      summary: Update classification
+      operationId: updateClassification
+
+      parameters:
+        - $ref: '#/components/parameters/ClassificationId'
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClassificationUpdate'
+
+      responses:
+        '200':
+          description: Updated classification
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Classification'
+
+
+components:
+
+  parameters:
+
+    ToolId:
+      name: tool_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    ClassificationId:
+      name: classification_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+
+  schemas:
+
+    ToolManifest:
+      type: object
+      required:
+        - id
+        - tool_key
+        - name
+        - source_type
+        - input_schema
+        - source_state
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+
+        tool_key:
+          type: string
+          readOnly: true
+
+        name:
+          type: string
+          readOnly: true
+
+        source_type:
+          type: string
+          readOnly: true
+
+        source_ref:
+          type: string
+          nullable: true
+          readOnly: true
+
+        entrypoint:
+          type: string
+          nullable: true
+          readOnly: true
+
+        input_schema:
+          type: object
+          readOnly: true
+
+        output_schema:
+          type: object
+          nullable: true
+          readOnly: true
+
+        source_docstring:
+          type: object
+          nullable: true
+          readOnly: true
+          description: >-
+            从代码 docstring 解析出的结构。raw 是原文，永远保留；
+            其余是从 raw 或 input_schema 提炼出的读得出来的入口。
+          properties:
+            raw:
+              type: string
+              nullable: true
+              description: docstring 原文，未切分。
+
+            description:
+              type: string
+              nullable: true
+              description: >-
+                正文：第一个节标题之前的全部内容。docstring 没有
+                分节时它与 raw 相同。没有 docstring 时不出现。
+
+            returns:
+              type: string
+              nullable: true
+              description: >-
+                返回值说明。输出模型的 docstring 优先；没有输出模型
+                时才回落到方法里的 Returns 段。两者都没有则不出现。
+
+            parameters:
+              type: object
+              additionalProperties:
+                type: string
+              description: >-
+                参数说明。键是 input_schema 的 JSON Pointer（例如
+                /input_text），与 parameter_path 同一套写法。
+
+        manifest_hash:
+          type: string
+          readOnly: true
+
+        source_state:
+          type: string
+          enum:
+            - ACTIVE
+            - MISSING
+          readOnly: true
+
+        discovered_at:
+          type: string
+          format: date-time
+          readOnly: true
+
+        last_synced_at:
+          type: string
+          format: date-time
+          readOnly: true
+
+
+    ToolDocumentation:
+      type: object
+      required:
+        - tool_id
+      properties:
+        tool_id:
+          type: string
+          format: uuid
+          readOnly: true
+
+        description_override:
+          type: string
+          nullable: true
+
+        return_description_override:
+          type: string
+          nullable: true
+
+        parameter_descriptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParameterDocumentation'
+
+        effective_description:
+          type: string
+          nullable: true
+          readOnly: true
+
+        effective_return_description:
+          type: string
+          nullable: true
+          readOnly: true
+
+        updated_by:
+          type: string
+          nullable: true
+          readOnly: true
+
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          readOnly: true
+
+
+    ParameterDocumentation:
+      type: object
+      required:
+        - parameter_path
+      properties:
+        parameter_path:
+          type: string
+          example: /query
+
+        source_description:
+          type: string
+          nullable: true
+          readOnly: true
+
+        description_override:
+          type: string
+          nullable: true
+
+        effective_description:
+          type: string
+          nullable: true
+          readOnly: true
+
+
+    ToolDocumentationUpdate:
+      type: object
+      properties:
+        description_override:
+          type: string
+          nullable: true
+
+        return_description_override:
+          type: string
+          nullable: true
+
+        parameter_descriptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ParameterDocumentationUpdate'
+
+
+    ParameterDocumentationUpdate:
+      type: object
+      required:
+        - parameter_path
+      properties:
+        parameter_path:
+          type: string
+
+        description_override:
+          type: string
+          nullable: true
+
+
+    Classification:
+      type: object
+      required:
+        - id
+        - code
+        - name
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+
+        code:
+          type: string
+
+        name:
+          type: string
+
+        description:
+          type: string
+          nullable: true
+
+        parent_id:
+          type: string
+          format: uuid
+          nullable: true
+
+        sort_order:
+          type: integer
+
+        is_active:
+          type: boolean
+
+
+    ToolClassificationUpdate:
+      type: object
+      required:
+        - classification_ids
+      properties:
+        classification_ids:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+
+
+    ClassificationCreate:
+      type: object
+      required:
+        - code
+        - name
+      properties:
+        code:
+          type: string
+
+        name:
+          type: string
+
+        description:
+          type: string
+          nullable: true
+
+        parent_id:
+          type: string
+          format: uuid
+          nullable: true
+
+        sort_order:
+          type: integer
+          default: 0
+
+
+    ClassificationUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+
+        description:
+          type: string
+          nullable: true
+
+        parent_id:
+          type: string
+          format: uuid
+          nullable: true
+
+        sort_order:
+          type: integer
+
+        is_active:
+          type: boolean
+
+
+    ToolSummary:
+      type: object
+      required:
+        - id
+        - tool_key
+        - name
+        - source_type
+        - source_state
+      properties:
+        id:
+          type: string
+          format: uuid
+
+        tool_key:
+          type: string
+
+        name:
+          type: string
+
+        source_type:
+          type: string
+
+        source_state:
+          type: string
+          enum:
+            - ACTIVE
+            - MISSING
+
+        description:
+          type: string
+          nullable: true
+          readOnly: true
+
+        classifications:
+          type: array
+          readOnly: true
+          items:
+            $ref: '#/components/schemas/Classification'
+
+
+    ToolDefinitionDetail:
+      type: object
+      required:
+        - manifest
+        - documentation
+        - classifications
+      properties:
+        manifest:
+          $ref: '#/components/schemas/ToolManifest'
+
+        documentation:
+          $ref: '#/components/schemas/ToolDocumentation'
+
+        classifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/Classification'
+
+
+    PagedToolSummaryResponse:
+      type: object
+      required:
+        - items
+        - page
+        - page_size
+        - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolSummary'
+
+        page:
+          type: integer
+
+        page_size:
+          type: integer
+
+        total:
+          type: integer
+
+
+    ToolSyncRequest:
+      type: object
+      properties:
+        source_types:
+          type: array
+          items:
+            type: string
+          description: |
+            Optional source type filter.
+            Empty means all discoverable sources.
+
+        source_refs:
+          type: array
+          items:
+            type: string
+          description: |
+            Optional source filter.
+
+        remove_missing:
+          type: boolean
+          default: false
+          description: |
+            Whether physically remove definitions missing from
+            the latest discovery result.
+            Recommended to keep false.
+
+
+    ToolSyncResult:
+      type: object
+      required:
+        - scanned
+        - created
+        - updated
+        - unchanged
+        - missing
+      properties:
+        scanned:
+          type: integer
+
+        created:
+          type: integer
+
+        updated:
+          type: integer
+
+        unchanged:
+          type: integer
+
+        missing:
+          type: integer
+
+        orphaned_documentations:
+          type: integer
+
+
+  responses:
+
+    NotFound:
+      description: Resource not found

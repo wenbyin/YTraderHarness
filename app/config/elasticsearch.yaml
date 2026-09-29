@@ -1,0 +1,62 @@
+# Elasticsearch 数据源。
+#
+# 对应容器：
+#   docker run -d --name elasticsearch -p 9200:9200 \
+#     -e discovery.type=single-node -e ELASTIC_PASSWORD=123456 \
+#     -e xpack.security.enabled=true \
+#     -e xpack.security.http.ssl.enabled=false \
+#     -e xpack.security.transport.ssl.enabled=false \
+#     elastic/elasticsearch:9.5.3
+#
+# ⚠️ 当前 ES **没有数据持久化**：elastic/elasticsearch:9.5.3 这个镜像
+#    不声明 VOLUME，上面也没挂卷，所以索引数据在容器可写层里 ——
+#    容器 stop/start 还在，但 `docker rm` 之后就没了。
+#    要持久化就自己加一个命名卷重建（我没能代跑：命令里出现
+#    /usr/share/... 会被本机 Claude Code 的路径防护整条拦下）：
+#        docker rm -f elasticsearch
+#        docker volume create elasticsearch-data
+#        docker run -d --name elasticsearch -p 9200:9200 \
+#          -e discovery.type=single-node -e ELASTIC_PASSWORD=123456 \
+#          -e xpack.security.enabled=true \
+#          -e xpack.security.http.ssl.enabled=false \
+#          -e xpack.security.transport.ssl.enabled=false \
+#          -v elasticsearch-data:/usr/share/elasticsearch/data \
+#          elastic/elasticsearch:9.5.3
+#    （重建后要重跑下面那行建 y_trader 的命令）
+#
+# 应用用 y_trader 这个超管账号，不用内置的 elastic ——
+# elastic 是内置用户，名字改不了，只能另建一个：
+#   curl -u elastic:123456 -X POST \
+#     "http://localhost:9200/_security/user/y_trader" \
+#     -H 'Content-Type: application/json' \
+#     -d '{"password":"123456","roles":["superuser"]}'
+#
+# 覆盖方式：ES_HOST / ES_USERNAME / ES_PASSWORD
+
+name: elasticsearch
+type: elasticsearch
+
+enabled: true
+
+# 本地开发连不上时只打 warning 并跳过，应用照常启动；
+# 生产要强校验（连不上就别启动）就改成 true。
+required: false
+
+startup_timeout_seconds: 5
+
+config:
+  hosts:
+    - "${ES_HOST:-http://localhost:9200}"
+
+  username: "${ES_USERNAME:-y_trader}"
+  password: "${ES_PASSWORD:-123456}"
+
+  # 容器是上面那样起的：http 端口，TLS 关掉了。
+  # 所以这里没有证书可校验 —— 保持 true 不会报错（http 走不到
+  # 证书逻辑），但语义上是 false 更准确。
+  #
+  # 若哪天把 xpack.security.http.ssl.enabled 打开，这里必须同时
+  # 换成 CA 证书（往配置里加 ca_certs 指向 http_ca.crt）：
+  # 自签证书下 verify_certs: true 会直接握手失败。
+  verify_certs: false
+  request_timeout: 5

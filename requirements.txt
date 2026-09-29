@@ -1,0 +1,168 @@
+# YTrader Agent — 运行时依赖
+#
+# 环境：Python 3.14 (CPython, win_amd64)
+#
+# 全部依赖在 cp314 上都有预编译 wheel，无需源码编译。
+# 验证方式（要求只有二进制包可解，否则视为不可用）：
+#
+#     python -m pip install --dry-run --only-binary=:all: -r requirements.txt
+#
+# 精确 pin 是为了让 3.14 这个较新的解释器上环境可复现；
+# 升级时请整组一起升并重跑上面的 --dry-run。
+
+# ============================================================
+# Web 框架
+# ============================================================
+
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn==0.52.4
+python-multipart==0.0.32
+
+# ============================================================
+# 数据校验
+# ============================================================
+
+pydantic==2.13.5
+pydantic_core==2.46.5
+annotated-types==0.8.0
+annotated-doc==0.0.5
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+
+# ============================================================
+# 数据库
+# ============================================================
+
+SQLAlchemy==2.0.52
+asyncpg==0.31.0
+greenlet==3.5.5
+
+# LangGraph checkpointer 走 psycopg 而非 SQLAlchemy，
+# 因此这里同时存在两套驱动，且两套连接池相互独立：
+#
+#   asyncpg      -> SQLAlchemy 业务读写
+#   psycopg (v3) -> LangGraph checkpointer
+#
+# 二者 DSN 不同（后者不能带 +asyncpg 方言后缀），
+# 见 app/infra/datasource/models.py::resolved_dsn_psycopg。
+psycopg[binary,pool]==3.3.5
+
+# 历史遗留：当前代码路径未使用，保留以免破坏既有本地环境
+psycopg2==2.9.13
+
+# ============================================================
+# 图存储
+# ============================================================
+#
+# Neo4j 官方异步驱动（AsyncGraphDatabase），供 GraphRAG /
+# 实体关系检索使用。pure-python，cp314 无需编译；
+# pytz 是它的传递依赖，一并 pin 住。
+#
+# 注意：驱动 6.x 需要服务端 >= 5.0。连 4.x 实例要降到 5.x 驱动。
+
+neo4j==6.3.1
+
+# ============================================================
+# 检索 / 向量
+# ============================================================
+
+elasticsearch==9.5.1
+elastic-transport==9.4.2
+pymilvus==3.0.1
+
+# AsyncElasticsearch 的 HTTP 后端（elastic_transport 默认的
+# AiohttpHttpNode）。缺了它，AsyncElasticsearch 一构造就抛
+#   ValueError: You must have 'aiohttp' installed to use AiohttpHttpNode
+# 被 startup 降级成一条 "Optional datasource unavailable" 警告，
+# ES 从此静默不可用 —— 所以必须显式声明，不能指望传递依赖。
+#
+# 不用 httpx 后端（HttpxAsyncHttpNode）的原因见
+# app/infra/datasource/elasticsearch.py：那个 client 的
+# trust_env 是开着的，会把 localhost 请求也塞进系统代理。
+#
+# aiohttp 带 C 扩展，但 cp314 有预编译 wheel（已按文件头的方式
+# 用 --only-binary=:all: 验证过），不违反"无需源码编译"的约定。
+aiohttp==3.14.3
+
+# ============================================================
+# Pipeline 编排
+# ============================================================
+#
+# 组合验证过（见 requirements-dev.txt 的同名说明）：
+#   langgraph 1.2.11 + langgraph-checkpoint-postgres 3.1.2
+#   -> 拉起 langgraph-checkpoint 4.2.0 + langchain-core 1.6.3
+#
+# 注意：runtime.execution_info（node_attempt / task_id）需要
+# langgraph >= 1.1.5。低于该版本时 app/infra/graph/instrumentation.py
+# 的 getattr 兜底会让流程降级运行但不崩，但重试计数会恒为 1。
+
+langgraph==1.2.11
+langgraph-checkpoint-postgres==3.1.2
+
+# ============================================================
+# 序列化 / 配置
+# ============================================================
+
+orjson==3.12.0
+PyYAML==6.0.3
+python-dotenv==1.2.3
+
+# ============================================================
+# 数据处理
+# ============================================================
+
+numpy==2.5.3
+pandas==3.0.5
+python-dateutil==2.9.0.post0
+six==1.17.0
+
+# 分块长度度量：length_function='token' 时按 o200k_base 分词计数。
+#
+# 只在选 token 模式时才被 import（chunker/txt.py 里惰性加载），
+# 因此 char 模式完全不付它的启动成本。
+#
+# ⚠️ 首次调用会**联网下载** BPE 词表并缓存到本地。
+# 离线 / 镜像环境需要预先下载并设置 TIKTOKEN_CACHE_DIR，
+# 否则第一次切分会很慢甚至失败。
+tiktoken==0.14.0
+regex==2026.9.10
+
+# 本地向量化：走 Ollama（embedder/ollama.py）。
+#
+# langchain-ollama 只是 OllamaEmbeddings 这层薄封装；ollama 是官方
+# Python 客户端（pure-python，无编译依赖）。base_url 刻意不配 ——
+# OllamaEmbeddings 会自己读 OLLAMA_HOST，默认 http://127.0.0.1:11434。
+langchain-ollama==1.1.0
+ollama==0.6.2
+
+# ============================================================
+# 传输 / 其他
+# ============================================================
+
+requests==2.34.2
+urllib3==2.7.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+idna==3.19
+anyio==4.15.1
+sniffio==1.3.1
+h11==0.16.0
+click==8.5.0
+cachetools==7.1.8
+protobuf==7.36.1
+grpcio==1.83.1
+tzdata==2026.3
+pytz==2026.3.post1
+
+# aiohttp 的传递依赖（见上面 elasticsearch 段）。aiohttp 带 C 扩展，
+# 它这一串同样是预编译 wheel。
+aiohappyeyeballs==2.7.1
+aiosignal==1.4.0
+attrs==26.1.0
+frozenlist==1.8.0
+multidict==6.9.0
+propcache==0.5.4
+yarl==1.25.1
+
+python-magic

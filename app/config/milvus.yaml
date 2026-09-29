@@ -1,0 +1,34 @@
+# Milvus 数据源。
+#
+# 对应容器（数据目录用命名卷，不要用 Windows bind mount —— 见下）：
+#   docker run -d --name milvus-standalone -p 19530:19530 -p 9091:9091 \
+#     -e ETCD_USE_EMBED=true -e ETCD_DATA_DIR=/var/lib/milvus/etcd \
+#     -e COMMON_STORAGETYPE=local -e DEPLOY_MODE=STANDALONE \
+#     -v milvus-data:/var/lib/milvus \
+#     -v "F:\milvus\user.yaml:/milvus/configs/user.yaml" \
+#     milvusdb/milvus:v3.0-beta milvus run standalone
+#
+# 数据目录必须是命名卷：之前挂在 F:\milvus\volumes（Windows bind
+# mount）时 embedded etcd 会 panic（etcdserver: leader changed），
+# 因为 etcd 依赖的 fsync / 文件锁语义在 9p / virtiofs 上不可靠。
+#
+# 鉴权在 F:\milvus\user.yaml 里开启（authorizationEnabled: true）。
+# y_trader 是启动后用 API 建的 admin 用户。
+
+name: milvus
+type: milvus
+
+enabled: true
+
+# 连不上时只打 warning 并跳过；生产要强校验就改成 true。
+required: false
+
+startup_timeout_seconds: 5
+
+config:
+  uri: "${MILVUS_URI:-http://localhost:19530}"
+
+  # Milvus 的凭据格式就是 "用户名:密码" 一个字符串。
+  token: "${MILVUS_TOKEN:-y_trader:123456}"
+
+  db_name: "default"

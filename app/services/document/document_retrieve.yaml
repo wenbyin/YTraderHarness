@@ -1,0 +1,800 @@
+openapi: 3.1.0
+
+info:
+  title: Document Retrieve API
+  version: 1.0.0
+  description: |
+    Business-level retrieval API for Document Service.
+
+    Retrieve processing rules:
+      - Single document_type_definition_id:
+        use the RetrieveProcessor configured by that document type definition.
+      - Multiple document_type_definition_ids:
+        execute each document type definition with its own RetrieveProcessor,
+        then pass the combined results through COMMON_RETRIEVE_PROCESSOR_CHAIN.
+      - Runtime retrieve_processor configuration may override only:
+        Fusioner, Filter, Reranker, and Cutter.
+      - Recaller is an internal implementation detail and is not exposed
+        through the public API.
+      - Each API call represents exactly one retrieval round.
+        The service does not automatically expand recall, rewrite queries,
+        retry retrieval, or start an agent loop.
+
+servers:
+  - url: /api/v1
+    description: Document Service API
+
+tags:
+  - name: Document Retrieve
+    description: Business-level document retrieval
+
+paths:
+  /documents/retrieve:
+    post:
+      tags:
+        - Document Retrieve
+      operationId: retrieveDocuments
+      summary: Retrieve documents
+      description: |
+        Execute one retrieval round against one or more document type definitions.
+
+        Default RetrieveProcessor resolution:
+          1. One document type definition -> that definition's RetrieveProcessor.
+          2. Multiple document type definitions -> each definition's RetrieveProcessor,
+             followed by COMMON_RETRIEVE_PROCESSOR_CHAIN.
+
+        Runtime override precedence:
+          runtime retrieve_processor field
+            > configured RetrieveProcessor
+            > system default
+
+        Only Fusioner, Filter, Reranker, and Cutter may be overridden.
+        Recaller selection remains internal to the Document Service.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentRetrieveRequest'
+            examples:
+              singleDtdDefault:
+                summary: Single DTD with default RetrieveProcessor
+                value:
+                  document_type_definition_ids:
+                    - 3f1a6c2e-0b7d-4a51-9c8e-1d2f3a4b5c60
+                  input_text: "比亚迪2025年第一大股东是谁？"
+
+              singleDtdOverride:
+                summary: Single DTD with runtime overrides
+                value:
+                  document_type_definition_ids:
+                    - 3f1a6c2e-0b7d-4a51-9c8e-1d2f3a4b5c60
+                  input_text: "比亚迪2025年第一大股东是谁？"
+                  retrieve_processor:
+                    fusioner:
+                      enabled: true
+                      type: rrf
+                      top_k: 50
+                    filter:
+                      enabled: true
+                      score_threshold: 0.30
+                    reranker:
+                      enabled: true
+                      type: cross_encoder
+                      top_n: 50
+                    cutter:
+                      top_k: 10
+
+              multiDtdDefault:
+                summary: Cross-DTD retrieval using common chain
+                value:
+                  document_type_definition_ids:
+                    - 3f1a6c2e-0b7d-4a51-9c8e-1d2f3a4b5c60
+                    - 7c9e1b34-5d2a-4e6f-8a0b-2c3d4e5f6a71
+                    - b2d4f6a8-1c3e-4b5d-9f70-3a4b5c6d7e82
+                  input_text: "比亚迪2025年的第一大股东及其持股关系"
+
+              multiDtdOverride:
+                summary: Cross-DTD retrieval with common-chain overrides
+                value:
+                  document_type_definition_ids:
+                    - 3f1a6c2e-0b7d-4a51-9c8e-1d2f3a4b5c60
+                    - b2d4f6a8-1c3e-4b5d-9f70-3a4b5c6d7e82
+                  input_text: "比亚迪2025年的第一大股东及其股权关系"
+                  retrieve_processor:
+                    fusioner:
+                      enabled: true
+                      type: rrf
+                      top_k: 100
+                      rrf_k: 60
+                    filter:
+                      enabled: true
+                      metadata:
+                        company_code: "002594"
+                    reranker:
+                      enabled: true
+                      type: cross_encoder
+                      top_n: 100
+                    cutter:
+                      top_k: 20
+      responses:
+        '200':
+          description: Retrieval completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentRetrieveResponse'
+              examples:
+                singleDtdResult:
+                  value:
+                    retrieve_id: "2f3be2e5-735c-4d67-8d6d-9b13b8fce2d3"
+                    retrieve_scope: single
+                    retrieve_processor_mode: dtd
+                    document_type_definition_ids:
+                      - 3f1a6c2e-0b7d-4a51-9c8e-1d2f3a4b5c60
+                    results:
+                      - rank: 1
+                        score: 0.9421
+                        document_chunk_id: e5f6a7b8-c9d0-4e1f-8a2b-3c4d5e6f7081
+                        document_version_id: d4e5f6a7-b8c9-4d0e-9f1a-2b3c4d5e6f70
+                        document_id: a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d
+                        document_type_definition_id: 3f1a6c2e-0b7d-4a51-9c8e-1d2f3a4b5c60
+                        pipeline_keys:
+                          - keyword
+                        content: "截至2025年年报披露，比亚迪第一大股东为王传福。"
+                        metadata:
+                          page_number: 56
+                          company_code: "002594"
+                    retrieve_processor:
+                      source: document_type_definition
+                      fusioner:
+                        enabled: true
+                        type: rrf
+                        top_k: 50
+                        rrf_k: 60
+                      filter:
+                        enabled: true
+                        score_threshold: 0.30
+                      reranker:
+                        enabled: true
+                        type: cross_encoder
+                        top_n: 50
+                      cutter:
+                        top_k: 10
+
+                multiDtdResult:
+                  value:
+                    retrieve_id: "f5f5b1e0-2b40-4d66-9b9b-3f8d4b7fd981"
+                    retrieve_scope: multi
+                    retrieve_processor_mode: common_chain
+                    document_type_definition_ids:
+                      - 3f1a6c2e-0b7d-4a51-9c8e-1d2f3a4b5c60
+                      - b2d4f6a8-1c3e-4b5d-9f70-3a4b5c6d7e82
+                    results:
+                      - rank: 1
+                        score: 0.9317
+                        document_chunk_id: e5f6a7b8-c9d0-4e1f-8a2b-3c4d5e6f7081
+                        document_version_id: d4e5f6a7-b8c9-4d0e-9f1a-2b3c4d5e6f70
+                        document_id: a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d
+                        document_type_definition_id: 3f1a6c2e-0b7d-4a51-9c8e-1d2f3a4b5c60
+                        pipeline_keys:
+                          - keyword
+                        content: "截至2025年年报披露，比亚迪第一大股东为王传福。"
+                        metadata:
+                          page_number: 56
+                          company_code: "002594"
+                      - rank: 2
+                        score: 0.9143
+                        document_chunk_id: f6a7b8c9-d0e1-4f2a-9b3c-4d5e6f708192
+                        document_version_id: d4e5f6a7-b8c9-4d0e-9f1a-2b3c4d5e6f70
+                        document_id: a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d
+                        document_type_definition_id: b2d4f6a8-1c3e-4b5d-9f70-3a4b5c6d7e82
+                        pipeline_keys:
+                          - graph
+                        content: "王传福持有比亚迪相关股权关系。"
+                        metadata:
+                          company_code: "002594"
+                    retrieve_processor:
+                      source: common_retrieve_processor_chain
+                      fusioner:
+                        enabled: true
+                        type: rrf
+                        top_k: 100
+                        rrf_k: 60
+                      filter:
+                        enabled: true
+                        metadata:
+                          company_code: "002594"
+                      reranker:
+                        enabled: true
+                        type: cross_encoder
+                        top_n: 100
+                      cutter:
+                        top_k: 20
+
+        '400':
+          description: Invalid retrieve request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Access denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: One or more document type definitions do not exist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Internal retrieve processing error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    DocumentRetrieveRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - document_type_definition_ids
+        - input_text
+      properties:
+        document_type_definition_ids:
+          type: array
+          description: |
+            One or more business document type definitions to retrieve from.
+
+            Resolution:
+              - 1 ID -> the corresponding DTD RetrieveProcessor.
+              - >1 IDs -> each DTD RetrieveProcessor, then COMMON_RETRIEVE_PROCESSOR_CHAIN.
+          minItems: 1
+          maxItems: 50
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+
+        input_text:
+          type: string
+          description: Natural-language query text.
+          minLength: 1
+          maxLength: 10000
+
+        retrieval_types:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: |
+            Restrict recall to these routes. Omitted/null = every route the
+            DTD has configured.
+
+            **Intersection semantics**: the list only *filters* the routes
+            the DTD actually has — it never conjures routes that were never
+            configured. Naming a type the document does not have is
+            therefore not an error; it simply filters nothing out. When
+            none of the named routes exist the result is empty, not 400.
+
+            An **empty array is rejected** (422) rather than treated as
+            "all": null already means "all", and under intersection
+            semantics [] means "no routes at all" — a result callers
+            essentially never want. Rejecting is safer than guessing.
+
+            Filtered-out routes do not contribute scores and do not appear
+            in pipeline_keys.
+          items:
+            type: string
+            description: |
+              Same value domain as pipeline_keys. Deliberately not an
+              inline enum — RetrievalType is defined once in
+              document_type_definition.yaml.
+
+        retrieval_config:
+          type: object
+          description: |
+            Per-route recall parameters, keyed by retrieval type. Routes and
+            fields that are omitted fall back to their defaults.
+
+            Division of labour with retrieval_types: that one decides **which
+            routes run**, this one decides **how wide they run**.
+
+            Keys **must** be valid retrieval types. A typo such as
+            "dense_vectorr" is rejected with 422 rather than ignored —
+            a config that silently does nothing is the hardest kind of bug
+            to find. This is deliberately stricter than the intersection
+            semantics of retrieval_types, which is a *filter*; this is a
+            *config*, so a key that matches nothing is a mistake.
+
+            A valid key naming a route that retrieval_types did not select is
+            simply unused, not an error.
+          additionalProperties:
+            $ref: '#/components/schemas/RetrievalRecallConfig'
+
+        only_active:
+          type: boolean
+          default: true
+          description: |
+            Restrict retrieval to the currently active DocumentVersion.
+
+            Defaults to true. Set to false only to inspect what an older
+            (superseded / pending / failed) version contains — those
+            versions stay in the index because reprocessing never deletes
+            them, so without this flag stale content competes with current
+            content for the same result slots.
+
+            The filter is applied **inside the index query**, not after
+            hydration: filtering later would let superseded versions
+            consume the recall budget and silently shrink the result set.
+
+        retrieve_processor:
+          $ref: '#/components/schemas/RetrieveProcessorOverride'
+
+    RetrieveProcessorOverride:
+      type: object
+      additionalProperties: false
+      description: |
+        Optional runtime override for the current retrieval only.
+
+        Omitted fields inherit the selected default RetrieveProcessor.
+        Recaller configuration is intentionally excluded from this schema.
+      properties:
+        fusioner:
+          $ref: '#/components/schemas/FusionerConfig'
+
+        filter:
+          $ref: '#/components/schemas/FilterConfig'
+
+        reranker:
+          $ref: '#/components/schemas/RerankerConfig'
+
+        cutter:
+          $ref: '#/components/schemas/CutterConfig'
+
+    FusionerConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        type:
+          type: string
+          enum:
+            - rrf
+            - weighted_sum
+          default: rrf
+        top_k:
+          type: integer
+          minimum: 1
+          maximum: 5000
+          default: 50
+        rrf_k:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 60
+        weights:
+          type: object
+          description: |
+            Optional source weights for weighted_sum.
+            Keys are server-defined retrieval source identifiers.
+          additionalProperties:
+            type: number
+            minimum: 0
+
+    FilterConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled:
+          type: boolean
+          default: true
+
+        score_threshold:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: |
+            Minimum normalized score retained by the configured filter stage.
+
+        document_ids:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+
+        document_version_ids:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+
+        metadata:
+          type: object
+          description: |
+            Server-supported metadata conditions.
+            Exact matching semantics may be extended by implementation.
+          additionalProperties: true
+
+    RerankerConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled:
+          type: boolean
+          default: true
+
+        type:
+          type: string
+          enum:
+            - cross_encoder
+            - llm
+            - custom
+
+        model:
+          type: string
+          description: |
+            Optional reranker model identifier.
+
+            Either a local directory (e.g. G:\models\bge-reranker-v2-m3)
+            or a fully qualified Hub repo id (e.g. BAAI/bge-reranker-v2-m3).
+            When omitted, use the selected RetrieveProcessor's configured model.
+
+            A bare name such as "bge-reranker-v2-m3" is NOT valid - the Hub
+            reads it as an org/user name, builds a URL missing the "BAAI/"
+            segment, and goes to the network instead of using the local copy.
+
+        top_n:
+          type: integer
+          minimum: 1
+          maximum: 5000
+          description: Number of candidates passed into the reranker.
+
+    CutterConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        top_k:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 10
+          description: Maximum number of final retrieval results returned.
+
+        max_content_chars:
+          type: integer
+          minimum: 1
+          maximum: 200000
+          description: Optional maximum content length returned for each result.
+
+    RetrievalRecallConfig:
+      type: object
+      additionalProperties: false
+      description: |
+        Recall parameters for a single route — the stage *before* fusion.
+
+        Why request-level and not part of the DTD: this document states
+        elsewhere that the recaller is an internal implementation detail and
+        is not exposed through RetrieveProcessorOverride. That override's
+        four sections all run *after* recall; this one decides the size and
+        the cleanliness of the pool those sections then sort.
+      properties:
+        top_k:
+          type: integer
+          minimum: 1
+          maximum: 500
+          description: |
+            How many candidates this route recalls. Omitted = 200.
+
+            This is the **candidate pool** size, not the number of results
+            returned — that is cutter.top_k. A pool that is too narrow means
+            semantically relevant chunks that merely rank lower never enter
+            it, and no amount of fusion, reranking or cutting can recover
+            them.
+
+        min_score:
+          type: number
+          description: |
+            Score floor for this route, applied to **raw** scores (no
+            normalisation). Omitted = no filtering.
+
+            **The meaning depends on the retrieval type**, because raw score
+            scales differ per route:
+              keyword        BM25, unbounded (tens is normal)
+              sparse_vector  sparse dot product, unbounded
+              dense_vector   cosine, [-1, 1] — absolute
+            The same number therefore does something different on each
+            route, which is why it is given per route.
+
+            It **must** be pushed down to the index (Elasticsearch
+            min_score / Milvus radius) rather than applied after recall:
+            each route normalises its scores by dividing by the maximum
+            immediately after recall, which pins that route's top hit at
+            exactly 1.0 — comparing a threshold against normalised scores
+            can therefore never filter anything out.
+
+        search_params:
+          type: object
+          additionalProperties: true
+          description: |
+            Backend-specific search parameters, passed through verbatim.
+            Currently only consumed by dense_vector (Milvus), e.g. HNSW
+            ef / nprobe. Other backends have no equivalent and ignore it.
+
+            Note this is a different knob from top_k: too small an ef
+            **genuinely loses neighbours** — asking for top_k 200 with
+            ef 10 still does not return the true top 200.
+
+            metric_type cannot be overridden here; it is a physical fact
+            fixed at collection-creation time and is set by the backend.
+
+        timeout_ms:
+          type: integer
+          minimum: 1
+          maximum: 60000
+          description: |
+            Independent timeout for this route in milliseconds. Omitted =
+            no request-level timeout, deferring to the backend's own.
+
+            A timeout puts **only this route** into degraded_routes; the
+            others still return, matching how backend errors are handled.
+            Content recalled by the other routes is genuinely retrievable,
+            so failing the whole query would be wrong.
+
+    DocumentRetrieveResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - retrieve_id
+        - retrieve_scope
+        - retrieve_processor_mode
+        - document_type_definition_ids
+        - results
+      properties:
+        retrieve_id:
+          type: string
+          format: uuid
+
+        retrieve_scope:
+          type: string
+          enum:
+            - single
+            - multi
+
+        retrieve_processor_mode:
+          type: string
+          enum:
+            - dtd
+            - common_chain
+          description: |
+            dtd = one DTD RetrieveProcessor.
+            common_chain = per-DTD processing followed by COMMON_RETRIEVE_PROCESSOR_CHAIN.
+
+        document_type_definition_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentRetrieveResult'
+
+        degraded_routes:
+          type: array
+          default: []
+          description: |
+            Routes that could NOT take part in this round.
+
+            Empty means every route ran. Non-empty means `results` comes
+            only from the remaining routes and may be incomplete — it does
+            **not** mean "that is all the corpus holds".
+
+            Callers should check this field. A single failing backend
+            (Milvus recovering, ES timeout) is deliberately not allowed to
+            fail the whole request, because the other routes' hits are
+            genuinely retrievable; but the degradation is never silent.
+          items:
+            $ref: '#/components/schemas/DegradedRoute'
+
+        retrieve_processor:
+          $ref: '#/components/schemas/EffectiveRetrieveProcessor'
+
+    DegradedRoute:
+      type: object
+      additionalProperties: false
+      required:
+        - document_retrieval_definition_id
+        - retrieval_type
+        - reason
+      properties:
+        document_retrieval_definition_id:
+          type: string
+          format: uuid
+
+        retrieval_type:
+          type: string
+          description: |
+            Which retrieval direction the route was meant to serve.
+
+            Deliberately **not** an inline enum: RetrievalType is defined
+            once in document_type_definition.yaml, and restating its
+            members here is exactly the duplication the project forbids
+            (two copies drift). Same treatment as DocumentRetrieveResult's
+            pipeline_keys.
+
+        reason:
+          type: string
+          description: |
+            Why the route did not take part — the backend's error message,
+            or "not implemented yet". A warning is logged as well; it is
+            surfaced here so the caller is never left guessing.
+
+    DocumentRetrieveResult:
+      type: object
+      additionalProperties: false
+      required:
+        - rank
+        - score
+        - document_chunk_id
+        - document_version_id
+        - document_id
+        - document_type_definition_id
+        - content
+      properties:
+        rank:
+          type: integer
+          minimum: 1
+
+        score:
+          type: number
+          format: double
+
+        document_chunk_id:
+          type: string
+          format: uuid
+
+        document_version_id:
+          type: string
+          format: uuid
+
+        document_id:
+          type: string
+          format: uuid
+
+        document_type_definition_id:
+          type: string
+          format: uuid
+
+        pipeline_keys:
+          type: array
+          default: []
+          description: |
+            Every business retrieval direction that hit this result.
+
+            An array, not a single value: the same chunk being hit by
+            several routes at once is the most valuable thing fusion
+            produces. Scores are not comparable across routes (BM25 is
+            tens, cosine is 0..1), but "both routes selected it" is —
+            reporting only one route throws that signal away.
+
+            Values come from DocumentRetrievalDefinition.retrieval_type
+            (keyword / sparse_vector / dense_vector / graph / document).
+            Informational; not a caller-controlled Recaller parameter.
+          items:
+            type: string
+
+        content:
+          type: string
+
+        metadata:
+          type: object
+          additionalProperties: true
+
+        highlights:
+          type: object
+          default: {}
+          description: |
+            Index-side highlight fragments, **grouped by route**:
+
+                {"keyword": ["...<em>比亚迪</em>...", ...],
+                 "dense_vector": [...]}
+
+            Keys are the same value domain as pipeline_keys
+            (DocumentRetrievalDefinition.retrieval_type). Markers are
+            `<em>…</em>`.
+
+            Deliberately a map rather than one flat list: with several
+            routes hitting the same chunk, each route's fragments answer a
+            different question ("where did the keyword match" vs "what did
+            the dense route mark lexically"), and flattening them makes it
+            impossible to tell which fragment came from which route.
+
+            Only routes that **produced** fragments appear. Which routes
+            hit this chunk at all is pipeline_keys; this field answers
+            "what did each of them mark".
+
+            Absent/empty is normal and does not mean "no hit": ES's
+            sparse_vector query is a similarity search and never goes
+            through the highlighter, and Milvus marks lexically, which
+            need not correspond to why the vector matched.
+          additionalProperties:
+            type: array
+            items:
+              type: string
+
+    EffectiveRetrieveProcessor:
+      type: object
+      additionalProperties: false
+      required:
+        - source
+      properties:
+        source:
+          type: string
+          enum:
+            - document_type_definition
+            - common_retrieve_processor_chain
+            - runtime_override
+          description: |
+            Indicates the effective RetrieveProcessor origin.
+            Runtime override means the request supplied at least one override
+            that changed the effective configuration.
+
+        fusioner:
+          $ref: '#/components/schemas/FusionerConfig'
+
+        filter:
+          $ref: '#/components/schemas/FilterConfig'
+
+        reranker:
+          $ref: '#/components/schemas/RerankerConfig'
+
+        cutter:
+          $ref: '#/components/schemas/CutterConfig'
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+        request_id:
+          type: string

@@ -1,0 +1,485 @@
+openapi: 3.1.0
+info:
+  title: Document Processor Capability API
+  version: 1.0.0
+  description: 'Processor 能力目录接口。
+
+
+    前端用它回答两个问题：
+
+    - 平台有哪些可用的处理能力（解析 / 归一化 / 清洗 / 切分 / 向量化 …）
+
+    - 每种能力的参数该怎么填 —— 靠 config_schema 直接生成表单
+
+
+    本目录 vs /document-processors —— 不要混
+
+    ----------------------------------------
+
+    GET /document-processors 是**配置资源**：某个 DocumentTypeDefinition
+
+    下 .pdf 该走哪个 loader / processor，是可增删改的数据库行。
+
+    GET /document-processor-capabilities（本接口）是**代码里的能力**：
+
+    由后端反射发现，只读，不由用户创建。
+
+    前者的 loader_name / processor_name 等字段取值，正是本目录的
+
+    processor_key。两者是"配置引用能力"的关系，不是同一个资源。
+
+
+    processor_key 是契约键，config_schema 不是
+
+    ------------------------------------------
+
+    processor_key 一旦发布**永不复用**。它会被冻结进
+
+    PipelineConfigSnapshot（见 document.yaml），历史运行靠它解释
+
+    "当时用的是哪个能力"。
+
+
+    但 config_schema（以及它描述的参数集合）**不是**冻结值：
+
+    给一个能力新增参数是常规变更。前端不要把它缓存成永久事实。
+
+
+    能力目录答"平台能做什么"，不答"这个文件能不能传"
+
+    --------------------------------------------------
+
+    某个 DocumentTypeDefinition 是否接受某后缀，取决于它的
+
+    analysis_mode 与 DocumentProcessorDefinition ——
+
+    analysis_mode=config 时，缺少匹配该后缀的配置就不允许上传。
+
+    两者不要混。
+
+
+    不要硬编码 processor_key 清单
+
+    -----------------------------
+
+    目录由后端反射发现（见 pipeline/registry.py），
+
+    条目会随代码增减。因此规格里**故意不给 processor_key 设 enum**，
+
+    也不要假设列表长度稳定。
+
+    某个 role 下暂时一条都没有是正常状态（该 role 还没实现）。
+
+
+    role 的覆盖范围
+
+    ---------------
+
+    本枚举只覆盖**写入链**上有名字注册的能力，共 7 个。
+
+    刻意不包含查询期能力（retrieve / fuse / rerank）与 IndexBackend ——
+
+    前者不在写入流水线上，后者按 StorageBackend 注册而非按名字，
+
+    注册模型不同。需要时另行开接口，不要塞进本目录。
+
+
+    过滤与派生值
+
+    ------------
+
+    响应里的 support_suffix 是**派生并集**，并且**受查询过滤影响**：
+
+    传了 role 或 modality_type，并集就只统计过滤后的 loader 条目。
+
+    想要"全平台可解析后缀"的完整清单，不带任何参数调用一次并缓存。
+
+    '
+servers:
+- url: /api/v1
+tags:
+- name: Document Processor Capabilities
+  description: 处理能力目录（processor_key 契约表 + config_schema）
+paths:
+  /document-processor-capabilities:
+    get:
+      tags:
+      - Document Processor Capabilities
+      summary: List processor capabilities
+      operationId: listProcessorCapabilities
+      description: '平台当前的处理器能力目录。
+
+
+        不带参数时返回全部 role 的条目。
+
+        条目数量级很小（等于已注册的实现数），因此**不分页**。
+
+
+        排序由后端反射的发现顺序决定，前端需要稳定展示顺序时
+
+        请按 role + processor_key 自行排序，不要依赖返回顺序。
+
+        '
+      parameters:
+      - name: role
+        in: query
+        required: false
+        description: '只看某个阶段的能力。前端做"选解析器 / 选切分器"
+
+          这类下拉时用它。
+
+          '
+        schema:
+          $ref: '#/components/schemas/ProcessorRole'
+      - name: modality_type
+        in: query
+        required: false
+        description: '按模态过滤，对**所有 role** 都成立 ——
+
+          modality 是能力的适用域，不是 loader 专属。
+
+          「列出 audio 相关的全部能力」就用它。
+
+
+          注意它与 loader 的 selector 无关：loader 也有 modality_type，
+
+          但那是因为所有 role 都有，不是因为它在做后缀自选。
+
+          '
+        schema:
+          $ref: '#/components/schemas/ModalityType'
+      - name: file_extension
+        in: query
+        required: false
+        description: '只作用于 role=loader 的条目。例如 .txt 或 txt，
+
+          大小写不敏感。参数名与 GET /document-processors 的
+
+          file_extension 保持一致。
+
+          '
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Capability catalog of the current build.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessorCapabilityCatalogResponse'
+  /document-processor-capabilities/{processor_key}:
+    get:
+      tags:
+      - Document Processor Capabilities
+      summary: Get one processor capability
+      operationId: getProcessorCapability
+      description: '按 processor_key 查单个能力。
+
+
+        给前端解析一个"不认识的 key"用 —— 例如从历史
+
+        PipelineConfigSnapshot 里读到的 key，不必为了它拉整个目录。
+
+        404 时前端应回退到显示原始 key，而不是丢弃这条配置。
+
+        '
+      parameters:
+      - name: processor_key
+        in: path
+        required: true
+        description: '稳定能力标识，例如 TEXT_TXT_COMMON_PARSER。
+
+          '
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Processor capability entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessorCapabilityEntry'
+        '404':
+          $ref: '#/components/responses/NotFound'
+components:
+  responses:
+    NotFound:
+      description: 'Unknown processor_key for the current build.
+
+        '
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+
+    # ========================================================
+    # Enums
+    # ========================================================
+
+    ProcessorRole:
+      type: string
+      description: '能力在写入流水线里承担的阶段。
+
+
+        取值与 pipeline/catalog.py 的节点划分、以及各 role 的 ABC 对应：
+
+        loader          DocumentParser    阶段 3  文件 -> 文本/结构化内容
+        normalize       DocumentProcessor 阶段 4  编码 / 换行 / 空白 / 全半角
+        clean           DocumentProcessor 阶段 5  去页眉页脚 / 水印等噪声
+        enrich_metadata DocumentProcessor 阶段 6  抽取文档级元数据
+        chunk           ChunkStrategy     阶段 7  按 retrieval 切分
+        chunk_enrich    ChunkEnricher     阶段 8  补定位信息与继承元数据
+        embed           Embedder          阶段 9  文本 -> 向量
+
+
+        某 role 下暂时没有任何条目，表示该阶段还没实现 ——
+
+        不要当成接口出错。
+
+        '
+      enum:
+      - loader
+      - normalize
+      - clean
+      - enrich_metadata
+      - chunk
+      - chunk_enrich
+      - embed
+    ModalityType:
+      type: string
+      description: 'loader 所属模态，取自 DocumentParser.get_modality()。
+
+
+        取值与 parser/base.py 的 modality_types 白名单一致，共 4 个。
+
+
+        注意它**窄于** document_type_definition.yaml 的同名枚举 ——
+
+        后者多出 structured 与 multimodal。两份枚举尚未收敛，
+
+        前端同时消费两个接口时不要直接做值相等判断。
+
+        '
+      enum:
+      - text
+      - image
+      - audio
+      - video
+
+    # ========================================================
+    # Capability catalog
+    # ========================================================
+
+    ProcessorCapabilitySelector:
+      type: object
+      description: '**仅 role=loader 出现。**
+
+
+        装的是"文件刚进来、还没查任何配置时，按什么把 loader 选出来"
+
+        的两个谓词，对应 DocumentParser 的 supports() 与 is_default()。
+
+
+        为什么只有 loader 有：文件带着后缀进来，在任何人查配置**之前**，
+
+        系统必须先决定"谁能读它"。其余 role 都是被配置显式点名的
+
+        （chunker_name / processor_name / …），不做自选。
+
+
+        注意 modality_type **不在**这里 —— 它是"这个能力处理什么内容"，
+
+        是所有 role 都有的适用域，因此挂在 entry 顶层。
+
+        '
+      required:
+      - support_suffix
+      - is_default
+      properties:
+        support_suffix:
+          type: array
+          items:
+            type: string
+          description: '该 loader 认的文件后缀，**服务端已归一化**：
+
+            小写 + 带前导点，例如 [".txt"]。
+
+
+            可以增删，不是冻结值。
+
+            '
+        is_default:
+          type: boolean
+          description: '同一后缀有多个候选 loader 时，是否为默认选中的那个。
+
+            '
+    ProcessorCapabilityEntry:
+      type: object
+      description: '目录中的一项 —— 一个已注册的处理能力。
+
+
+        processor_key 与 role 直取实现类，没有额外加工。
+
+        '
+      required:
+      - processor_key
+      - role
+      - modality_type
+      - config_schema
+      properties:
+        processor_key:
+          type: string
+          description: '稳定契约键，例如 TEXT_TXT_COMMON_PARSER。
+
+
+            会被冻结进 PipelineConfigSnapshot，历史运行靠它解释
+
+            当时用的是哪个能力。因此一旦发布**永不复用**。
+
+
+            它也是 GET /document-processors 响应里 loader_name /
+
+            processor_name 等字段的取值。
+
+            '
+        role:
+          $ref: '#/components/schemas/ProcessorRole'
+        modality_type:
+          $ref: '#/components/schemas/ModalityType'
+          description: '该能力处理什么模态的内容 —— **所有 role 都有**，
+
+            不是 loader 专属。
+
+
+            文档本身也有 modality_type（见 DocumentTypeDefinition），
+
+            两者对接：audio 类型的文档只该选到 audio 的能力。
+
+            '
+        selector:
+          $ref: '#/components/schemas/ProcessorCapabilitySelector'
+        config_schema:
+          type: object
+          additionalProperties: true
+          description: '该能力的参数结构，一个 JSON Schema（draft 2020-12）。
+
+
+            **前端据此生成表单并做本地校验**，服务端在写入
+
+            definition 时用同一份结构校验参数，规则不会漂移。
+
+            服务端实现是 pydantic v2 的 model_json_schema() 原生输出，
+
+            因此与 OpenAPI 3.1 的 schema 版本天然一致。
+
+
+            表单生成器普遍消费的键：title / description / default /
+
+            enum / minimum / maximum / format / anyOf。
+
+
+            注意两点：
+
+
+            - 用 Literal 或 Enum 声明的字段会产出 enum，渲染成下拉。
+
+            - 嵌套模型或独立枚举会产出 $defs + $ref，解析器需要支持；
+
+              第一版的能力参数建议保持扁平，避免这个复杂度。
+
+
+            没有参数的能力返回空 object（properties 为空），
+
+            此时前端应隐藏表单而不是渲染空面板。
+
+            '
+          example:
+            type: object
+            title: Params
+            properties:
+              mode:
+                type: string
+                title: 解析模式
+                description: fast 跳过版式分析；accurate 保留表格结构。
+                enum:
+                - fast
+                - accurate
+                default: fast
+              max_pages:
+                type: integer
+                title: 最大页数
+                minimum: 1
+                maximum: 5000
+                default: 100
+              confidence:
+                type: number
+                title: 置信度阈值
+                minimum: 0.0
+                maximum: 1.0
+                default: 0.8
+              keep_layout:
+                type: boolean
+                title: 保留版式
+                default: true
+              exclude_pages:
+                type: array
+                title: 排除的页
+                description: 如 ['1-3', '7']。
+                items:
+                  type: string
+                default: []
+              force_encoding:
+                anyOf:
+                - type: string
+                - type: 'null'
+                title: 强制编码
+                default: null
+    ProcessorCapabilityCatalogResponse:
+      type: object
+      description: '处理能力目录。不分页 —— 条目数量级等于已注册的实现数。
+
+        '
+      required:
+      - items
+      - support_suffix
+      - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProcessorCapabilityEntry'
+        support_suffix:
+          type: array
+          items:
+            type: string
+          description: '派生值：本次返回的 items 中 **role=loader** 那些条目的
+
+            support_suffix 去重并集，已排序。
+
+
+            **受查询过滤影响。** 传了 role / modality_type /
+
+            file_extension，这里就只统计过滤后的集合；要"全平台可解析
+
+            后缀"的完整清单，请不带参数调用一次。
+
+
+            过滤到没有 loader 条目时是空数组（不是 null）。
+
+
+            它回答的是"平台有没有 loader 兜底"，**不等于**
+
+            "某个 DocumentTypeDefinition 收不收这个后缀"。
+
+            '
+        total:
+          type: integer
+          description: items 的长度。
+    ErrorResponse:
+      type: object
+      required:
+      - detail
+      properties:
+        detail:
+          type: string

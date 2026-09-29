@@ -1,0 +1,547 @@
+openapi: 3.1.0
+
+info:
+  title: Tool Processor Management API
+  version: 1.0.0
+  description: |
+    API for managing processors mounted on tools.
+
+    Architectural rules:
+      - Processor implementations are code-owned and discovered from the runtime registry.
+      - The API does not create or modify processor implementations.
+      - Persistent state stores only the processor instances mounted on a Tool.
+      - Each Tool currently has exactly one ordered processor chain.
+      - The chain is represented by ordered processor instances on the Tool.
+      - `config` contains only processor-specific configuration.
+      - `execution_mode` and `hook` are structural runtime properties.
+      - `AROUND` requires `SYNC` execution.
+      - One Tool invocation is one execution scope for this chain; this API does not model agent/node/workflow control flow.
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Processor Registry
+    description: Code-registered processor implementations. Read-only from the management plane.
+  - name: Tool Processors
+    description: Processor instances mounted on a Tool.
+  - name: Tool Processor Chain
+    description: Atomic operations for replacing or reordering a Tool's processor chain.
+
+paths:
+  /processors:
+    get:
+      tags:
+        - Processor Registry
+      summary: List registered processor implementations
+      operationId: listProcessorDefinitions
+      parameters:
+        - name: keyword
+          in: query
+          schema:
+            type: string
+          description: Filter by processor key, name, or description.
+        - name: enabled
+          in: query
+          schema:
+            type: boolean
+          description: Filter code-registered processors by registry availability.
+        - name: hook
+          in: query
+          schema:
+            $ref: '#/components/schemas/ProcessorHook'
+          description: Return processors supporting the specified hook.
+        - name: execution_mode
+          in: query
+          schema:
+            $ref: '#/components/schemas/ExecutionMode'
+          description: Return processors supporting the specified execution mode.
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          description: Registered processors
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PagedProcessorDefinitionResponse'
+
+  /processors/{processor_key}:
+    get:
+      tags:
+        - Processor Registry
+      summary: Get a registered processor implementation
+      operationId: getProcessorDefinition
+      parameters:
+        - $ref: '#/components/parameters/ProcessorKey'
+      responses:
+        '200':
+          description: Processor definition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessorDefinition'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /tools/{tool_id}/processors:
+    get:
+      tags:
+        - Tool Processors
+      summary: Get the processor chain mounted on a Tool
+      operationId: listToolProcessors
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+        - name: enabled_only
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: When true, return only enabled processor instances.
+      responses:
+        '200':
+          description: Ordered processor chain
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolProcessorChain'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags:
+        - Tool Processor Chain
+      summary: Replace the complete processor chain of a Tool
+      operationId: replaceToolProcessorChain
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplaceToolProcessorChainRequest'
+      responses:
+        '200':
+          description: Replaced processor chain
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolProcessorChain'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+    post:
+      tags:
+        - Tool Processors
+      summary: Add one processor to a Tool
+      operationId: addToolProcessor
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateToolProcessorRequest'
+      responses:
+        '201':
+          description: Processor instance added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolProcessor'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /tools/{tool_id}/processors/{processor_id}:
+    patch:
+      tags:
+        - Tool Processors
+      summary: Update one mounted processor instance
+      operationId: updateToolProcessor
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+        - $ref: '#/components/parameters/ProcessorId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateToolProcessorRequest'
+      responses:
+        '200':
+          description: Updated processor instance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolProcessor'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+    delete:
+      tags:
+        - Tool Processors
+      summary: Remove one mounted processor instance
+      operationId: deleteToolProcessor
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+        - $ref: '#/components/parameters/ProcessorId'
+      responses:
+        '204':
+          description: Processor instance removed
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /tools/{tool_id}/processors/order:
+    put:
+      tags:
+        - Tool Processor Chain
+      summary: Reorder a Tool processor chain
+      operationId: reorderToolProcessors
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReorderToolProcessorsRequest'
+      responses:
+        '200':
+          description: Reordered processor chain
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolProcessorChain'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+components:
+  parameters:
+    ToolId:
+      name: tool_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    ProcessorId:
+      name: processor_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+    ProcessorKey:
+      name: processor_key
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+
+  schemas:
+    ProcessorType:
+      type: string
+      enum:
+        - INTERCEPTOR
+        - TRANSFORMER
+        - OBSERVER
+
+    ProcessorHook:
+      type: string
+      enum:
+        - BEFORE
+        - AFTER
+        - AROUND
+
+    ExecutionMode:
+      type: string
+      enum:
+        - SYNC
+        - ASYNC
+
+    ProcessorDefinition:
+      type: object
+      required:
+        - key
+        - name
+        - processor_type
+        - supported_hooks
+        - supported_execution_modes
+        - config_schema
+      properties:
+        key:
+          type: string
+          readOnly: true
+        name:
+          type: string
+          readOnly: true
+        description:
+          type: string
+          nullable: true
+          readOnly: true
+        processor_type:
+          $ref: '#/components/schemas/ProcessorType'
+        supported_hooks:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/ProcessorHook'
+          readOnly: true
+        supported_execution_modes:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/ExecutionMode'
+          readOnly: true
+        config_schema:
+          type: object
+          description: JSON Schema used to validate and render processor config.
+          readOnly: true
+        registry_available:
+          type: boolean
+          readOnly: true
+
+    ToolProcessor:
+      type: object
+      required:
+        - id
+        - tool_id
+        - processor_key
+        - sequence
+        - execution_mode
+        - hook
+        - config
+        - enabled
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        tool_id:
+          type: string
+          format: uuid
+          readOnly: true
+        processor_key:
+          type: string
+          minLength: 1
+          maxLength: 255
+        sequence:
+          type: integer
+          minimum: 1
+        execution_mode:
+          $ref: '#/components/schemas/ExecutionMode'
+        hook:
+          $ref: '#/components/schemas/ProcessorHook'
+        config:
+          type: object
+          additionalProperties: true
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+        processor:
+          allOf:
+            - $ref: '#/components/schemas/ProcessorDefinition'
+          readOnly: true
+
+    CreateToolProcessorRequest:
+      type: object
+      required:
+        - processor_key
+        - execution_mode
+        - hook
+      properties:
+        processor_key:
+          type: string
+          minLength: 1
+          maxLength: 255
+        sequence:
+          type: integer
+          minimum: 1
+          description: Optional insertion position. When omitted, append to the end.
+        execution_mode:
+          $ref: '#/components/schemas/ExecutionMode'
+        hook:
+          $ref: '#/components/schemas/ProcessorHook'
+        config:
+          type: object
+          default: {}
+          additionalProperties: true
+        enabled:
+          type: boolean
+          default: true
+
+    UpdateToolProcessorRequest:
+      type: object
+      minProperties: 1
+      properties:
+        execution_mode:
+          $ref: '#/components/schemas/ExecutionMode'
+        hook:
+          $ref: '#/components/schemas/ProcessorHook'
+        config:
+          type: object
+          additionalProperties: true
+        enabled:
+          type: boolean
+
+    ReplaceToolProcessorChainRequest:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          description: Complete ordered processor chain. The array order is the execution order.
+          items:
+            $ref: '#/components/schemas/ReplaceToolProcessorItem'
+
+    ReplaceToolProcessorItem:
+      type: object
+      required:
+        - processor_key
+        - execution_mode
+        - hook
+      properties:
+        processor_key:
+          type: string
+          minLength: 1
+          maxLength: 255
+        execution_mode:
+          $ref: '#/components/schemas/ExecutionMode'
+        hook:
+          $ref: '#/components/schemas/ProcessorHook'
+        config:
+          type: object
+          default: {}
+          additionalProperties: true
+        enabled:
+          type: boolean
+          default: true
+
+    ReorderToolProcessorsRequest:
+      type: object
+      required:
+        - processor_ids
+      properties:
+        processor_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+          description: All processor IDs belonging to the Tool, in desired execution order.
+
+    ToolProcessorChain:
+      type: object
+      required:
+        - tool_id
+        - processors
+      properties:
+        tool_id:
+          type: string
+          format: uuid
+          readOnly: true
+        processors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolProcessor'
+          readOnly: true
+
+    PagedProcessorDefinitionResponse:
+      type: object
+      required:
+        - items
+        - page
+        - page_size
+        - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProcessorDefinition'
+        page:
+          type: integer
+          minimum: 1
+        page_size:
+          type: integer
+          minimum: 1
+        total:
+          type: integer
+          minimum: 0
+
+    ErrorResponse:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    ValidationError:
+      description: Validation error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+    Conflict:
+      description: Conflict, such as unsupported hook/mode combination or stale chain state
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'

@@ -1,0 +1,50 @@
+# Neo4j 数据源。
+#
+# 对应容器：
+#   docker run -d --name neo4j -p 7474:7474 -p 7687:7687 \
+#     -e NEO4J_AUTH=neo4j/123456 \
+#     -e NEO4J_dbms_security_auth__minimum__password__length=6 \
+#     -v neo4j-data:/data -v neo4j-logs:/logs \
+#     neo4j:latest
+#
+# 两个绕不开的限制（都是 Neo4j Community 自身的行为，不是配置问题）：
+#
+# 1. 内置管理员用户名**必须是 neo4j**，改不了。
+#    NEO4J_AUTH=y_trader/123456 会直接启动失败并报
+#    "Invalid admin username, it must be neo4j."
+#    所以镜像初始化时用 neo4j，随后在容器内另建 y_trader：
+#        CREATE USER y_trader IF NOT EXISTS
+#          SET PASSWORD '123456' CHANGE NOT REQUIRED;
+#
+# 2. GRANT ROLE 在社区版不支持（Enterprise 才有 RBAC），
+#    因此 y_trader 的 roles 列是空的。但社区版不做权限隔离，
+#    认证通过即拥有完整读写权限 —— 已实测 y_trader 能建节点、能查。
+#
+# 3. 密码长度：Neo4j 默认要求 >= 8 位，123456 只有 6 位。
+#    用 NEO4J_dbms_security_auth__minimum__password__length=6 放行。
+#
+# 服务端自身配置模板在 app/config/neo4j/neo4j.conf —— 放在子目录
+# 是有意的：DataSourceConfigLoader 只 glob 本目录顶层的 *.yaml。
+#
+# 覆盖方式：NEO4J_URI / NEO4J_USERNAME / NEO4J_PASSWORD / NEO4J_DATABASE
+
+name: neo4j
+type: neo4j
+
+enabled: true
+
+# 连不上时只打 warning 并跳过；生产要强校验就改成 true。
+required: false
+
+startup_timeout_seconds: 5
+
+config:
+  uri: "${NEO4J_URI:-bolt://localhost:7687}"
+  username: "${NEO4J_USERNAME:-y_trader}"
+  password: "${NEO4J_PASSWORD:-123456}"
+  database: "${NEO4J_DATABASE:-neo4j}"
+
+  # 驱动连接池是每进程的：多 worker 时总连接数 = 本值 × worker 数。
+  max_connection_pool_size: 100
+  connection_timeout: 5
+  max_connection_lifetime: 3600

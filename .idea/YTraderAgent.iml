@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="PYTHON_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/app/services/file" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/app/services/file/domain" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/app/services/document" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/app/common" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/data/_dbg/cache/Users/尹文彬/PycharmProjects/YTraderAgent/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/data" />
+      <excludeFolder url="file://$MODULE_DIR$/python.exe.stackdump" />
+    </content>
+    <orderEntry type="jdk" jdkName="~\PycharmProjects\YTraderAgent\.venv" jdkType="Python SDK" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>

@@ -1,0 +1,13 @@
+# YTrader Agent — 开发 / 测试依赖
+#
+#     python -m pip install -r requirements.txt -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest==9.1.1
+pytest-asyncio==1.4.0
+httpx==0.28.1
+
+# 注意：httpx 固定 0.28.1。langchain-core 会经 langsmith 拉入
+# httpx2（2.13.0），两者是不同的包、可以共存，不要试图用
+# httpx2 顶替 httpx —— FastAPI 的 TestClient 依赖后者。

@@ -1,0 +1,22 @@
+name: postgresql
+type: postgresql
+
+enabled: true
+required: true
+
+startup_timeout_seconds: 5
+
+config:
+  #  dsn: "${POSTGRES_DSN}"
+  dsn: postgresql+asyncpg://postgres:123456@localhost:5432/ytrader_agent
+
+  # LangGraph checkpointer 用 psycopg 直连，不吃 +asyncpg 的方言后缀。
+  # 留空则由 dsn 自动去掉方言后缀推导，一般不需要显式配置。
+  #  dsn_psycopg: "postgresql://postgres:123456@localhost:5432/ytrader_agent"
+  checkpointer_pool_size: 5
+
+  pool_size: 10
+  max_overflow: 20
+  pool_timeout: 30
+  pool_recycle: 1800
+  echo: false

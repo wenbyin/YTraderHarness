@@ -1,0 +1,1307 @@
+openapi: 3.1.0
+info:
+  title: Document Version API
+  version: 1.0.0
+  description: '文档版本（DocumentVersion）的**操作**与**产物**接口。
+
+
+    版本的**查询**接口不在这里 —— 列出/查看某文档的历史版本在
+
+    document.yaml 的 /documents/{document_id}/versions*。
+
+
+    按版本 × retrieval 查 Chunk
+
+    ----------------------------
+
+    前端的处理结果页是这样组织的：
+
+        一个 Document -> N 个 DocumentVersion -> 每个版本下 N 个 retrieval（= N 个 tab）
+
+        每个 tab 下：该路的 chunk 列表 + 该路运行时用的 chunker 配置
+
+
+    因此这里的两个接口是**成对**的：
+
+        GET .../retrievals                     列出 tab（含运行时 chunker 配置）
+
+        GET .../retrievals/{rid}/chunks        某个 tab 的内容
+
+
+    为什么不复用扁平的 /document-chunks
+
+    -----------------------------------
+
+    document_type_definition.yaml 里的 GET /document-chunks 是个通用过滤
+
+    接口（按 version + processor_definition 筛），**不支持按 retrieval 筛**
+
+    —— 而"哪一路 retrieval"正是 tab 的唯一标识，也是 document_chunk 表上
+
+    唯一约束 (version, retrieval, chunk_index) 的一部分。所以这里给的是
+
+    嵌在版本下的、以 (version, retrieval) 为主键的读接口。
+
+
+    components 为什么有重复
+
+    -----------------------
+
+    ErrorResponse / ProcessingStatus / RetrievalType / StorageBackend /
+
+    BadRequest / Forbidden 与其它规格文件各留一份 —— 规格是按文件独立
+
+    校验 $ref 的（见 app/tools/spec_check.py），跨文件引用不合法。
+
+    '
+servers:
+- url: /api/v1
+tags:
+- name: Document Versions
+  description: 文档版本管理
+- name: Document Version Chunks
+  description: 按 版本 × retrieval 查询 Chunk（处理结果页的 tab 数据源）
+- name: QA Dataset
+  description: '为某个文档版本生成 QA 测试数据集（**手动触发**，不在任何管线步骤里）。
+
+
+    产物不在响应里，而是写成 JSON 落到服务器磁盘上，响应只回路径与统计。
+
+    '
+
+paths:
+  /document-versions/{document_version_id}/reprocess:
+    post:
+      tags:
+      - Document Versions
+      summary: Reprocess a DocumentVersion
+      operationId: reprocessDocumentVersion
+      description: 'Re-runs the configured processing pipeline for the specified
+
+        DocumentVersion.
+
+
+        Only document_version_id is required by the endpoint contract.
+
+        Authorization and resource ownership are resolved by the backend.
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/document_version_id'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReprocessDocumentVersionRequest'
+      responses:
+        '202':
+          description: Reprocessing accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReprocessDocumentVersionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: DocumentVersion not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Current state does not allow reprocessing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /document-versions/{document_version_id}/retrievals:
+    get:
+      tags:
+      - Document Versions
+      summary: List the retrievals of a DocumentVersion
+      operationId: listDocumentVersionRetrievals
+      description: '某个版本实际参与处理的 retrieval 列表 —— 前端据此生成 N 个 tab。
+
+
+        数据来源是版本级的绑定记录（DocumentVersionRetrievalBinding），
+
+        因此**只返回这个版本真正跑过的** retrieval，而不是该类型下
+
+        当前配置的全部 retrieval。
+
+
+        每个条目同时给出：
+
+        - retrieval_type / storage_backend：tab 的标签
+
+        - chunker：**本次运行实际使用**的 chunker 及其配置（见下方警告）
+
+        - chunk_count：该 tab 下有多少块，前端可据此决定是否懒加载
+
+        - processing_status / error_message：这一路成功还是失败
+
+
+        ⚠️ chunker 是**运行时冻结值**，不是当前定义的现值
+
+        -------------------------------------------------
+
+        改了 DocumentRetrievalDefinition 的 chunker 之后，历史版本这里
+
+        显示的仍是**当时**用的那个 —— 这正是本接口存在的意义。
+
+
+        这条契约要求实现在流水线执行时把 chunker 名与配置一起记下来。
+
+        若某条记录缺失（例如该版本跑在本次改造之前），chunker 返回 null，
+
+        前端应显示「未知」而不是回退去读当前定义 —— 那会撒谎。
+
+
+        失败的 retrieval 也会出现在列表里（processing_status=failed），
+
+        否则前端会以为这一路不存在，而不是「它失败了」。
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/document_version_id'
+      responses:
+        '200':
+          description: Retrievals of this DocumentVersion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentVersionRetrievalListResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: DocumentVersion not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /document-versions/{document_version_id}/retrievals/{document_retrieval_definition_id}/chunks:
+    get:
+      tags:
+      - Document Version Chunks
+      summary: List chunks of one retrieval under a DocumentVersion
+      operationId: listDocumentVersionRetrievalChunks
+      description: '某个 tab（= 某版本下的某一路 retrieval）的 chunk 列表。
+
+
+        全局唯一约束是 (document_version_id, document_retrieval_definition_id,
+
+        chunk_index)，因此这两个路径参数已经**唯一定位**了一组 chunk ——
+
+        不需要再传别的过滤条件。
+
+
+        排序固定为 chunk_index 升序：它是该 retrieval 内从 0 连续的编号
+
+        （见 DocumentChunk 的落库逻辑），因此页与页之间不会漂移，
+
+        翻页时也不会重复或漏块。
+
+
+        preview_chars：NoChunk 场景的防护
+
+        ---------------------------------
+
+        选中「不分块」那个 chunker 时，**整篇正文就是一个 chunk** ——
+
+        单条 content 可能是几十万字。前端做预览列表时不需要全量正文，
+
+        传 preview_chars 即可让服务端截断，并用 content_truncated 标记
+
+        这一条被截过。不传则返回完整 content。
+
+
+        不要拿本接口当"导出原文"的通道：chunk 是给结果页看的业务数据，
+
+        整篇正文的导出应当走另外的、有权限控制的接口。
+
+        '
+      parameters:
+      - $ref: '#/components/parameters/document_version_id'
+      - $ref: '#/components/parameters/document_retrieval_definition_id'
+      - name: preview_chars
+        in: query
+        required: false
+        description: '只返回每条 content 的前 N 个字符。留空返回完整内容。
+
+          '
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 4096
+      - name: page
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          default: 1
+      - name: page_size
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 20
+      responses:
+        '200':
+          description: Chunks of this retrieval under this DocumentVersion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentChunkListResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: 'DocumentVersion not found, or this retrieval did not
+
+            participate in this version.
+
+            '
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /document-chunk-projections:
+    post:
+      tags:
+      - Document Version Chunks
+      summary: Get projections of chunks by id
+      operationId: getChunkProjections
+      description: '按 chunk_id 批量查看**投影** —— 这些 chunk 当时写给索引的是什么。
+
+
+        与 /document-versions/.../chunks 的区别：
+
+
+        - 那个给**原件**：这一条是什么（从 PostgreSQL 的 document_chunk 读）
+
+        - 这个给**投影**：它被变成什么样子写进索引（从 embedding 产物读）
+
+
+        投影**不落库**（阶段 10 现算现发），唯一的痕迹是阶段 9 写出的产物。
+
+        因此这里读的是产物而不是索引本身 —— 索引挂着也能看。
+
+        代价是它反映"当时发出去的"，不是"索引里现在存着的"。
+
+
+        ⚠️ 只有需要向量化的 retrieval 有投影产物
+
+        ----------------------------------------
+
+        keyword / document 那两路在阶段 9 是**透传**的，没有单独的投影产物。
+
+        这种情况下 kind / fields 为 null，unavailable_reason 会说明原因。
+
+
+        结果与入参**一一对应且同序**，取不到的那些带 unavailable_reason ——
+
+        不抛错、也不悄悄丢掉，因为前端点了一条却什么都拿不到时，
+
+        需要知道为什么。
+
+
+        用 POST 而不是 GET：chunk_id 可能一次传上百个，
+
+        塞进 query string 会撞 URL 长度上限。语义上它是只读的。
+
+        '
+      parameters:
+      - name: include_vector
+        in: query
+        required: false
+        description: '是否返回完整向量。默认只给摘要（维度 / 非零项数 /
+
+          模长 / 前几个值）—— 稠密向量 512 个 float，N 条一起返回体积不小。
+
+          '
+        schema:
+          type: boolean
+          default: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChunkProjectionRequest'
+      responses:
+        '200':
+          description: Projections of the requested chunks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChunkProjectionListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /qa-datasets:generate:
+    post:
+      tags:
+      - QA Dataset
+      summary: Generate a QA dataset for a DocumentVersion
+      operationId: generateQaDataset
+      description: '以某个文档版本为素材，生成一份带**精确目标标注**的 QA 测试集。
+
+
+        为什么要它：排查"某个 chunk 搜不到"时没有 ground truth —— 每次都
+
+        得手工挑 chunk、手工构造 query、手工逐路二分定位它死在哪一步。
+
+        这个过程不可复现、不可批量，也无法度量"这次改动让检索变好还是
+
+        变坏"。有了带标注的数据集，这些都能自动做。
+
+
+        ## 它怎么做的
+
+
+        1. 取该版本 **clean 正文**（cleaning 节点留下的产物）与全部 chunk 的
+
+        `start_index` / `end_index` —— 两者是**同一个字符坐标系**（切分节点
+
+        读的就是这份正文），所以可以直接求交。
+
+
+        2. 把正文切成**尽量大的块**（见 max_block_chars）。实测某份 51.7 万
+
+        字符的档案，按 3 万字符一块切出 23 块，**首块横跨 228 条事件**。
+
+
+        3. 每块问一次云端 LLM，要求它给出「问题 + 答案 + **逐字摘录**」。
+
+
+        4. 拿摘录回正文里**精确匹配**定位字符区间。一道题可以定位出**多个**
+
+        区间（答案分散在多处时）。
+
+
+        5. 每个区间分别与 chunk 区间求交，取**并集**作为目标 chunk 列表。
+
+
+        ## 为什么切"大块"而不是"一条事件一个窗口"
+
+
+        只有让模型同时看到多条相邻记录，才可能问出**跨事件**的问题
+
+        （「2024 年哪一次户数下降最多」）。一条事件一个窗口时模型被物理
+
+        隔断，只能问单条事件内部的问题 —— 而那种问题太容易命中，测不出
+
+        检索的真实水平。
+
+
+        切点仍然落在标题边界上：块内多留几条事件没问题，但不能从一条事件
+
+        的中间切断，否则相邻两条会被拆到两个块里，跨事件的问题两边都看不全。
+
+
+        ⚠️ 切块大小上限的**真实约束是模型的上下文窗口**，不是磁盘或内存。
+
+        中文大致 1~1.5 字/token，所以 51.7 万字符 ≈ 35~50 万 token，超出
+
+        主流模型窗口（Kimi k2 是 256k）。给超过窗口的值不会报错，只会被
+
+        服务端**静默截断** —— 产出的问题会莫名其妙地只覆盖前半段。
+
+
+        ## 为什么让 LLM 给摘录而不是行号
+
+
+        行号是 LLM 最容易数错、且**错了不报错**的东西。数错的行区间换算成
+
+        偏移后可能仍落在某个合法 chunk 上，只是那个 chunk 与问题无关 ——
+
+        数据集于是带着错误的 ground truth 一路流到评估，表现为"召回率莫名
+
+        偏低"这种极难归因的症状。
+
+
+        摘录定位则**可校验**：搜不到就是模型编了原文，该条样本直接丢弃并在
+
+        `drop_reasons` 里计数。产物里**仍然给行号**（由偏移反推），只是它
+
+        不再是定位依据。
+
+
+        ## 问题里的主体从哪来
+
+
+        事件正文里**只有事件本身、不含公司名**（公司名在文档头）。而主体
+
+        缺失的问题会同时命中各家公司的同类事件，等于没检索。
+
+
+        所以实现会把正文最开头那段（`# 东方财富（300059.SZ）大事提醒…`）
+
+        单独摘出来，作为**所有块共用的背景**喂给模型，并在提示词里要求
+
+        问题必须写出主体名称与时间锚点。
+
+
+        ## 同步接口，所以默认只跑 10 个窗口
+
+
+        块数 × 单次云端 LLM 耗时就约等于请求时长。一块 3 万字符的单次调用
+
+        就要几分钟，全量会挂几小时，不现实。先用小批量试出效果，再分批放大。
+
+        真正的批量跑批留给将来的异步 job 版。
+
+
+        ## 产物格式
+
+
+        JSON 对象（不是裸数组），`cases` 字段是样本列表。每条样本的字段名
+
+        对齐 evaluation.yaml 的 `EvaluationCase`：
+
+
+            user_input            问题
+
+            reference             标准答案
+
+            reference_text        该问题所在块的正文
+
+            reference_spans       [{start_char_index, end_char_index}]
+
+                                   **可能有多条** —— 答案分散在多处时
+
+            reference_chunk_ids   目标 chunk（**最关键的字段**），
+
+                                   多条 span 求交后的并集
+
+
+        另有溯源字段 `start_line` / `end_line` / `section` /
+
+        `document_version_id` / `evidence_quotes` / `quote_locations`。
+
+
+        `meta` 里带完整统计（块成功率、丢弃原因分类、耗时、用到哪个 provider
+
+        与模型）—— "生成了 3 条"和"生成了 3 条、另外 47 个块全失败了"
+
+        是两回事。
+
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QADatasetGenerateRequest'
+      responses:
+        '200':
+          description: Dataset generated and written to disk.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QADatasetGenerateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: DocumentVersion not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  parameters:
+    document_version_id:
+      name: document_version_id
+      in: path
+      required: true
+      description: DocumentVersion database ID.
+      schema:
+        type: string
+        format: uuid
+    document_retrieval_definition_id:
+      name: document_retrieval_definition_id
+      in: path
+      required: true
+      description: 'DocumentRetrievalDefinition database ID —— 也就是前端的
+
+        tab 标识。它与 document_version_id 一起唯一定位一组 chunk。
+
+        '
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    ReprocessDocumentVersionRequest:
+      type: object
+      properties:
+        document_processor_definition_ids:
+          type: array
+          description: 'ProcessorDefinition IDs to re-run. Empty or omitted means the
+
+            currently applicable pipeline is re-run.
+
+            '
+          items:
+            type: string
+            format: uuid
+        force:
+          type: boolean
+          default: false
+          description: Force regeneration instead of reusing eligible results.
+    ReprocessDocumentVersionResponse:
+      type: object
+      required:
+      - document_version_id
+      - status
+      properties:
+        document_version_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/ProcessingStatus'
+        job_id:
+          type:
+          - string
+          - 'null'
+        message:
+          type: string
+
+    # ========================================================
+    # 处理结果页的 tab
+    # ========================================================
+
+    ChunkerBinding:
+      type: object
+      description: '本次运行实际使用的 chunker 及其配置 —— **运行时冻结值**。
+
+
+        它回答的是"这一路当时是怎么切的"，而不是"现在配置里怎么写"。
+
+        改了 retrieval 定义之后，历史版本这里仍然是旧值。
+
+
+        缺失时为 null（例如该版本跑在改用本接口之前），
+
+        前端应显示「未知」，**不要**回退去读当前定义。
+
+        '
+      required:
+      - processor_key
+      properties:
+        processor_key:
+          type: string
+          description: '能力键，例如 TEXT_TXT_GRAPHRAG_CHUNKER /
+
+            TEXT_NO_CHUNK_CHUNKER。取值见
+
+            GET /document-processor-capabilities?role=chunk。
+
+            '
+        config:
+          type: object
+          additionalProperties: true
+          description: '该次运行传给 chunker 的配置原文。
+
+            字段含义随 processor_key 不同 —— 用上面那个接口拿
+
+            config_schema 才能解释它。
+
+            '
+    DocumentVersionRetrievalSummary:
+      type: object
+      description: '某个版本下的一路 retrieval —— 也就是前端的一个 tab。'
+      required:
+      - document_version_retrieval_binding_id
+      - document_retrieval_definition_id
+      - retrieval_type
+      - storage_backend
+      - processing_status
+      - chunk_count
+      properties:
+        document_version_retrieval_binding_id:
+          type: string
+          format: uuid
+        document_retrieval_definition_id:
+          type: string
+          format: uuid
+          description: tab 标识。用它去取该 tab 的 chunk。
+        retrieval_type:
+          $ref: '#/components/schemas/RetrievalType'
+        storage_backend:
+          $ref: '#/components/schemas/StorageBackend'
+        chunker:
+          description: '该路运行时使用的 chunker。缺失时为 null（原因见
+
+            ChunkerBinding 的说明）。
+
+            '
+          oneOf:
+          - $ref: '#/components/schemas/ChunkerBinding'
+          - type: 'null'
+        chunk_count:
+          type: integer
+          minimum: 0
+          description: '该路写入了多少块。0 表示这一路没有产出 chunk
+
+            （例如不需要切分的 retrieval 类型）。
+
+            '
+        processing_status:
+          $ref: '#/components/schemas/ProcessingStatus'
+        error_message:
+          type:
+          - string
+          - 'null'
+          description: '该路失败时的原因。只在 processing_status=failed 时有值。
+
+            '
+    DocumentVersionRetrievalListResponse:
+      type: object
+      required:
+      - items
+      - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentVersionRetrievalSummary'
+        total:
+          type: integer
+          minimum: 0
+          description: tab 数量。不分页 —— 一个类型下的 retrieval 数量级很小。
+
+    # ========================================================
+    # Chunk
+    # ========================================================
+
+    DocumentChunkSummary:
+      type: object
+      description: '一条 chunk。
+
+
+        内容、定位信息、元数据三者分开给：
+
+            content              正文
+
+            locator              在源文件里的位置（页码 / 章节 / 行）
+
+            metadata             文档级元数据 + 阶段 8 增强补上的字段
+
+
+        后两者是自由 dict，前端做展示时应当容错 —— 它们的内容随
+
+        retrieval 与 enricher 配置而变。
+
+        '
+      required:
+      - document_chunk_id
+      - chunk_index
+      - content
+      - char_count
+      properties:
+        document_chunk_id:
+          type: string
+          format: uuid
+        chunk_index:
+          type: integer
+          minimum: 0
+          description: '本 retrieval 内从 0 连续。排序依据。'
+        content:
+          type: string
+          description: chunk 正文。传了 preview_chars 时是截断后的。
+        content_truncated:
+          type: boolean
+          default: false
+          description: '该条 content 被 preview_chars 截断过。
+
+            前端应给出「查看完整内容」的入口 —— 用 document_chunk_id 去
+
+            取单条（GET /document-chunks/{document_chunk_id}）。
+
+            '
+        char_count:
+          type: integer
+          minimum: 0
+          description: '**截断前**的字符数 —— 因此它可能大于 content 的长度。'
+        token_count:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: 'token 数。只有按 token 度量长短的 chunker 填得出来，
+
+            其余为 null（不估算）。
+
+            '
+        start_index:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+          description: '在归一化后正文中的起始字符偏移。可用它做高亮定位。
+
+            满足 content == 正文[start_index:end_index]（未截断时）。
+
+            '
+        end_index:
+          type:
+          - integer
+          - 'null'
+          minimum: 0
+        content_hash:
+          type:
+          - string
+          - 'null'
+          description: content 的 sha256，用于变更检测与去重。
+        locator:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    DocumentChunkListResponse:
+      type: object
+      required:
+      - items
+      - page
+      - page_size
+      - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentChunkSummary'
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+          description: 该 (version, retrieval) 下的 chunk 总数。
+
+    # ========================================================
+    # 投影
+    # ========================================================
+
+    EmbeddingOutput:
+      type: string
+      description: '向量化能力产出的**向量形态**。两种向量在数学上不可互换，
+
+        索引侧也存在完全不同的字段类型里：
+
+
+        dense    定长浮点数组，例如 512 维 -> Milvus FLOAT_VECTOR
+
+        sparse   维度索引 -> 权重的稀疏映射 -> ES sparse_vector
+
+
+        取投影时用它决定该看哪个字段。
+
+        '
+      enum:
+      - dense
+      - sparse
+      - graph
+    ChunkProjectionRequest:
+      type: object
+      description: '批量查投影的入参。
+
+        用 POST 而不是 GET：chunk_id 可能一次传几十上百个。
+
+        '
+      required:
+      - document_chunk_ids
+      properties:
+        document_chunk_ids:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items:
+            type: string
+            format: uuid
+          description: '要查的 chunk id。返回结果与它**一一对应且同序**，
+
+            包含取不到的那些（看 unavailable_reason）。
+
+            '
+    VectorSummary:
+      type: object
+      description: '稠密向量的摘要。
+
+
+        给的是**判断"这条投影正不正常"够用的那几个数** —— 维度对不对、
+
+        是不是零向量、数值量级是否离谱。看全部值要传 include_vector。
+
+        '
+      required:
+      - dimensions
+      - nonzero_count
+      - l2_norm
+      properties:
+        dimensions:
+          type: integer
+          description: 向量维度。应与索引 schema 一致。
+        nonzero_count:
+          type: integer
+          description: '非零分量个数。稠密向量通常接近满值；
+
+            异常地少说明 embedding 有问题。
+
+            '
+        l2_norm:
+          type: number
+          description: 'L2 模长。embedder 开了归一化时应当接近 1.0；
+
+            明显偏离说明没归一化或向量异常。
+
+            '
+        head:
+          type: array
+          items:
+            type: number
+          description: 前 8 个分量，用来看数值量级。
+    SparseSummary:
+      type: object
+      description: 稀疏向量的摘要。
+      required:
+      - nonzero_count
+      properties:
+        nonzero_count:
+          type: integer
+          description: 非零项个数 —— 也就是这条文本命中了多少个词项。
+        top:
+          type: array
+          description: '权重最大的前 8 项，每项 {dim, weight}。
+
+            dim 是 token id（见 embedder/sparse.py 的说明）。
+
+            '
+          items:
+            type: object
+            additionalProperties: true
+    ChunkProjection:
+      type: object
+      description: '一条 chunk 当时**写给索引的东西**（投影）。
+
+
+        与 DocumentChunkSummary 的区别：
+
+
+        - DocumentChunkSummary  原件：这一条是什么（从 PG 读）
+
+        - ChunkProjection       投影：它被变成了什么样子写进索引（从产物读）
+
+
+        两者不是同一份数据：投影里带向量、而且只带索引需要的字段。
+
+
+        ⚠️ 只有需要向量化的 retrieval 才有投影产物
+
+        ------------------------------------------
+
+        阶段 9 对 keyword / document 那两路是**透传**的，
+
+        因此没有单独的投影产物。这种情况下 kind / fields 都是 null，
+
+        unavailable_reason 会说明原因。
+
+        '
+      required:
+      - document_chunk_id
+      properties:
+        document_chunk_id:
+          type: string
+          format: uuid
+        document_version_id:
+          type: string
+          format: uuid
+        document_retrieval_definition_id:
+          type: string
+          format: uuid
+        kind:
+          description: 投影的形态。取不到时为 null。
+          oneOf:
+          - $ref: '#/components/schemas/EmbeddingOutput'
+          - type: 'null'
+        embedder:
+          type: string
+          description: '产出它的 embedder 能力键，
+
+            例如 TEXT_BGE_SMALL_ZH_EMBEDDER。
+
+            '
+        dimensions:
+          type: integer
+          description: '该批向量声明的维度。与 vector_summary.dimensions 可能不同 ——
+
+            那个是这条向量实际的长度，这个是产物里声明的值，
+
+            两者不一致本身就是个问题。
+
+            '
+        fields:
+          type: object
+          additionalProperties: true
+          description: '投影里**非向量**的那些字段 —— 也就是当时发给索引后端的
+
+            content / content_hash / 计数 / metadata 等。
+
+            '
+        vector_summary:
+          oneOf:
+          - $ref: '#/components/schemas/VectorSummary'
+          - type: 'null'
+        sparse_summary:
+          oneOf:
+          - $ref: '#/components/schemas/SparseSummary'
+          - type: 'null'
+        vector:
+          type: array
+          items:
+            type: number
+          description: 完整稠密向量。只有 include_vector=true 时返回。
+        sparse:
+          type: object
+          additionalProperties:
+            type: number
+          description: '完整稀疏向量（维度 -> 权重）。
+
+            只有 include_vector=true 时返回。键是整数维度索引。
+
+            '
+        unavailable_reason:
+          type: string
+          description: '取不到投影时的原因。有值时其余字段都是 null ——
+
+            前端应当把它显示出来，而不是当作「这条没有投影」。
+
+            '
+    ChunkProjectionListResponse:
+      type: object
+      required:
+      - items
+      - total
+      - include_vector
+      properties:
+        items:
+          type: array
+          description: '与请求的 chunk_ids **一一对应且同序**，包括取不到的那些
+
+            （它们的 unavailable_reason 有值）。
+
+            '
+          items:
+            $ref: '#/components/schemas/ChunkProjection'
+        total:
+          type: integer
+        include_vector:
+          type: boolean
+          description: 回显本次是否返回了完整向量，方便前端判断要不要再请求一次。
+
+    # ========================================================
+    # QA 数据集生成
+    # ========================================================
+
+    QADatasetGenerateRequest:
+      type: object
+      required:
+      - document_version_id
+      properties:
+        document_version_id:
+          type: string
+          format: uuid
+          description: 对哪个文档版本生成。取它的 clean 正文与 chunk 区间。
+        max_windows:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 10
+          description: '本次最多处理多少个**事件窗口**。
+
+
+            窗口按 2~4 级标题切出来，一个窗口 = 一条事件（`#### 2026-03-20 ｜ 股东户数`
+
+            那种）。分得细、单次调用快，但问题只覆盖单条事件。
+
+
+            正文最开头那段（文档头，含公司名）不算窗口 —— 它作为**背景**喂给模型，
+
+            不参与出题。
+
+
+            **默认 10**：实测某份档案切出 1257 个窗口，全量要跑很久，而同步接口要挂到
+
+            跑完。先小批量试出效果，再分批放大。
+
+            '
+        sample_seed:
+          type: integer
+          default: 0
+          description: '抽样种子。窗口是从全部窗口里**随机抽** max_windows 个的
+
+            （而不是取前 N 个）—— 取前 N 个会永远只看得到文档开头，那部分的
+
+            事件类型和中间、结尾完全不同。
+
+
+            固定种子 = 同样参数抽出同一批窗口，便于比较两次改动的差异。
+
+            '
+        max_questions_per_window:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 3
+          description: '单个窗口最多出几道题。
+
+
+            上限放到 100 是给「一条事件里塞了大量可比数字」的场景用的（比如
+
+            对外担保那种几千字的表格段，一段里几十个金额、期限、比例都能单独
+
+            成题）。
+
+
+            ⚠️ 这是**每窗口**的上限，总题数约等于 窗口数 × 这个值 —— 而耗时
+
+            与 token 都跟着涨。配合 max_windows 一起用。
+
+            '
+        llm_timeout_seconds:
+          type: number
+          minimum: 10
+          maximum: 3600
+          default: 600
+          description: '单次 LLM 调用的超时（秒）。**默认 600。**
+
+
+            ⚠️ 这个值必须**按块大小**给，不能按固定值。原默认是 120 秒，那是按小窗口
+
+            定的；一块 3 万字符的调用远超它 —— 实测一个 83 字符的小节就要 42 秒，
+
+            思考型模型的耗时随输入长度增长得很快。结果就是**每个块都在 120 秒处
+
+            超时**，表现为「请求超时」而看不出是哪一层超的。
+
+
+            块调大时记得同步调大它。
+
+            '
+        concurrency:
+          type: integer
+          minimum: 1
+          maximum: 16
+          default: 1
+          description: '并发调用云端 LLM 的条数。**默认 1。**
+
+
+            ⚠️ 这个值必须 ≤ 你账号的**并发上限**，而不只是 RPM。两者是不同的限制，
+
+            而且并发限制往往小得多：实测某个账号 RPM=3、**并发上限只有 1** ——
+
+            默认并发 4 时每个块都直接 429：
+
+
+                request reached max organization concurrency: 1
+
+
+            代价是慢：并发 1 时块只能串行，一块几分钟。但撞限流后重试只会更慢，
+
+            还可能把 key 短时间封掉。**先确认账号上限再调大。**
+
+            '
+        provider:
+          type:
+          - string
+          - 'null'
+          description: '用哪个 LLM 提供方（见 app/common/llm.yaml）。
+
+            None = 用那里的 default_provider。
+
+            '
+        temperature:
+          type:
+          - number
+          - 'null'
+          minimum: 0
+          maximum: 2
+          default: null
+          description: '采样温度。**null（默认）= 根本不传这个参数**，由服务端用它自己
+
+            的默认值。
+
+
+            为什么默认是不传：temperature 的**合法范围由模型决定**。实测 kimi-k3
+
+            只接受 1 —— 传 0 会得到 `400 invalid temperature: only 1 is allowed
+
+            for this model`，而且**整个窗口**的生成直接失败，不是一条样本失败。
+
+
+            只有确实需要「同一份输入每次出一模一样结果」时才显式指定，而且要填
+
+            该模型接受的值。
+
+            '
+
+    QADatasetFailure:
+      type: object
+      required:
+      - section
+      - span
+      - reason
+      properties:
+        section:
+          type: string
+          description: 该窗口的起始小节标题。
+        span:
+          type: array
+          minItems: 2
+          maxItems: 2
+          description: 该窗口在正文中的字符区间。
+          items:
+            type: integer
+        reason:
+          type: string
+          description: 失败原因。
+
+    QADatasetGenerateResponse:
+      type: object
+      required:
+      - dataset_path
+      - case_count
+      - windows_total
+      - windows_ok
+      - windows_failed
+      - questions_generated
+      - questions_kept
+      - questions_dropped
+      - elapsed_seconds
+      properties:
+        dataset_path:
+          type: string
+          description: 落盘路径。产物在磁盘上，不在这里。
+        case_count:
+          type: integer
+          description: 最终保留下来的样本数。
+        windows_total:
+          type: integer
+          description: 本次处理的窗口总数。
+        windows_ok:
+          type: integer
+          description: LLM 调用成功的窗口数。
+        windows_failed:
+          type: integer
+          description: LLM 调用失败（超时、限流、格式不对）的窗口数。
+        questions_generated:
+          type: integer
+          description: LLM 一共出了多少道题。
+        questions_kept:
+          type: integer
+          description: 保留下来的。
+        questions_dropped:
+          type: integer
+          description: '丢弃的。**这个数偏高不一定是坏事** —— 最常见的原因是模型
+
+            没有逐字引用原文（它改写了），那种题的目标位置无法确定，留着只会
+
+            污染数据集。
+
+            '
+        drop_reasons:
+          type: object
+          additionalProperties:
+            type: integer
+          description: 丢弃原因分类计数，用来判断问题出在哪一环。
+        failures:
+          type: array
+          description: 失败的窗口明细（最多保留前若干个）。
+          items:
+            $ref: '#/components/schemas/QADatasetFailure'
+        elapsed_seconds:
+          type: number
+          description: 整批耗时（秒）。
+
+    # ========================================================
+    # 共用枚举与错误（与其它规格文件各留一份，见 info.description）
+    # ========================================================
+
+    RetrievalType:
+      type: string
+      description: '业务检索类型。同一定义下唯一。
+
+        不同取值的处理链不同（例如 dense_vector 需要向量化，document 不需要）。
+
+        '
+      enum:
+      - document
+      - keyword
+      - sparse_vector
+      - dense_vector
+      - graph
+    StorageBackend:
+      type: string
+      enum:
+      - postgresql
+      - elasticsearch
+      - milvus
+      - neo4j
+      description: '实际存储后端。不传时由 retrieval_type 默认映射得到。
+
+        注意 sparse_vector 的默认是 elasticsearch 而不是 milvus ——
+
+        稀疏向量落在 ES 的 sparse_vector 字段类型上。
+
+        '
+    ProcessingStatus:
+      type: string
+      enum:
+      - pending
+      - processing
+      - completed
+      - failed
+    ErrorResponse:
+      type: object
+      required:
+      - code
+      - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+  responses:
+    BadRequest:
+      description: Invalid request parameters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: Permission denied.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'

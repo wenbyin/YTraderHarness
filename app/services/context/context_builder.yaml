@@ -1,0 +1,585 @@
+openapi: 3.1.0
+info:
+  title: Context Builder Catalog API
+  version: 1.0.0
+  summary: Read-only API for discovering Context Builder definitions and runtime logic
+  description: |
+    This API exposes the server-side Context Builder catalog as read-only metadata.
+
+    The API is intentionally descriptive rather than configurable. The Context Builder
+    pipeline is fixed in server code; an Agent/Context Type only selects which stages
+    participate and supplies stage parameters. Clients must not reorder, create,
+    delete, or mutate stages through this API.
+
+    Primary use cases:
+      - Frontend displays the structure and behavior of each Context Builder type.
+      - Frontend generates a later flowchart / execution diagram from the returned
+        stages and edges.
+      - Agent Replay / observability UI explains why a stage was executed or skipped.
+      - Platform tooling inspects which steps may perform an auxiliary LLM invocation.
+
+    Important runtime semantics:
+      1. Every Context Builder execution occurs before the target LLM invocation it prepares.
+      2. A Context Builder may itself perform an auxiliary LLM invocation, for example
+         Compaction. Such nested invocation is part of the builder execution and is not
+         automatically a top-level LangGraph business node.
+      3. Stage order is server-defined and must be treated as immutable by clients.
+      4. A stage can be enabled/disabled by the selected Context Builder Type and by
+         runtime policy, but client configuration cannot arbitrarily introduce new stages
+         or reorder the fixed pipeline.
+      5. External providers such as Memory Service, Document Service, Profile Service,
+         and Capability Selector are dependencies/sources; their implementation is not
+         part of the Context Builder itself.
+      6. The final output is a ModelRequest (messages, tool definitions, response format,
+         model-facing metadata) that is suitable for the target model invocation.
+
+servers:
+  - url: /api/v1
+    description: Agent Platform API
+
+tags:
+  - name: Context Builders
+    description: Read-only discovery of available Context Builder types and their logic.
+
+paths:
+  /context-builders:
+    get:
+      operationId: listContextBuilders
+      tags: [Context Builders]
+      summary: List available Context Builder types
+      description: |
+        Returns all Context Builder types supported by this server version.
+
+        This endpoint is a discovery endpoint. It does not return mutable configuration
+        and does not permit callers to create or customize a builder.
+
+        The `pipeline_template` describes the fixed server-side stage order. Each builder
+        type then overrides stage participation and parameters through `stage_policies`.
+      parameters:
+        - $ref: '#/components/parameters/IncludeDisabled'
+      responses:
+        '200':
+          description: Context Builder catalog
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextBuilderListResponse'
+
+  /context-builders/{context_builder_type}:
+    get:
+      operationId: getContextBuilder
+      tags: [Context Builders]
+      summary: Get one Context Builder definition
+      description: |
+        Returns the complete read-only definition used by runtime tooling and frontend
+        visualization.
+
+        The response explicitly separates:
+          - `pipeline_template`: immutable execution order of stages.
+          - `stage_policies`: how this builder type enables/skips stages and the parameters
+            used by each participating stage.
+          - `edges`: logical control/data-flow relations for diagram generation.
+          - `nested_invocations`: LLM calls that can happen inside builder execution.
+
+        `execution_mode` distinguishes whether this builder is normally embedded inside
+        another Agent/Model invocation or may run as an independent workflow.
+      parameters:
+        - $ref: '#/components/parameters/ContextBuilderType'
+      responses:
+        '200':
+          description: Context Builder definition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextBuilderDefinition'
+        '404':
+          description: Unknown Context Builder type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /context-builders/{context_builder_type}/pipeline:
+    get:
+      operationId: getContextBuilderPipeline
+      tags: [Context Builders]
+      summary: Get the flowchart-oriented pipeline description
+      description: |
+        Returns only the graph-oriented representation needed to generate a flowchart.
+
+        The returned graph is not an executable workflow definition. It documents the
+        server's fixed Context Builder pipeline and the conditional edges/stages for the
+        selected builder type.
+
+        A frontend can use `nodes`, `edges`, `entry_stage_id`, `exit_stage_id`, and each
+        node's `skip_when` / `execute_when` fields to render the execution path without
+        embedding server-side business logic.
+      parameters:
+        - $ref: '#/components/parameters/ContextBuilderType'
+      responses:
+        '200':
+          description: Flowchart-oriented pipeline definition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ContextBuilderPipeline'
+        '404':
+          description: Unknown Context Builder type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  parameters:
+    ContextBuilderType:
+      name: context_builder_type
+      in: path
+      required: true
+      description: |
+        Stable server-defined Context Builder type. This is a type identifier, not an
+        arbitrary workflow name.
+      schema:
+        $ref: '#/components/schemas/ContextBuilderType'
+
+    IncludeDisabled:
+      name: include_disabled
+      in: query
+      required: false
+      description: |
+        Whether definitions marked `status=disabled` are included. Disabled definitions
+        remain read-only metadata and cannot be activated through this API.
+      schema:
+        type: boolean
+        default: false
+
+  schemas:
+    ContextBuilderType:
+      type: string
+      enum:
+        - agent_invoke
+        - planner
+        - classifier
+        - compaction
+        - memory
+        - sub_agent
+      description: |
+        Server-defined Context Builder execution semantics.
+
+        `agent_invoke`:
+          Main Agent/ReAct invocation. Usually builds the context immediately before the
+          main model call and may include history, memory, knowledge, capabilities,
+          budgeting, and compaction.
+
+        `planner`:
+          Builds context for an independent planning model call. Usually uses task-scoped
+          history and planning instructions and does not require full execution history.
+
+        `classifier`:
+          Builds a narrow input for routing/JEV/classification. Usually no conversation
+          history, memory, knowledge, or tool execution context unless explicitly defined.
+
+        `compaction`:
+          Builds context for an auxiliary LLM call whose purpose is to summarize/compress
+          prior context. It is normally invoked from another builder when budget or policy
+          requires compaction.
+
+        `memory`:
+          Builds context for memory extraction/reflection. It can be executed by a separate
+          background workflow and should only include information eligible for memory
+          extraction under the configured scope and policy.
+
+        `sub_agent`:
+          Builds a context isolated to a sub-agent's task scope, normally with a reduced
+          view of parent-agent history and capabilities.
+
+    ContextBuilderStatus:
+      type: string
+      enum: [active, disabled]
+
+    ExecutionMode:
+      type: string
+      enum:
+        - embedded_model_invocation
+        - independent_workflow
+        - either
+      description: |
+        Describes the normal runtime placement.
+        `embedded_model_invocation` means the builder runs as part of preparing a parent
+        LLM call. `independent_workflow` means it is normally invoked as its own workflow.
+
+    StageId:
+      type: string
+      enum:
+        - context_resolver
+        - profile_loader
+        - summary_loader
+        - history_selector
+        - memory_retriever
+        - knowledge_retriever
+        - capability_loader
+        - prompt_assembler
+        - token_budgeter
+        - context_compactor
+        - context_validator
+      description: |
+        Fixed server-side Context Builder stage. Stage IDs are stable identifiers used by
+        frontend visualization and observability.
+
+    StageKind:
+      type: string
+      enum:
+        - resolver
+        - loader
+        - selector
+        - retriever
+        - assembler
+        - budgeter
+        - compactor
+        - validator
+
+    StagePolicy:
+      type: object
+      additionalProperties: false
+      required:
+        - stage_id
+        - enabled
+        - execution_order
+      properties:
+        stage_id:
+          $ref: '#/components/schemas/StageId'
+        enabled:
+          type: boolean
+          description: Whether this stage participates for the selected builder type.
+        execution_order:
+          type: integer
+          minimum: 0
+          description: |
+            Order inside the fixed pipeline. This is descriptive only; clients cannot
+            change it through this API.
+        required:
+          type: boolean
+          description: Whether the stage must execute when it is enabled. A non-required
+            stage may still be skipped by runtime conditions.
+        policy_ref:
+          type: string
+          nullable: true
+          description: Stable name of the server-side policy/profile supplying parameters.
+        parameters:
+          type: object
+          additionalProperties: true
+          description: |
+            Read-only effective parameters for this builder type. Parameter values are
+            descriptive runtime policy, not a writable user configuration surface.
+        execute_when:
+          type: array
+          items:
+            type: string
+          description: Conditions under which an enabled stage executes.
+        skip_when:
+          type: array
+          items:
+            type: string
+          description: Conditions under which an enabled stage may be skipped.
+        input_contract:
+          $ref: '#/components/schemas/StageContract'
+        output_contract:
+          $ref: '#/components/schemas/StageContract'
+
+    StageContract:
+      type: object
+      additionalProperties: false
+      properties:
+        description:
+          type: string
+        fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContractField'
+
+    ContractField:
+      type: object
+      additionalProperties: false
+      required: [name, type, required]
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+        required:
+          type: boolean
+        description:
+          type: string
+
+    PipelineNode:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - stage_id
+        - label
+        - kind
+        - enabled
+      properties:
+        id:
+          type: string
+          description: Frontend-stable graph node identifier.
+        stage_id:
+          $ref: '#/components/schemas/StageId'
+        label:
+          type: string
+        kind:
+          $ref: '#/components/schemas/StageKind'
+        enabled:
+          type: boolean
+        execution_order:
+          type: integer
+        description:
+          type: string
+        llm_invocation:
+          type: boolean
+          description: Whether this stage itself may invoke an LLM.
+        independent_lifecycle:
+          type: boolean
+          description: |
+            Whether this stage is designed to be independently observable/recoverable as
+            a business workflow step. This does not automatically make it a LangGraph node.
+        execute_when:
+          type: array
+          items:
+            type: string
+        skip_when:
+          type: array
+          items:
+            type: string
+        metadata:
+          type: object
+          additionalProperties: true
+
+    PipelineEdge:
+      type: object
+      additionalProperties: false
+      required:
+        - from
+        - to
+        - type
+      properties:
+        from:
+          type: string
+        to:
+          type: string
+        type:
+          type: string
+          enum:
+            - sequence
+            - conditional
+            - retry
+            - compaction_loop
+            - nested_invocation
+            - terminal
+        condition:
+          type: string
+          nullable: true
+          description: Human-readable execution condition for conditional edges.
+        description:
+          type: string
+
+    NestedInvocation:
+      type: object
+      additionalProperties: false
+      required:
+        - context_builder_type
+        - trigger
+      properties:
+        context_builder_type:
+          $ref: '#/components/schemas/ContextBuilderType'
+        trigger:
+          type: string
+          description: Condition under which the nested builder is invoked.
+        relation:
+          type: string
+          enum: [nested, delegated, background]
+        blocks_parent:
+          type: boolean
+          description: |
+            Whether the parent execution waits for the nested LLM invocation to complete.
+        description:
+          type: string
+
+    ContextBuilderDefinition:
+      type: object
+      additionalProperties: false
+      readOnly: true
+      required:
+        - type
+        - version
+        - status
+        - name
+        - description
+        - execution_mode
+        - pipeline_template
+        - stage_policies
+        - edges
+        - final_output
+      properties:
+        type:
+          $ref: '#/components/schemas/ContextBuilderType'
+        version:
+          type: string
+          description: Definition version used for replay/documentation compatibility.
+        status:
+          $ref: '#/components/schemas/ContextBuilderStatus'
+        name:
+          type: string
+        description:
+          type: string
+        execution_mode:
+          $ref: '#/components/schemas/ExecutionMode'
+        entry_stage_id:
+          $ref: '#/components/schemas/StageId'
+        exit_stage_id:
+          $ref: '#/components/schemas/StageId'
+        pipeline_template:
+          type: array
+          description: |
+            The immutable global stage order shared by Context Builder implementations.
+            The selected builder type only controls participation and stage parameters.
+          items:
+            $ref: '#/components/schemas/StageId'
+        stage_policies:
+          type: array
+          items:
+            $ref: '#/components/schemas/StagePolicy'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/PipelineEdge'
+        nested_invocations:
+          type: array
+          items:
+            $ref: '#/components/schemas/NestedInvocation'
+        external_dependencies:
+          type: array
+          items:
+            type: string
+          description: |
+            External context sources/services used by the builder. These dependencies are
+            not internally implemented by Context Builder.
+        final_output:
+          $ref: '#/components/schemas/FinalOutputContract'
+        visualization:
+          $ref: '#/components/schemas/VisualizationMetadata'
+
+    FinalOutputContract:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - description
+      properties:
+        type:
+          type: string
+          enum: [model_request]
+        description:
+          type: string
+        fields:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContractField'
+
+    VisualizationMetadata:
+      type: object
+      additionalProperties: false
+      properties:
+        layout_direction:
+          type: string
+          enum: [TB, LR]
+          default: TB
+        group:
+          type: string
+        node_order:
+          type: array
+          items:
+            type: string
+        notes:
+          type: array
+          items:
+            type: string
+
+    ContextBuilderPipeline:
+      type: object
+      additionalProperties: false
+      readOnly: true
+      required:
+        - type
+        - version
+        - entry_stage_id
+        - exit_stage_id
+        - nodes
+        - edges
+      properties:
+        type:
+          $ref: '#/components/schemas/ContextBuilderType'
+        version:
+          type: string
+        entry_stage_id:
+          type: string
+        exit_stage_id:
+          type: string
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/PipelineNode'
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/PipelineEdge'
+        nested_invocations:
+          type: array
+          items:
+            $ref: '#/components/schemas/NestedInvocation'
+
+    ContextBuilderSummary:
+      type: object
+      additionalProperties: false
+      required: [type, version, status, name, description, execution_mode]
+      properties:
+        type:
+          $ref: '#/components/schemas/ContextBuilderType'
+        version:
+          type: string
+        status:
+          $ref: '#/components/schemas/ContextBuilderStatus'
+        name:
+          type: string
+        description:
+          type: string
+        execution_mode:
+          $ref: '#/components/schemas/ExecutionMode'
+
+    ContextBuilderListResponse:
+      type: object
+      additionalProperties: false
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContextBuilderSummary'
+        count:
+          type: integer
+          minimum: 0
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: string
+          nullable: true
+
