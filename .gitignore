@@ -2,3 +2,4 @@
 /python.exe.stackdump
 /.venv/
 /.idea/
+/app/__pycache__/
