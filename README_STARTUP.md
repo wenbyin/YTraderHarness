@@ -1,6 +1,6 @@
 # START_UP.md — 配置与启动
 
-> YTraderAgent · 配置手册与启动时序
+> YTraderHarness · 配置手册与启动时序
 > 覆盖范围：`app/config/**`（运行时配置，10 份）、`app/services/**/*.yaml`（HTTP 契约规格，19 份）、
 > 以及 `app/main.py` 的 lifespan 启动链。
 > 本文回答一个问题：**"这个服务要跑起来，哪些文件要配、按什么顺序读、改完怎么生效。"**

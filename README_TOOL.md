@@ -1,6 +1,6 @@
 # TOOL_README.MD — Tool 子系统
 
-> YTraderAgent · Tool 子系统事实手册
+> YTraderHarness · Tool 子系统事实手册
 > 覆盖范围：`app/services/tool/`（定义 / 注册 / 发现 / 管理）、`app/agent/tools/processor/`（处理器链 / 拦截）、`app/infra/agent/`（执行器 / 暴露）、`app/api/v1/{tools,tool_processors,processors,capabilities}.py`。
 > 本文只描述**代码里真实存在**的东西；注释与代码冲突处一律以代码为准并显式标注。
 

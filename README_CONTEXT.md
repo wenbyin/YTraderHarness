@@ -1,6 +1,6 @@
 # CONTEXT_README.MD — Context 子系统
 
-> YTraderAgent · Context 子系统事实手册
+> YTraderHarness · Context 子系统事实手册
 > 覆盖范围：`app/agent/context/`（builder 构建器 + processor 处理器流水线）、`app/common/context/enum.py`（枚举定义处）、`app/services/context/context_builder.yaml`（契约）。
 > 本文回答一个问题：**"把图状态组装成给模型看的 messages" 这件事，在这份代码里是怎么发生的。**
 

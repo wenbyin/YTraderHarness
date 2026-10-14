@@ -1,6 +1,6 @@
 # MODEL_README.MD — Model 子系统
 
-> YTraderAgent · Model 子系统事实手册
+> YTraderHarness · Model 子系统事实手册
 > 覆盖范围：`app/agent/model/`（目录 / 路由 / 适配 / 运行 / 类型 / 错误 / 凭证 / 观测）、`app/common/llm.py` + `app/common/llm.yaml`（客户端构造）。
 > **本文所有模型名、上下文长度、profile 参数均照抄 `model.yaml` 的真实值，不补充常识、不臆造价格。**
 
