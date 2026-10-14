@@ -1,0 +1,480 @@
+openapi: 3.1.0
+
+info:
+  title: User & Authentication API
+  version: 1.0.0
+  description: |
+    Casdoor OAuth 登录与当前调用者查询。
+
+    Responsibilities:
+      - Start an OAuth login and return the Casdoor authorization URL.
+      - Exchange the authorization code for a token set.
+      - Refresh an expired access token.
+      - Describe the authenticated caller.
+      - Search the Casdoor directory for users, to fill option pickers
+        (admin only — see `/users/search`).
+
+    Non-responsibilities:
+      - User CRUD. Users live in Casdoor, which is the single source of
+        truth. This service keeps **no** local user table — even
+        `/users/search` asks Casdoor at request time rather than holding
+        a copy.
+      - Group / role / permission management (Casdoor console).
+      - Token *verification*. That is the shared auth component in
+        app/common/auth, applied to every protected endpoint by
+        app/api/v1/router.py. It is not re-implemented here.
+
+    Authentication:
+      `/auth/login`, `/auth/callback` and `/auth/refresh` are **public**
+      (`security: []`) — see each operation for why.
+      `/auth/me` requires a bearer token, like every other /api/v1
+      endpoint.
+
+    Path prefix note:
+      The `/auth/*` paths are not `/users/*` because the subject of each
+      is a *login action*, not a user resource. `/users/search` is the
+      deliberate exception: there the subject **is** the user resource —
+      a read-only lookup that Casdoor itself answers.
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Auth
+    description: Casdoor OAuth login and current caller
+
+  - name: Users
+    description: |
+      Read-only lookup of users in the Casdoor directory, for option
+      pickers.
+
+      ⚠️ Admin-only: the caller must hold the role named by
+      `casdoor.yaml: admin_role` (`Y-Trader-Admin` by default). This is
+      the first endpoint in this repository gated by a *role* rather
+      than by the global `required_groups` login gate.
+
+
+paths:
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Begin login
+      operationId: beginLogin
+      description: |
+        Returns the Casdoor authorization URL and sets a short-lived
+        `HttpOnly; SameSite=Lax` cookie (name from
+        `casdoor.yaml: state_cookie_name`) holding a nonce bound to the
+        `state`.
+
+        **Public** — there is no token yet at this point.
+
+        The returned URL must be opened by the *same browser* that
+        received this response, otherwise the callback will not carry
+        the cookie and the state check will fail. This is deliberate:
+        a signed state alone does not stop login CSRF, only a
+        browser-bound one does.
+      security: []
+      responses:
+        '200':
+          description: |
+            Authorization URL. The response also carries
+            `Set-Cookie: <state_cookie_name>=<nonce>`.
+          headers:
+            Set-Cookie:
+              description: |
+                One-time state nonce, bound to the returned `state`.
+                Cleared on /auth/callback.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginUrlResponse'
+        '500':
+          description: |
+            Casdoor auth is disabled (`enabled: false`) — login cannot
+            proceed without credentials.
+
+  /auth/callback:
+    post:
+      tags: [Auth]
+      summary: Exchange authorization code for tokens
+      operationId: completeLogin
+      description: |
+        The frontend reads `?code=&state=` off the redirect URI and
+        forwards them here. The state cookie is sent automatically by
+        the browser and is required.
+
+        **Public** — this is the step that obtains a token.
+
+        The code is single-use: a second call with the same code fails.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginCallbackRequest'
+      responses:
+        '200':
+          description: Token set. Clears the state cookie.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          description: |
+            State missing / forged / expired / from another browser,
+            or the authorization code was rejected by Casdoor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Casdoor unreachable, or auth is disabled.
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Refresh an access token
+      operationId: refreshToken
+      description: |
+        Exchanges a refresh token for a new token set.
+
+        **Public on purpose** — it authenticates with the refresh
+        token, and its whole purpose is to be called once the access
+        token has *expired*. Requiring a valid access token here would
+        make it useless.
+
+        ⚠️ This triggers an outbound call to Casdoor from unauthenticated
+        input. There is no rate limiting yet; add one before exposing
+        this to the public internet.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+      responses:
+        '200':
+          description: New token set.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          description: Refresh token rejected by Casdoor.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Casdoor unreachable, or auth is disabled.
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Describe the current caller
+      operationId: describeCurrentUser
+      description: |
+        Every field comes from the access token's claims — no database
+        lookup (there is no local user table).
+
+        Note that `groups` reflects what the **token** says, not live
+        Casdoor state: removing someone from a group takes effect when
+        their token expires or they log in again.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The authenticated caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentUserResponse'
+        '401':
+          description: |
+            Missing / malformed / expired token, or wrong audience.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: |
+            Token is valid but the user is not in a required group
+            (`casdoor.yaml: required_groups`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/search:
+    get:
+      tags: [Users]
+      summary: Search users for option pickers
+      operationId: searchUsers
+      description: |
+        Looks up users in the Casdoor directory so a UI can offer a
+        picker. Read-only: nothing is written, and no local copy is kept
+        (there is no local user table).
+
+        Returns *options* — the four fields a picker needs — not full
+        user objects. Casdoor's user object carries well over a hundred
+        fields (including `accessToken` and third-party credentials);
+        it is deliberately not passed through.
+
+        ## Matching
+
+        The keyword is matched **approximately** (substring, `LIKE
+        %keyword%`) against three fields, each queried separately and
+        the results merged:
+
+            name    login name
+            email   email
+            id      the user id (UUID) — what other APIs take as the
+                    user's identity (`subject` on /auth/me)
+
+        ⚠️ Matching is **case-sensitive** (`yin` hits, `YIN` does not);
+        that is Casdoor's own comparison, not a choice made here.
+        `displayName` is **not** searched — add it to the field list in
+        app/common/auth/component.py if the picker shows display names.
+
+        Results are de-duplicated by id and truncated to `limit`. The
+        order is "name matches first, then email, then id" — **not**
+        relevance-ranked, and not guaranteed stable across Casdoor
+        versions.
+
+        Accounts that are disabled (`isForbidden`) or deleted
+        (`isDeleted`) are left out: an option nobody can be given is
+        noise in a picker.
+
+        ## Authorization
+
+        **Admin-only.** The caller's `roles` claim must hold the role
+        named by `casdoor.yaml: admin_role` (`Y-Trader-Admin` by
+        default), otherwise 403 — matching semantics are the same as
+        `required_groups` (bare name, or the name qualified with the
+        configured `org_name`).
+
+        ⚠️ With authentication switched off (`casdoor.yaml: enabled:
+        false`), the dev-bypass user carries **no** roles, so this
+        endpoint answers 403 locally too. That is deliberate — see
+        `CasdoorAuthComponent.synthetic_user` for why the bypass must
+        not invent roles.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: keyword
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 128
+          description: |
+            What to look for. Omit (or send an empty value) to list the
+            first `limit` users of the organization without filtering —
+            useful for showing a picker before the user types anything.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 20
+          description: |
+            Maximum number of options to return. Capped at 50: this
+            feeds a picker, and a picker that needs more than 50 rows
+            is a search box, not a picker.
+      responses:
+        '200':
+          description: |
+            Matching options. Empty list when nothing matches — not a
+            404.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UserOption'
+        '401':
+          description: |
+            Missing / malformed / expired token, or wrong audience.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: |
+            Token is valid but the caller lacks the admin role
+            (`casdoor.yaml: admin_role`), or is not in a required group.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: |
+            Casdoor unreachable, or it refused the lookup (the
+            application's credentials have no right to read users
+            there).
+
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Casdoor access token:
+        `Authorization: Bearer <access_token>`.
+
+        The only exception is the SSE endpoint
+        `GET /api/v1/runs/{run_id}/events`, which also accepts
+        `?access_token=` because browser EventSource cannot set
+        headers. See session.yaml.
+
+  schemas:
+
+    LoginUrlResponse:
+      type: object
+      additionalProperties: false
+      required: [authorize_url, state]
+      properties:
+        authorize_url:
+          type: string
+          description: |
+            Casdoor authorization page. Open it in the browser that
+            received this response.
+        state:
+          type: string
+          description: |
+            CSRF state value; send it back verbatim on /auth/callback.
+            HMAC-signed and self-expiring — no server-side storage.
+
+    LoginCallbackRequest:
+      type: object
+      additionalProperties: false
+      required: [code, state]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          description: Authorization code. Single-use.
+        state:
+          type: string
+          minLength: 1
+          description: The state returned by /auth/login.
+
+    RefreshTokenRequest:
+      type: object
+      additionalProperties: false
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+
+    TokenResponse:
+      type: object
+      additionalProperties: false
+      required: [access_token, token_type]
+      description: |
+        Passed through from Casdoor unchanged — the field names are
+        OAuth 2.0's, and remapping them would only add a place to lose
+        information.
+      properties:
+        access_token:
+          type: string
+          description: |
+            JWT. Send it as `Authorization: Bearer <token>`.
+        token_type:
+          type: string
+          default: Bearer
+        refresh_token:
+          type: string
+          nullable: true
+          description: |
+            Sensitive: equivalent to a password while valid. Returned
+            in the body here; an HttpOnly cookie would be safer for
+            browser clients (would require server-side sessions).
+        expires_in:
+          type: integer
+          nullable: true
+          description: Seconds until `access_token` expires.
+        id_token:
+          type: string
+          nullable: true
+        scope:
+          type: string
+          nullable: true
+
+    CurrentUserResponse:
+      type: object
+      additionalProperties: false
+      required: [subject]
+      description: |
+        Derived entirely from the verified access token. Raw claims are
+        deliberately **not** exposed here.
+      properties:
+        subject:
+          type: string
+          description: Casdoor user id (JWT `sub`).
+        name:
+          type: string
+          default: ''
+        display_name:
+          type: string
+          default: ''
+        email:
+          type: string
+          default: ''
+        groups:
+          type: array
+          items:
+            type: string
+          description: |
+            Normalized group names (arrays / objects / owner-qualified
+            forms are all flattened to bare names). Reflects the token,
+            not live Casdoor state.
+
+    UserOption:
+      type: object
+      additionalProperties: false
+      required: [id]
+      description: |
+        One row of a user picker.
+
+        ⚠️ Not a user *record*: only the fields a picker renders. A
+        user's full Casdoor object is not exposed anywhere in this
+        service (see the file's Non-responsibilities).
+      properties:
+        id:
+          type: string
+          description: |
+            Casdoor user id (UUID). This is the value other APIs take
+            when they need a user — it is the `subject` that
+            /auth/me reports for that same person.
+        name:
+          type: string
+          default: ''
+          description: Login name.
+        display_name:
+          type: string
+          default: ''
+          description: |
+            Display name (`displayName` in Casdoor). Can be empty.
+        email:
+          type: string
+          default: ''
+          description: Email. Can be empty.
+
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: string

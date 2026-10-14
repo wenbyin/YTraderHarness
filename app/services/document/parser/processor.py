@@ -155,8 +155,9 @@ class TextDocumentProcessor(DocumentProcessor, ABC):
 
     ⚠️ 它必须是抽象的（ABC）
     ------------------------
-    能力注册表按"叶子子类"发现实现（见 pipeline/registry.py 的
-    `_leaf_subclasses`），**只跳过抽象类**。这一层如果变成具体类，
+    能力注册表按"叶子子类"发现实现（见 app/common/utils/
+    reflection.py 的 `leaf_subclasses`），**只跳过抽象类**。这一层
+    如果变成具体类，
     一旦哪天它的子类都被删光，它自己就会被当成一个可注册的能力
     实例化出来 —— 一个没有 name、没有 role 的空壳。
     """

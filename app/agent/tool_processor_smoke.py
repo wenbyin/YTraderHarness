@@ -183,8 +183,9 @@ class ObserverDemo(ToolObserver):
 #: 两级各有各的语义（节点级管的是"这一步要不要重跑"，工具级只能管
 #: "这一次调用"），叠在一起出问题时很难说清是谁在重跑。
 REAL_KEYS = frozenset({
-    "hitl_processor",
+    "approval_interceptor",
     "cache_interceptor",
+    "auth_interceptor",
     "event_observer",
     "metrics_observer",
     "privacy_transformer",
@@ -427,7 +428,7 @@ async def main() -> int:
     registry = get_processor_registry()
 
     check(
-        "五个真实处理器都在目录里",
+        "六个真实处理器都在目录里",
         REAL_KEYS <= set(registry.keys()),
     )
     check(
@@ -985,7 +986,9 @@ async def main() -> int:
     )
 
     everything = await catalog.list_definitions()
-    check("默认列出全部实现", everything.total == 5)
+    # 用 REAL_KEYS 的长度而不是写死的数字：新增一个真实处理器时该改的是
+    # 上面那个集合（它同时被"注册表里都有"那条断言用），而不是这里。
+    check("默认列出全部实现", everything.total == len(REAL_KEYS))
     check(
         "config_schema 始终存在",
         all(item.config_schema for item in everything.items),
@@ -1026,10 +1029,13 @@ async def main() -> int:
         == {"cache_interceptor"},
     )
 
+    # 第 2 页、每页 4 条：满页之外剩下的那几条。
+    # 同样从 REAL_KEYS 推，别写死数字 —— 前提只是"处理器比一页多"。
     paged = await catalog.list_definitions(page=2, page_size=4)
     check(
         "分页：total 是过滤后的总数，不是页长",
-        len(paged.items) == 1 and paged.total == 5,
+        paged.total == len(REAL_KEYS)
+        and len(paged.items) == len(REAL_KEYS) - 4,
     )
     check(
         "TRANSFORMER 这个 type 现在有真实实现（之前是空枚举值）",
@@ -1185,6 +1191,120 @@ async def main() -> int:
                 config={},
             )
         ).error is not None,
+    )
+
+    # --------------------------------------------------------
+    section("调用者鉴权（INTERCEPTOR）")
+
+    from pydantic import ValidationError
+
+    from app.agent.tools.processor.context import (
+        CALLER_CONTEXT_KEY,
+        ToolCallDenied,
+        build_caller_context,
+    )
+    from app.agent.tools.processor.interceptor.auth import (
+        AuthConfig,
+        AuthProcessor,
+    )
+
+    checkauth = AuthProcessor()
+
+    async def _authz(config, caller=None):
+        """跑一次 before，返回它给出的东西（ToolInvocation=放行）。"""
+
+        invocation = ToolInvocation(
+            tool_key="checkauth.smoke", arguments={}
+        )
+
+        if caller is not None:
+            invocation.context[CALLER_CONTEXT_KEY] = caller
+
+        return await checkauth.before(invocation, config=config)
+
+    # ⚠️ 空配置在**挂载期**就该被拒：挂一个什么都不拦的鉴权关卡比没挂
+    # 更危险（链上看起来有鉴权）。挂载校验会把 config 过一遍
+    # config_model，所以这里抛的 ValidationError -> 接口 400。
+    check(
+        "两个条件都空 -> 配置本身不成立",
+        _raises(
+            ValidationError,
+            lambda: AuthConfig.model_validate({}),
+        )
+        and _raises(
+            ValidationError,
+            lambda: AuthConfig.model_validate(
+                {"require_roles": [], "require_group": "   "}
+            ),
+        ),
+    )
+
+    check(
+        "角色命中任意一个即放行",
+        isinstance(
+            await _authz(
+                {"require_roles": ["trader_admin", "ops"]},
+                build_caller_context(roles=["ops"]),
+            ),
+            ToolInvocation,
+        ),
+    )
+
+    denied = await _authz(
+        {"require_roles": ["trader_admin"]},
+        build_caller_context(roles=["viewer"]),
+    )
+    check(
+        "角色不命中 -> 拒绝（ToolCallDenied，工具没跑）",
+        isinstance(denied, ToolOutcome)
+        and isinstance(denied.error, ToolCallDenied),
+    )
+
+    check(
+        "群组精确匹配 -> 放行",
+        isinstance(
+            await _authz(
+                {"require_group": "Y-Trader-User"},
+                build_caller_context(groups=["Y-Trader-User"]),
+            ),
+            ToolInvocation,
+        ),
+    )
+    check(
+        "群组不做\"取 / 之后那段\"的宽松匹配（auth 层拒绝过那种写法）",
+        isinstance(
+            await _authz(
+                {"require_group": "Y-Trader-User"},
+                build_caller_context(groups=["evil-org/Y-Trader-User"]),
+            ),
+            ToolOutcome,
+        ),
+    )
+    check(
+        "两个条件都配时是 AND",
+        isinstance(
+            await _authz(
+                {"require_roles": ["ops"], "require_group": "g1"},
+                build_caller_context(roles=["ops"], groups=["g2"]),
+            ),
+            ToolOutcome,
+        ),
+    )
+
+    missing = await _authz({"require_roles": ["ops"]})
+    check(
+        "拿不到身份 -> 默认拒绝（fail-closed）",
+        isinstance(missing, ToolOutcome)
+        and isinstance(missing.error, ToolCallDenied),
+    )
+    check(
+        "on_missing=allow 才放行，且**只有**显式配了才这样",
+        isinstance(
+            await _authz(
+                {"require_roles": ["ops"], "on_missing": "allow"}
+            ),
+            ToolInvocation,
+        ),
     )
 
     # --------------------------------------------------------

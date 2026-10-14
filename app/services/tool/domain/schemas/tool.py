@@ -16,7 +16,8 @@ from pydantic import Field
 
 from app.common.schemas import APIModel
 
-from .classification import Classification
+from app.services.capability.domain.schemas import Capability
+
 from .documentation import ToolDocumentation
 from .enum import SourceState, SourceType
 
@@ -126,14 +127,17 @@ class ToolSummary(APIModel):
         ),
     )
 
-    classifications: list[Classification] = Field(
+    #: 字段名保持 classifications（不叫 capabilities）—— 它描述的是
+    #: **工具这一侧**的关联，与 /tools/{tool_id}/classifications 一致；
+    #: 嵌进来的对象本身是不可改名的 Capability（见 capability.yaml）。
+    classifications: list[Capability] = Field(
         default_factory=list,
-        description="已关联的分类。",
+        description="已关联的能力。",
     )
 
 
 class ToolDefinitionDetail(APIModel):
-    """详情页：事实 + 人工说明 + 分类，一次给全。"""
+    """详情页：事实 + 人工说明 + 能力，一次给全。"""
 
     manifest: ToolManifest = Field(
         description="代码侧事实。",
@@ -143,9 +147,9 @@ class ToolDefinitionDetail(APIModel):
         description="人工说明与生效值。",
     )
 
-    classifications: list[Classification] = Field(
+    classifications: list[Capability] = Field(
         default_factory=list,
-        description="已关联的分类。",
+        description="已关联的能力。",
     )
 
 

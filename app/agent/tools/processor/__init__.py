@@ -11,7 +11,7 @@
 ----------------------------
 注册表（app/services/tool/registry/processor_registry.py）把本包名
 写进 PROCESSOR_PACKAGES，然后 `walk_packages` 逐个 import、
-`_leaf_subclasses(BaseToolProcessor)` 收叶子类。
+`leaf_subclasses(BaseToolProcessor)` 收叶子类。
 
 因此新增一个处理器 = 在本包下加一个 .py 文件 + 继承某个 type 基类
 + 声明 name / supported_hooks / supported_execution_modes，

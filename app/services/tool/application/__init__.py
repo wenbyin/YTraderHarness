@@ -7,15 +7,21 @@ Tool 模块的应用服务。
 
 _assembly.py 不是服务，是两个读服务共用的纯函数组装逻辑 ——
 放在这里是因为它只被本层用，且不该被更外层直接 import。
+
+⚠️ 能力树本体的服务**不在本模块** —— 它是
+app/services/capability 的 CapabilityService。这里只有工具 ↔ 能力的
+关联服务（ToolClassificationService）。
 """
 
-from .classification_service import ClassificationService
-from .classification_service_impl import ClassificationServiceImpl
 from .processor_definition_service import (
     ProcessorDefinitionService,
 )
 from .processor_definition_service_impl import (
     ProcessorDefinitionServiceImpl,
+)
+from .tool_classification_service import ToolClassificationService
+from .tool_classification_service_impl import (
+    ToolClassificationServiceImpl,
 )
 from .tool_discovery_service import ToolDiscoveryService
 from .tool_discovery_service_impl import ToolDiscoveryServiceImpl
@@ -23,20 +29,24 @@ from .tool_documentation_service import ToolDocumentationService
 from .tool_documentation_service_impl import (
     ToolDocumentationServiceImpl,
 )
+from .tool_execution_service import ToolExecutionService
+from .tool_execution_service_impl import ToolExecutionServiceImpl
 from .tool_processor_service import ToolProcessorService
 from .tool_processor_service_impl import ToolProcessorServiceImpl
 from .tool_query_service import ToolQueryService
 from .tool_query_service_impl import ToolQueryServiceImpl
 
 __all__ = [
-    "ClassificationService",
-    "ClassificationServiceImpl",
     "ProcessorDefinitionService",
     "ProcessorDefinitionServiceImpl",
+    "ToolClassificationService",
+    "ToolClassificationServiceImpl",
     "ToolDiscoveryService",
     "ToolDiscoveryServiceImpl",
     "ToolDocumentationService",
     "ToolDocumentationServiceImpl",
+    "ToolExecutionService",
+    "ToolExecutionServiceImpl",
     "ToolProcessorService",
     "ToolProcessorServiceImpl",
     "ToolQueryService",

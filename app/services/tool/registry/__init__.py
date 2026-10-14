@@ -8,6 +8,7 @@ Tool 自注册与发现。
     schema.py       schema 推导（纯函数，两条来源共用）
     docstring.py    docstring 切段（纯函数，两条来源共用）
     spec.py         两个数据结构
+    selection.py    按 key 选工具（纯函数）—— "哪些工具能用"的唯一判定
 
     processor_registry.py
                     处理器实现的注册表（反射发现，与上面几个无关 ——
@@ -44,6 +45,7 @@ from .schema import (
     resolve_request_model,
     synthesize_schema,
 )
+from .selection import select_specs, tool_key_of, wire_name
 from .spec import ToolManifestData, ToolSpec
 
 __all__ = [
@@ -67,6 +69,9 @@ __all__ = [
     "parse_docstring",
     "resolve_request_model",
     "resolve_returns",
+    "select_specs",
     "synthesize_schema",
     "tool",
+    "tool_key_of",
+    "wire_name",
 ]

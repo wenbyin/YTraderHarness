@@ -16,9 +16,12 @@ from __future__ import annotations
 from uuid import UUID
 
 from app.agent.tools.processor.base import BaseToolProcessor
+from app.services.capability.application._assembly import (
+    build_capability,
+)
+from app.services.capability.domain.entities import Capability
 
 from ..domain.entities import (
-    ToolClassification,
     ToolDefinition,
     ToolDocumentation as ToolDocumentationEntity,
 )
@@ -26,7 +29,6 @@ from ..domain.entities import (
     ToolProcessor as ToolProcessorEntity,
 )
 from ..domain.schemas import (
-    Classification,
     ParameterDocumentation,
     ProcessorDefinition,
     ToolDefinitionDetail,
@@ -40,8 +42,8 @@ from ..domain.schemas.enum import ExecutionMode, ProcessorHook
 from ..registry.schema import output_description
 
 __all__ = [
+    "build_capability",
     "build_chain",
-    "build_classification",
     "build_definition_detail",
     "build_documentation",
     "build_manifest",
@@ -68,20 +70,6 @@ def build_manifest(definition: ToolDefinition) -> ToolManifest:
         source_state=definition.source_state,
         discovered_at=definition.discovered_at,
         last_synced_at=definition.last_synced_at,
-    )
-
-
-def build_classification(
-        entity: ToolClassification,
-) -> Classification:
-    return Classification(
-        id=entity.classification_id,
-        code=entity.code,
-        name=entity.name,
-        description=entity.description,
-        parent_id=entity.parent_id,
-        sort_order=entity.sort_order,
-        is_active=entity.is_active,
     )
 
 
@@ -185,7 +173,7 @@ def build_summary(
         definition: ToolDefinition,
         *,
         description_override: str | None,
-        classifications: list[ToolClassification],
+        classifications: list[Capability],
 ) -> ToolSummary:
     """
     列表项。
@@ -204,7 +192,7 @@ def build_summary(
         source_state=definition.source_state,
         description=description_override or source_raw,
         classifications=[
-            build_classification(item) for item in classifications
+            build_capability(item) for item in classifications
         ],
     )
 
@@ -212,15 +200,15 @@ def build_summary(
 def build_definition_detail(
         definition: ToolDefinition,
         stored: ToolDocumentationEntity | None,
-        classifications: list[ToolClassification],
+        classifications: list[Capability],
 ) -> ToolDefinitionDetail:
-    """详情：事实 + 说明 + 分类，一次组装完。"""
+    """详情：事实 + 说明 + 能力，一次组装完。"""
 
     return ToolDefinitionDetail(
         manifest=build_manifest(definition),
         documentation=build_documentation(definition, stored),
         classifications=[
-            build_classification(item) for item in classifications
+            build_capability(item) for item in classifications
         ],
     )
 

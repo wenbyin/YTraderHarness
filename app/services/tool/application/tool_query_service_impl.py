@@ -7,6 +7,7 @@ ToolQueryService 的默认实现。
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 from app.common.exceptions import NotFoundError
@@ -134,3 +135,91 @@ class ToolQueryServiceImpl(ToolQueryService):
             stored,
             classifications,
         )
+
+    # ========================================================
+    # 解析（见契约里的说明）
+    # ========================================================
+
+    async def tool_keys_for_capabilities(
+            self,
+            codes: list[str],
+    ) -> list[str]:
+
+        definitions = (
+            await self._definitions.list_active_by_classification_codes(
+                codes
+            )
+        )
+
+        # 仓储已经按 tool_key 排序，但**组装层不该依赖别人的排序**
+        # （与 _assembly.build_chain 同一条规矩）：这里少去重一次，
+        # 将来任何一条换掉的查询都会静默把重复的 key 交给模型。
+        return list(dict.fromkeys(d.tool_key for d in definitions))
+
+    async def tool_ids_for_keys(
+            self,
+            tool_keys: list[str],
+    ) -> dict[str, UUID]:
+
+        if not tool_keys:
+            return {}
+
+        definitions = await self._definitions.list_by_keys(tool_keys)
+
+        return {d.tool_key: d.tool_id for d in definitions}
+
+    async def tool_documentation_overrides(
+            self,
+            tool_keys: list[str],
+    ) -> dict[str, dict[str, Any]]:
+
+        if not tool_keys:
+            return {}
+
+        # 键 -> id 的桥只有这一条（仓储按 tool_id 存，模型只知道 key）。
+        # 自己再写一次 join 就是第二份实现，而两份迟早会对同一个 key
+        # 给出不同的 id。
+        id_of = await self.tool_ids_for_keys(tool_keys)
+
+        if not id_of:
+            return {}
+
+        tool_ids = list(id_of.values())
+
+        # 两次批量查询，而不是逐工具取 —— 逐个取是经典的 N+1，
+        # 而这条路跑在**每一轮对话**上（见 list_tools 里同一条说明）。
+        descriptions = await self._documentations.map_description_overrides(
+            tool_ids
+        )
+
+        parameters = await self._documentations.map_parameter_overrides(
+            tool_ids
+        )
+
+        overrides: dict[str, dict[str, Any]] = {}
+
+        for tool_key, tool_id in id_of.items():
+
+            description = descriptions.get(tool_id)
+
+            # 空串与 None 都算"没写"。这里用真值判据而不是 `is not None`
+            # 是刻意的：与读接口 `_assembly.build_summary` 的
+            # `description_override or source_raw` 必须是同一个口径，
+            # 否则同一份覆盖在列表页生效、在模型那里不生效。
+            params = {
+                path: value
+                for path, value in (parameters.get(tool_id) or {}).items()
+                if value
+            }
+
+            if not description and not params:
+                continue
+
+            entry: dict[str, Any] = {"description": description or None}
+
+            if params:
+                entry["parameters"] = params
+
+            overrides[tool_key] = entry
+
+        return overrides

@@ -114,7 +114,14 @@ class UploadFileRequest(APIModel):
         default_factory=dict
     )
 
-    uploaded_by: UUID | None = None
+    uploaded_by: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "上传用户 ID（Casdoor 的 sub）。由 api 层从 access token 填，"
+            "调用方指定它没有意义（本 DTO 也不是请求体，见上传端点）。"
+        ),
+    )
 
 
 class FileResponse(APIModel):
@@ -156,7 +163,10 @@ class GetFileResponse(FileResponse):
 class DeleteFileRequest(APIModel):
     file_id: UUID
 
-    deleted_by: UUID | None = None
+    # ⚠️ 当前**没有任何实现读它**（delete_file 不写删除人）。类型跟着
+    # uploaded_by 一起从 UUID 改成字符串，只为不留"唯一一个还在用 UUID
+    # 的用户标识"这种不一致。
+    deleted_by: str | None = None
 
 
 class DeleteFileResponse(APIModel):
@@ -242,9 +252,16 @@ class ListFilesRequest(APIModel):
         ),
     )
 
-    uploaded_by: UUID | None = Field(
+    uploaded_by: str | None = Field(
         default=None,
-        description="上传用户 ID。",
+        max_length=255,
+        description=(
+            "上传用户 ID（Casdoor 的 sub，字符串）。"
+            "为空时不按上传人过滤。\n\n"
+            "⚠️ 它是**过滤条件，不是授权边界**：file 接口当前不按登录用户"
+            "过滤（见 api/v1/files.py 的说明），所以拿别人的 id 传进来能查到"
+            "别人的文件。"
+        ),
     )
 
     created_from: datetime | None = Field(
@@ -309,7 +326,7 @@ class FileListItem(APIModel):
 
     status: str
 
-    uploaded_by: UUID | None
+    uploaded_by: str | None
 
     created_at: datetime
 

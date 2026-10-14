@@ -154,9 +154,12 @@ class File(BaseModel):
     # Audit
     # ========================================================
 
-    uploaded_by: UUID | None = Field(
+    uploaded_by: str | None = Field(
         default=None,
-        description="上传用户 ID。",
+        description=(
+            "上传用户 ID —— Casdoor 的 sub（app/common/auth），字符串。"
+            "原为 UUID，见 models/sqlalchemy/file.py 的换类型说明。"
+        ),
     )
 
     created_at: datetime = Field(

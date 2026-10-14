@@ -124,6 +124,31 @@ class ToolDocumentationRepository(BaseRepository):
         raise NotImplementedError
 
     @abstractmethod
+    async def map_parameter_overrides(
+            self,
+            tool_ids: list[UUID],
+    ) -> dict[UUID, dict[str, str | None]]:
+        """
+        批量取**参数级**的描述覆盖，返回 tool_id -> {参数路径: 覆盖值}。
+
+        与 list_parameter_documentations 的关系，就是
+        map_description_overrides 与 get 的关系：前者一个工具一次、
+        后者一批一次。执行那条路（把人工说明叠进 bind 给模型的工具）
+        要的正是批量版 —— 逐个工具查就是经典的 N+1，而它跑在
+        每一轮对话的路径上。
+
+        ⚠️ 返回的**内层 dict 里保留值为 None 的行**（人为建了行但没写
+        覆盖）。上层要判"算不算覆盖"请用自己的口径（空串与 None 都
+        算没有），别指望这里替你滤 —— 滤掉之后"有行但空"与"没有行"
+        就分不开了，而两者排查方向不同。
+
+        没有任何参数说明的 tool_id 不会出现在返回的 dict 里，
+        调用方请用 .get(tool_id) 取值。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
     async def count_for_tools(
             self,
             tool_ids: list[UUID],

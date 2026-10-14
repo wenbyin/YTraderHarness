@@ -69,11 +69,18 @@ langchain_core/tools/base.py 的 tool_call_schema）。
 （`tool.description` 与 `tool.args_schema` 构造后仍可赋值，
 `tool_call_schema` 因此自动跟着变）。
 
-执行入口还没接
---------------
+执行不走这里
+------------
 `_run` / `_arun` 是**明确的占位**（抛 NotImplementedError 并指向
-该去的地方）。真正的执行要 factory.create(contract) 造出 service
-再调方法，那是 app/infra/agent/ 那一层的事。
+该去的地方）。真正的执行在 `app/infra/agent/tool_executor.py`：
+它按 tool_id 取处理器链、驱动链、再用 factory.create(contract)
+造出 service 调方法。
+
+为什么不让描述符自己执行
+------------------------
+声明层要能反向依赖 service 工厂与处理器链，就等于把"声明一个工具"
+的代价从"建一个 pydantic 模型"变成"拖进整个执行栈"。而且工具要跑的
+不只是方法本身 —— 还有链上的拦截 / 转换 / 观测，那些不属于工具。
 """
 
 from __future__ import annotations
@@ -226,23 +233,30 @@ class ToolDescriptor(StructuredTool):
 
     async def _arun(self, **kwargs: Any) -> Any:
         """
-        还没有接通，见模块 docstring 的"执行入口还没接"。
+        本描述符**不负责执行**，见模块 docstring 的"执行不走这里"。
 
         刻意显式抛错而不是留空：留空的话基类会拿 kwargs 去调那个
         未绑定方法，报的是"缺少参数 self"—— 那句话指向不了真正
-        的原因（还没实现执行层），排查要从这里绕一圈。
+        的原因，排查要从这里绕一圈。
+
+        ⚠️ 但这**不是**"工具还不能跑"：能跑，只是入口不在描述符上。
+        直接 `await tool.ainvoke(...)`（例如被 langgraph 的 ToolNode
+        驱动）会撞到这里，绕开处理器链 —— 而那正是我们要避免的：
+        链上可能挂着审批与脱敏，绕过它执行比失败更糟。
         """
 
         raise NotImplementedError(
-            f"{self.name} 的执行入口尚未接通。"
-            "@tool 目前只完成声明（名字 / 描述 / 参数 schema），"
-            "真正执行需要由 app/infra/agent/ 那一层用 "
-            "factory.create(contract) 造出 service 再调方法。"
+            f"{self.name} 不通过描述符执行。"
+            "工具的执行入口是 app/infra/agent/tool_executor.py："
+            "它按 tool_id 取处理器链（拦截 / 转换 / 观测）、驱动链，"
+            "再用 factory.create(contract) 造出 service 调方法。"
+            "直接 ainvoke 会绕过整条链。"
         )
 
     def _run(self, **kwargs: Any) -> Any:
         raise NotImplementedError(
-            f"{self.name} 的执行入口尚未接通（同步路径）。"
+            f"{self.name} 不通过描述符执行（同步路径同理，"
+            "见 _arun 的说明）。"
         )
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用

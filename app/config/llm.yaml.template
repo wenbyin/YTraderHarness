@@ -1,0 +1,69 @@
+# ============================================================
+# 这是模板，不是可用配置。用法：
+#
+#     cp app/config/llm.yaml.template app/config/llm.yaml
+#
+# 然后 export 下面这些环境变量（不要把明文写进文件）。
+#
+# 为什么 llm.yaml 本身不在仓库里：它含明文密钥，已被 .gitignore
+# 按**路径**排除。本文件是它的镜像，api_key 一律只留 ${VAR} 名。
+# ============================================================
+
+# 云端 LLM 提供方配置。
+#
+# ⚠️ 为什么不放在 app/config/ 下
+# ------------------------------
+# 那个目录被数据源加载器整目录 `glob("*.yaml")` 扫（见
+# infra/datasource/loader.py:58）。多放一个文件只有两种结局：
+#
+#   没有 `type` 字段  -> loader.py:63 直接 raise，**应用起不来**
+#   有但不认识的 type -> 每次启动打一条 "Ignore optional datasource" warning
+#
+# 所以放在这里，与读它的代码（app/common/llm.py）同处。
+#
+# ⚠️ API Key 一律走环境变量
+# -------------------------
+# 这个文件是**可以进版本库**的，密钥不行。`${VAR:-default}` 是项目既有
+# 的展开语法（与 app/config/*.yaml 一致），`:-` 后面留空表示"没配就是
+# 空串"，真正的报错推迟到**真正要调用时** —— 这样只跑检索、不跑 LLM 的
+# 场景不会被一条缺失的 key 拦在门外。
+#
+# 需要设置的环境变量：
+#     DEEPSEEK_API_KEY     https://platform.deepseek.com/
+#     KIMI_API_KEY         https://platform.moonshot.cn/
+
+#: 不指定 provider 时用哪个。
+default_provider: kimi
+
+#: 可选的提供方。
+#:
+#: 两家都是 **OpenAI 兼容**接口，所以用同一个 ChatOpenAI 客户端，只换
+#: base_url / model / api_key —— 换一家不需要换客户端类。
+#:
+#: 新增一家的步骤：这里加一段 + app/common/llm.py 的枚举加一项。
+#: base_url 必须带 /v1（OpenAI SDK 会自己拼 /chat/completions）。
+providers:
+
+  deepseek:
+    label: DeepSeek
+    base_url: https://api.deepseek.com/v1
+    #: deepseek-chat 是非推理模型，快且便宜，适合批量生成。
+    #: 需要更强推理时换 deepseek-reasoner（慢很多、贵很多）。
+    model: deepseek-v4-flash
+    api_key: "${DEEPSEEK_API_KEY}"
+
+  kimi:
+    label: Kimi（月之暗面）
+    base_url: https://api.moonshot.cn/v1
+    #: moonshot-v1 系列按上下文长度分档（8k/32k/128k），价格随档位涨。
+    #: 本工具的窗口实测中位 100 字符、切分后上限 2000 字符，
+    #: 32k 档绰绰有余。
+    model: kimi-k2.7-code
+    api_key: "${KIMI_API_KEY}"
+
+  qwen:
+    label: qwen（阿里千问）
+    base_url: https://maas.qianwenaiapi.com/compatible-mode/v1
+
+    model: qwen3.7-flash
+    api_key: "${QWEN_API_KEY}"

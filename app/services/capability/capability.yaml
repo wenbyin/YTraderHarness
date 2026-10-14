@@ -1,0 +1,367 @@
+openapi: 3.1.0
+
+info:
+  title: Capability Management API
+  version: 1.0.0
+  description: |
+    Business capability taxonomy management.
+
+    Responsibilities:
+      - Manage the capability tree used by LLM and JEV to filter tools.
+      - Manage the hierarchy (parent_id) and enabled state.
+
+    Non-responsibilities:
+      - Tool definitions and their synchronization (see tool.yaml)
+      - Tool <-> capability association
+        (see tool.yaml, /tools/{tool_id}/classifications)
+      - Group / permission / tag management
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Capabilities
+    description: Capability taxonomy management
+
+
+paths:
+
+  /capabilities:
+    get:
+      tags:
+        - Capabilities
+      summary: List capability taxonomy
+      operationId: listCapabilities
+
+      parameters:
+        - name: parent_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+            nullable: true
+
+        - name: keyword
+          in: query
+          schema:
+            type: string
+
+        - name: is_active
+          in: query
+          schema:
+            type: boolean
+
+      responses:
+        '200':
+          description: Capability list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Capability'
+
+    post:
+      tags:
+        - Capabilities
+      summary: Create capability
+      operationId: createCapability
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CapabilityCreate'
+
+      responses:
+        '201':
+          description: Capability created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capability'
+
+
+  /capabilities/{capability_id}:
+    get:
+      tags:
+        - Capabilities
+      summary: Get capability
+      operationId: getCapability
+
+      parameters:
+        - $ref: '#/components/parameters/CapabilityId'
+
+      responses:
+        '200':
+          description: Capability
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capability'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags:
+        - Capabilities
+      summary: Update capability
+      operationId: updateCapability
+      description: |
+        Partial update. Only the fields present in the body change;
+        everything else keeps its current value. Use PUT to replace.
+
+        code is not updatable here either — it is the stable identifier.
+
+      parameters:
+        - $ref: '#/components/parameters/CapabilityId'
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CapabilityUpdate'
+
+      responses:
+        '200':
+          description: Updated capability
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capability'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+    put:
+      tags:
+        - Capabilities
+      summary: Replace capability
+      operationId: replaceCapability
+      description: |
+        Full replace of the mutable fields. Unlike PATCH, an omitted
+        nullable field is treated as null (cleared), not as "keep".
+
+        code is not part of the body — it is the stable identifier,
+        and changing it would orphan existing Tool links.
+
+      parameters:
+        - $ref: '#/components/parameters/CapabilityId'
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CapabilityReplace'
+
+      responses:
+        '200':
+          description: Replaced capability
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Capability'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+    delete:
+      tags:
+        - Capabilities
+      summary: Delete capability
+      operationId: deleteCapability
+      description: |
+        Hard delete. The row is removed and every Tool link to it is
+        removed with it (ON DELETE CASCADE), so tools that were only
+        associated with it end up unassociated.
+
+        **Nodes with children are always refused** (409, never forced) —
+        the self-referencing FK is deliberately not cascading. Move or
+        deactivate the children first, then delete this node. Deactivating
+        (PATCH is_active=false) is usually what you actually want:
+        it keeps the taxonomy intact for historical links.
+
+        Deleting a node that is still referenced by tools is also refused
+        by default, and the error says how many tools are using it.
+        Pass force=true to confirm and unlink them.
+
+      parameters:
+        - $ref: '#/components/parameters/CapabilityId'
+
+        - name: force
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: |
+            Confirm deletion when the capability is still referenced
+            by tools; those links are removed as well. Has no effect on
+            the children check, which force cannot override.
+
+      responses:
+        '204':
+          description: Capability deleted
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+
+components:
+
+  parameters:
+
+    CapabilityId:
+      name: capability_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+
+  schemas:
+
+    Capability:
+      type: object
+      required:
+        - id
+        - code
+        - name
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+
+        code:
+          type: string
+
+        name:
+          type: string
+
+        description:
+          type: string
+          nullable: true
+
+        parent_id:
+          type: string
+          format: uuid
+          nullable: true
+
+        sort_order:
+          type: integer
+
+        is_active:
+          type: boolean
+
+
+    CapabilityCreate:
+      type: object
+      required:
+        - code
+        - name
+      properties:
+        code:
+          type: string
+
+        name:
+          type: string
+
+        description:
+          type: string
+          nullable: true
+
+        parent_id:
+          type: string
+          format: uuid
+          nullable: true
+
+        sort_order:
+          type: integer
+          default: 0
+
+
+    CapabilityUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+
+        description:
+          type: string
+          nullable: true
+
+        parent_id:
+          type: string
+          format: uuid
+          nullable: true
+
+        sort_order:
+          type: integer
+
+        is_active:
+          type: boolean
+
+
+    CapabilityReplace:
+      type: object
+      required:
+        - name
+        - sort_order
+        - is_active
+      description: >-
+        Full replacement of a capability node. Same fields as
+        CapabilityUpdate, but the semantics are "replace": an omitted
+        description or parent_id means null (cleared / moved to top
+        level), not "leave as is".
+
+        sort_order and is_active are required rather than defaulted on
+        purpose — a PUT that only meant to rename a node must not
+        silently reset its ordering or re-enable a disabled node.
+
+        code is absent: it is the stable identifier, same as in
+        CapabilityUpdate.
+      properties:
+        name:
+          type: string
+
+        description:
+          type: string
+          nullable: true
+
+        parent_id:
+          type: string
+          format: uuid
+          nullable: true
+
+        sort_order:
+          type: integer
+
+        is_active:
+          type: boolean
+
+
+  responses:
+
+    NotFound:
+      description: Resource not found
+
+    Conflict:
+      description: >-
+        Request conflicts with existing data: the code is taken, the
+        parent does not exist, the new parent is the node itself or one
+        of its descendants, or the node still has children / tool links
+        that block the delete.

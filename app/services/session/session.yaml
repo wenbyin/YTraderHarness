@@ -1,0 +1,555 @@
+openapi: 3.1.0
+
+info:
+  title: Agent Runtime API
+  version: 1.0.0
+
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Sessions
+    description: Agent 会话的建立与查询
+  - name: Runs
+    description: Agent 运行
+
+
+# 鉴权：本文件里的每个操作都要求 Casdoor 签发的 access token。
+# 挂载点不在本模块 —— 见 app/api/v1/router.py 的 protected_router。
+#
+# 唯一的例外是下面 /runs/{run_id}/events 的 access_token 查询参数，
+# 它在那个操作里单独说明。
+security:
+  - bearerAuth: []
+
+
+paths:
+
+  /sessions:
+    post:
+      summary: Create agent session
+      operationId: createSession
+      tags:
+        - Sessions
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+
+      responses:
+
+        "200":
+          description: Created session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+
+
+  /sessions/{session_id}:
+
+    get:
+      summary: Get session information
+      operationId: getSession
+      tags:
+        - Sessions
+
+      parameters:
+
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+
+      responses:
+
+        "200":
+          description: Session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+
+        "404":
+          description: Session not found
+
+
+
+  /sessions/{session_id}/runs:
+
+    post:
+      summary: Create agent run
+      operationId: createRun
+      tags:
+        - Runs
+
+
+      parameters:
+
+        - name: session_id
+          in: path
+          required: true
+
+          schema:
+            type: string
+            format: uuid
+
+
+      requestBody:
+
+        required: true
+
+        content:
+
+          application/json:
+
+            schema:
+
+              $ref: "#/components/schemas/CreateRunRequest"
+
+
+      responses:
+
+        "200":
+
+          description: Run created
+
+          content:
+
+            application/json:
+
+              schema:
+
+                $ref: "#/components/schemas/Run"
+
+        # 服务层的业务校验：input.text 为空或只有空白。
+        # 请求体**形状**不对（缺 text、多给键）是 FastAPI 的 422，
+        # 按仓库惯例不在这里声明。
+        "400":
+
+          description:
+            input.text 为空或只有空白（-> to_http_error 的 ValueError 分支）。
+
+
+        "404":
+
+          description: Session not found
+
+
+
+
+  /runs/{run_id}/events:
+
+    get:
+
+      summary: Subscribe run events
+
+      operationId: streamRunEvents
+      tags:
+        - Runs
+
+
+      parameters:
+
+        - name: run_id
+          in: path
+          required: true
+
+          schema:
+            type: string
+
+        # ⚠️ 全仓唯一一处从 query string 取 token 的参数。
+        #
+        # 浏览器的 EventSource **不能设置请求头**，而本端点是给
+        # EventSource 用的 —— 没有它，前端就只能自己造 SSE 客户端。
+        #
+        # 代价是 token 会进访问日志与浏览器历史，因此后端只在
+        # casdoor.yaml 的 query_token_paths 列出的路径上接受它，
+        # 其余接口一律只认 Authorization 头。
+        # 能用请求头时请优先用请求头。
+        - name: access_token
+          in: query
+          required: false
+          description: |
+            访问令牌。仅 EventSource 这类发不了请求头的客户端使用。
+          schema:
+            type: string
+
+
+      responses:
+
+        "200":
+
+          description: SSE event stream
+
+          content:
+
+            text/event-stream:
+
+              schema:
+
+                type: string
+
+
+
+
+  /runs/{run_id}/resume:
+
+
+    post:
+
+      summary: Resume interrupted run
+
+      operationId: resumeRun
+      tags:
+        - Runs
+
+
+      parameters:
+
+        - name: run_id
+          in: path
+
+          required: true
+
+          schema:
+            type: string
+
+
+      requestBody:
+
+        required: true
+
+        content:
+
+          application/json:
+
+            schema:
+
+              $ref: "#/components/schemas/ResumeRequest"
+
+
+
+      responses:
+
+        "200":
+
+          description: >-
+            Resume accepted —— 没有响应体。受理的那一刻 agent_run.status
+            还是 waiting_input，说成 running 是个还没成为事实的断言；
+            后续进展看 GET /runs/{run_id}/events。
+
+        "409":
+
+          description: >-
+            两种情形。其一：这次运行不在 waiting_input（跑完的没什么可
+            恢复，正在跑的那次还没停下来）。其二：answers 与当前待处理的
+            中断集合不一致 —— 必须一次带上**当前所有**待审批的
+            interrupt_id，少一个或给多了都在这里报。
+
+        "404":
+
+          description: 运行不存在，或它所属的会话不属于当前用户。
+
+        "409":
+
+          description: >-
+            这次运行不在 waiting_input。跑完的没什么可恢复，
+            正在跑的还没停下来。
+
+        "422":
+
+          description: >-
+            interrupt_id 为空，或 data 不是对象
+            （-> ResumeRequest 的校验）。
+
+
+
+  /runs/{run_id}/cancel:
+
+
+    post:
+
+      summary: Cancel running agent
+
+      operationId: cancelRun
+      tags:
+        - Runs
+
+
+      parameters:
+
+        - name: run_id
+          in: path
+
+          required: true
+
+          schema:
+            type: string
+
+
+
+      responses:
+
+        "200":
+
+          description: >-
+            Cancel accepted —— 没有响应体。取消是**异步**的（任务要在
+            下一个 await 点才真的停），受理只表示已通知。结果看事件流上的
+            run.failed（data.status 是 cancelled）或直接查库。
+
+        "404":
+
+          description: 运行不存在，或它所属的会话不属于当前用户。
+
+        "409":
+
+          description: >-
+            状态不允许取消。停在人工审批（waiting_input）的运行没有在跑的
+            任务，要用 /resume 回答；已经结束的运行没什么可取消。
+
+        "422":
+
+          description: run_id 不是合法的 UUID。
+
+
+
+
+
+components:
+
+  securitySchemes:
+
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Casdoor 签发的访问令牌：`Authorization: Bearer <access_token>`。
+
+
+  schemas:
+
+
+    CreateSessionRequest:
+
+      type: object
+
+      required:
+
+        - agent_id
+
+
+      properties:
+
+        agent_id:
+
+          type: string
+
+          example: stock_research
+
+
+        metadata:
+
+          type: object
+
+
+
+
+    Session:
+
+      type: object
+
+      properties:
+
+        session_id:
+
+          type: string
+
+
+        agent_id:
+
+          type: string
+
+
+        status:
+
+          type: string
+
+          enum:
+
+            - active
+            - archived
+
+
+        user_id:
+
+          type: [string, 'null']
+
+          description: |
+            会话归属的用户 ID（Casdoor 的 sub）。
+
+            只读：CreateSessionRequest 里没有这个字段，归属由后端从 access
+            token 取 —— 允许调用方自己声明归属，等于允许把会话挂到别人名下。
+
+            为 null 的是加这一列之前建的存量会话，它们对**所有**登录用户
+            可见（刻意的向后兼容，不是漏洞）。
+
+
+        updated_at:
+
+          type: string
+
+          format: date-time
+
+          description: |
+            最后活动时间。每次往这个会话发消息都会前进 —— 消息写在
+            agent_message 表，会话行本身没有字段变动，所以由后端在
+            create_run 时显式把它推到当下。
+
+            新建时它等于创建时刻。契约里只有它、没有 created_at：前端要的是
+            "最后活动"，而两者在建会话那一刻是同一个值。
+
+
+
+    CreateRunRequest:
+
+
+      type: object
+
+
+      required:
+
+        - input
+
+
+      properties:
+
+
+        input:
+
+          type: object
+
+          # 这一轮用户说的话 —— 图需要的最小输入。
+          #
+          # additionalProperties: false 与 DTO 一致（app/common/schemas/
+          # base.py 的 extra="forbid"）：多给的键会被拒，而不是被静默丢掉。
+          #
+          # 其余上下文通道（画像 / 记忆 / 检索 / 策略覆盖）以后按需再加 ——
+          # 现在多写一个字段，就是猜一个还没设计的形状。
+
+          required:
+
+            - text
+
+          additionalProperties: false
+
+          description:
+            User input payload
+
+          properties:
+
+            text:
+
+              type: string
+
+              description:
+                用户这一轮说的话。图把它包成一条 HumanMessage。
+
+
+        metadata:
+
+          type: object
+
+
+
+
+    Run:
+
+
+      type: object
+
+
+      properties:
+
+
+        run_id:
+
+          type: string
+
+
+        session_id:
+
+          type: string
+
+
+        status:
+
+          type: string
+
+          enum:
+
+            - queued
+            - running
+            - waiting_input
+            - completed
+            - failed
+            - cancelled
+
+
+
+    ResumeRequest:
+
+      type: object
+
+      description: >-
+        一次回答**当前所有**待审批。扇出下多个工具可以同时等审批，所以
+        answers 必须凑齐当前全部的 interrupt_id —— 少一个或给多了都 409。
+
+      required:
+
+        - answers
+
+      properties:
+
+        answers:
+
+          type: array
+
+          minItems: 1
+
+          items:
+
+            $ref: "#/components/schemas/ResumeAnswer"
+
+    ResumeAnswer:
+
+      type: object
+
+      required:
+
+        - interrupt_id
+        - data
+
+      properties:
+
+        interrupt_id:
+
+          type: string
+
+          description: >-
+            由 hitl.requested 事件的 data.interrupt_id 带出来。
+
+        data:
+
+          type: object
+
+          description: >-
+            回答内容，原样交给 interrupt()。审批的形状是
+            {"decision": "approve" | "reject" | "always"}。

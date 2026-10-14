@@ -37,6 +37,7 @@ from typing import Any
 __all__ = [
     "BaseService",
     "PostCommitHook",
+    "RollbackHook",
     "ServiceContext",
 ]
 
@@ -46,6 +47,16 @@ __all__ = [
 #: 放错位置会导致"事务回滚了但任务已投出去"，执行时机的完整说明
 #: 见 ServiceFactory.scope()。
 PostCommitHook = Callable[[], Awaitable[None]]
+
+#: 组合根在事务**没有**提交时要执行的补偿钩子。
+#:
+#: 与 post_commit 相对：那个只在提交后跑，这个只在回滚 / 异常时跑。
+#: 用途是撤销**事务之外**的副作用 —— 进程内锁、已占用的外部配额之类。
+#: 事务内的东西不需要它：数据库自己会回滚。
+#:
+#: ⚠️ 它跑在 `async with session_factory()` 退出**之后** —— session 已经关了，
+#: 所以**不能**用它写库。真要写，得用 session_factory 另开一段事务。
+RollbackHook = Callable[[], Awaitable[None]]
 
 
 @dataclass
@@ -69,6 +80,11 @@ class ServiceContext:
 
     #: 提交后要跑的钩子。服务往这里追加，组合根在事务提交后执行。
     post_commit: list[PostCommitHook] = field(default_factory=list)
+
+    #: 回滚 / 异常时要跑的补偿钩子。服务往这里追加，组合根在事务
+    #: **没有**提交时执行。与 post_commit 恰好互斥 —— 一次调用里
+    #: 两者只会跑一边。说明见 RollbackHook。
+    rollback: list[RollbackHook] = field(default_factory=list)
 
     #: 模块专属依赖。见模块 docstring。
     extras: dict[str, Any] = field(default_factory=dict)
@@ -135,6 +151,10 @@ class BaseService(ABC):
     @property
     def post_commit(self) -> list[PostCommitHook]:
         return self._ctx.post_commit
+
+    @property
+    def rollback(self) -> list[RollbackHook]:
+        return self._ctx.rollback
 
     def require(self, key: str) -> Any:
         return self._ctx.require(key)

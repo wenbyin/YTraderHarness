@@ -10,12 +10,13 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, select
 
-from ..domain.entities import ToolClassification
-from ..models.sqlalchemy.tool_classification import (
-    ToolClassification as ToolClassificationModel,
+from app.services.capability.domain.entities import Capability
+from app.services.capability.models.sqlalchemy.capability import (
+    Capability as CapabilityModel,
 )
+
 from ..models.sqlalchemy.tool_classification import (
     ToolDefinitionClassification as LinkModel,
 )
@@ -26,136 +27,10 @@ class ToolClassificationRepositoryImpl(
     ToolClassificationRepository
 ):
 
-    # ========================================================
-    # Taxonomy
-    # ========================================================
-
-    async def add(
-            self,
-            classification: ToolClassification,
-    ) -> ToolClassification:
-
-        model = ToolClassificationModel(
-            classification_id=classification.classification_id,
-            code=classification.code,
-            name=classification.name,
-            description=classification.description,
-            parent_id=classification.parent_id,
-            sort_order=classification.sort_order,
-            is_active=classification.is_active,
-            created_at=classification.created_at,
-            updated_at=classification.updated_at,
-        )
-
-        self._session.add(model)
-        await self._session.flush()
-
-        return self._to_entity(model)
-
-    async def update(
-            self,
-            classification: ToolClassification,
-    ) -> ToolClassification:
-
-        model = await self._session.get(
-            ToolClassificationModel,
-            classification.classification_id,
-        )
-
-        if model is None:
-            raise ValueError(
-                "分类不存在："
-                f"{classification.classification_id}"
-            )
-
-        # code 刻意不改：它是稳定标识，关联与外部引用都按它。
-        model.name = classification.name
-        model.description = classification.description
-        model.parent_id = classification.parent_id
-        model.sort_order = classification.sort_order
-        model.is_active = classification.is_active
-        model.updated_at = classification.updated_at
-
-        await self._session.flush()
-
-        return self._to_entity(model)
-
-    async def get(
-            self,
-            classification_id: UUID,
-    ) -> ToolClassification | None:
-
-        model = await self._session.get(
-            ToolClassificationModel, classification_id
-        )
-
-        return None if model is None else self._to_entity(model)
-
-    async def get_by_code(
-            self,
-            code: str,
-    ) -> ToolClassification | None:
-
-        result = await self._session.execute(
-            select(ToolClassificationModel).where(
-                ToolClassificationModel.code == code
-            )
-        )
-
-        model = result.scalar_one_or_none()
-
-        return None if model is None else self._to_entity(model)
-
-    async def list(
-            self,
-            *,
-            parent_id: UUID | None = None,
-            keyword: str | None = None,
-            is_active: bool | None = None,
-    ) -> list[ToolClassification]:
-
-        statement = select(ToolClassificationModel)
-        conditions = []
-
-        if parent_id is not None:
-            conditions.append(
-                ToolClassificationModel.parent_id == parent_id
-            )
-
-        if keyword:
-            pattern = f"%{keyword}%"
-            conditions.append(
-                or_(
-                    ToolClassificationModel.code.ilike(pattern),
-                    ToolClassificationModel.name.ilike(pattern),
-                )
-            )
-
-        if is_active is not None:
-            conditions.append(
-                ToolClassificationModel.is_active == is_active
-            )
-
-        if conditions:
-            statement = statement.where(*conditions)
-
-        result = await self._session.execute(
-            statement.order_by(
-                ToolClassificationModel.sort_order,
-                ToolClassificationModel.code,
-            )
-        )
-
-        return [self._to_entity(m) for m in result.scalars()]
-
-    # ========================================================
-    # Tool ↔ Classification
-    # ========================================================
-
     async def list_for_tool(
             self,
             tool_id: UUID,
-    ) -> list[ToolClassification]:
+    ) -> list[Capability]:
 
         mapping = await self.list_for_tools([tool_id])
 
@@ -164,34 +39,37 @@ class ToolClassificationRepositoryImpl(
     async def list_for_tools(
             self,
             tool_ids: list[UUID],
-    ) -> dict[UUID, list[ToolClassification]]:
+    ) -> dict[UUID, list[Capability]]:
 
         if not tool_ids:
             return {}
 
         # 一次 join 取回全部关联，避免列表页的 N+1。
+        # join 的另一侧是 capability 表 —— 关联表不自带能力的名字等
+        # 信息，调用方（工具列表页）要的就是完整能力对象，因此这里
+        # 必须跨模块 join，而不是只回一串 id。
         result = await self._session.execute(
             select(
                 LinkModel.tool_id,
-                ToolClassificationModel,
+                CapabilityModel,
             )
             .join(
-                ToolClassificationModel,
-                ToolClassificationModel.classification_id
+                CapabilityModel,
+                CapabilityModel.capability_id
                 == LinkModel.classification_id,
             )
             .where(LinkModel.tool_id.in_(tool_ids))
             .order_by(
-                ToolClassificationModel.sort_order,
-                ToolClassificationModel.code,
+                CapabilityModel.sort_order,
+                CapabilityModel.code,
             )
         )
 
-        mapping: dict[UUID, list[ToolClassification]] = {}
+        mapping: dict[UUID, list[Capability]] = {}
 
         for tool_id, model in result.all():
             mapping.setdefault(tool_id, []).append(
-                self._to_entity(model)
+                Capability.model_validate(model)
             )
 
         return mapping
@@ -219,34 +97,3 @@ class ToolClassificationRepositoryImpl(
             )
 
         await self._session.flush()
-
-    async def count_links(
-            self,
-            classification_ids: list[UUID],
-    ) -> int:
-
-        if not classification_ids:
-            return 0
-
-        result = await self._session.execute(
-            select(func.count())
-            .select_from(LinkModel)
-            .where(
-                LinkModel.classification_id.in_(
-                    classification_ids
-                )
-            )
-        )
-
-        return result.scalar_one()
-
-    # ========================================================
-    # internals
-    # ========================================================
-
-    @staticmethod
-    def _to_entity(
-            model: ToolClassificationModel,
-    ) -> ToolClassification:
-
-        return ToolClassification.model_validate(model)

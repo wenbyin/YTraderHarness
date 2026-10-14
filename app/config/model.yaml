@@ -1,0 +1,494 @@
+# 模型目录：有哪些模型、它们什么能力、谁引用谁、按什么策略调用。
+#
+# ⚠️ 与 app/common/llm.yaml 的分工
+# --------------------------------
+#   llm.yaml      连接：base_url / api_key（${ENV}）/ provider 分派 / 客户端类
+#   model.yaml    声明：模型 / 能力 / 别名 / profile / 策略 / 绑定
+#
+# 本文件**不含任何密钥**：`credential_ref` 只是一个名字，对应的环境变量名
+# 写在下面的 credentials: 里（那里也只有名字，没有值）。
+#
+# ⚠️ 为什么不放在 app/config/ 下
+# ------------------------------
+# 那个目录被数据源加载器整目录 glob("*.yaml") 扫，多一个不含 type 的文件
+# 会直接让启动失败（见 infra/datasource/loader.py）。理由与 llm.yaml 相同。
+#
+# ⚠️ 装配顺序是有约束的
+# --------------------
+#   providers -> credentials -> models -> profiles -> aliases -> bindings
+# 每一步只能引用**已经声明**的东西，引用不到就在启动期报错。因此本文件
+# 里的书写顺序不影响结果（读取时按上面的顺序解析），但引用必须存在。
+
+# ============================================================
+# provider：实现维度（规格 §4.1）
+# ============================================================
+#
+# 这里只声明"用哪个适配器"，连接信息与密钥一律在 llm.yaml 里 ——
+# 那份文件已经知道怎么按 provider 名分派客户端、怎么展开 ${ENV}。
+# 本模块不重复那套知识（规格 §20：不要造第二套配置系统）。
+#
+# provider 名必须与 llm.yaml 的 providers: 键一致。
+
+providers:
+
+  deepseek:
+    adapter: langchain
+    label: DeepSeek
+
+  kimi:
+    adapter: langchain
+    label: Kimi（月之暗面）
+
+  #: 阿里千问。端点是 OpenAI 兼容的，客户端走 llm.py 的
+  #: `_INIT_PROVIDERS` 映射到 openai 适配器 —— 只在这里声明是不够的，
+  #: 那张表也要有 qwen（否则建客户端时报 "Unsupported provider"）。
+  qwen:
+    adapter: langchain
+    label: qwen（阿里千问）
+
+# ============================================================
+# credential_ref -> 环境变量名
+# ============================================================
+#
+# ⚠️ 这里只有**名字**，没有秘密。`credential_ref` 是逻辑名（"哪份凭据"），
+# 值由 Model 层在**建客户端时**从环境变量取（见 model/credentials.py）。
+#
+# 为什么还要这一层：一个 provider 可能有多把 key（生产 / 沙箱 / 多租户）。
+# 不写 credential_ref 的模型走 llm.yaml 里 provider 自己的那份凭据 ——
+# 默认路径上本模块不认识任何密钥。
+#
+# 解不到环境变量时**不算错**：回落到 llm.yaml 的那一份（见
+# EnvVarCredentialResolver 的说明）。要"声明的凭据必须存在"，在
+# build_model_registry(credentials=EnvVarCredentialResolver(..., required=True))
+# 里显式要求。
+
+credentials:
+
+  deepseek-production: DEEPSEEK_API_KEY
+  kimi-production: KIMI_API_KEY
+  qwen-production: QWEN_API_KEY
+
+# ============================================================
+# 模型（规格 §4.2）
+# ============================================================
+#
+# `id` 默认是 `provider:model`，协议里的 primary / fallbacks 都引用它。
+#
+# capabilities 必须**诚实**：它决定两件事 ——
+#     1. 需要 tool_calling 的调用不允许降级到不支持它的模型（规格 §8.3）
+#     2. primary 不满足要求时直接报错，而不是静默降级
+# 声明的能力与事实不符时，第一个症状是运行期 provider 报错。
+#
+# config 里的键作为 provider 参数透传（temperature / max_tokens …）。
+# **不要**在这里写 max_retries：重试归 ModelRuntimePolicy 管；真要恢复
+# 客户端内部重试，写它才算"我知道我在干什么"（见 model/factory.py）。
+
+models:
+
+  - provider: deepseek
+    model: deepseek-v4-flash
+    display_name: DeepSeek V4 Flash
+    #: 上下文窗口（token）。**预算**的依据（规格 §二十一）：Context Builder
+    #: 用它算 history_budget。填的是保守值 —— 请按该模型的真实文档调整；
+    #: 不填时预算回落到策略里的兜底窗口，并在快照里注明来源。
+    context_window: 65536
+    credential_ref: deepseek-production
+    #: 便宜、快。工具调用与结构化输出都支持（OpenAI 兼容端点）。
+    #:
+    #: ⚠️ 下面 `reasoning: false` 说的是"它不是推理档"，**不等于这个端点
+    #: 不跑思考模式** —— 实测它默认就在思考模式下（见
+    #: structured_output_extra_body 的说明）。
+    capabilities:
+      tool_calling: true
+      structured_output: true
+      streaming: true
+      vision: false
+      reasoning: false
+
+    #: ⚠️ 该端点默认跑在**思考模式**下，而思考模式拒绝带强制 tool_choice
+    #: 的请求 —— 那正是结构化输出（`with_structured_output` 的
+    #: function_calling，见 app/agent/model/adapters.py）发出的东西。
+    #: 实测直接 400：
+    #:
+    #:     400 Thinking mode does not support this tool_choice
+    #:
+    #: 于是"要结构化输出"的调用要先把思考关掉。关在**调用期**而不是
+    #: config 里：config 是构造参数，会把该模型的推理 / 摘要调用一起关掉。
+    #:
+    #: 分类档（classification_default）的降级链上有这个模型 —— 只修主档
+    #: 不够，降级到它时同样会 400。
+    #:
+    #: ⚠️ **带工具的调用同样要关**（2026-10-10 实测）
+    #: ----------------------------------------
+    #: `bind_tools` 发的是 `tool_choice="auto"`，撞不上那条 400；可思考模式下
+    #: 这个模型会把工具调用写成它自家的 DSML 标记当**正文**吐出来：
+    #:
+    #:     <|DSML| calls><|DSML| invoke name="memory_search"> …
+    #:
+    #: 图读不到 tool_calls，于是判定"模型没要求调工具"，把那段标记当回答发给
+    #: 用户 —— 工具一次都没跑，而且**没有任何报错**。比 400 难查得多。
+    structured_output_extra_body:
+      thinking:
+        type: disabled
+
+    #: ⚠️ 这里**刻意没有** `disable_thinking: true`（2026-10-13 撤掉）
+    #: ----------------------------------------------------------
+    #: 它曾经在这里，理由是第二次 DSML 泄漏（run 51b31758）是个**纯文本
+    #: 调用**：形状判据一条都不占，于是思考照开、模型把工具调用写成正文。
+    #: 按形状猜就是会一直漏，所以当时改成"一律关"。
+    #:
+    #: 撤掉它的理由同样是产品要求：思维链本身要**给用户看** —— 它现在会随
+    #: `agent_message.reasoning_content` 落库、并经 `message.reasoning.*`
+    #: 推给前端（app/common/event/event.py）。一律关思考，这条链路就永远
+    #: 没有数据。而这个模型是主循环（`reasoning_default`）唯一的 primary。
+    #:
+    #: 于是策略回到**形状判据**（见 `thinking_off_extra_body`）：
+    #:
+    #:     带工具 / 带结构化输出   关思考 —— 这两类正是会撞出 400 或 DSML 的
+    #:                             形状，一个都不放过
+    #:     纯文本调用              开思考 —— 用户能看到推理；代价是那个泄漏
+    #:                             形状可能回来
+    #:
+    #: ⚠️ 那个代价由**出口的闸**兜底，不是"应该不会发生"
+    #: -------------------------------------------------
+    #: 纯文本轮里模型仍可能把工具调用写成 DSML 标记。现在它不会漏给用户：
+    #: leaked_tool_call 的两道闸会把它从正文与思维链里都清掉（2026-10-13 起
+    #: 思维链也过闸），而"整条回复只剩标记"时模型层直接抛错重试 / 降级。
+    #: 也就是说失败从"静默显示垃圾"变成"可见的重试"。**没有**消除风险本身。
+    #:
+    #: 真出问题时先看这里，而不是去加回 disable_thinking —— 那样等于把
+    #: 产品要的思维链一起关掉。这是理解为什么现在的 `reasoning: false` 的
+    #: 模型也会产出推理的关键：思考模式 ≠ 推理档。
+
+    config:
+      #: 刻意**不写** temperature：合法范围由模型决定，写错会让整个
+      #: 窗口的生成直接失败（见 app/common/llm.py 的说明）。
+      #:
+      #: ⚠️ 4096 太紧：思考与正文**共用**这一个额度，于是思考把它吃光时
+      #: 正文一个字都写不出来。2026-10-13 实测（session 69943666）两次调用
+      #: 都是 `finish_reason=length`、`output_tokens=4096`、而
+      #: `output_token_details.reasoning` **也是 4096** —— 推理写了一半被切
+      #: （"…C2 T →"、"子情况 1: A"），`content` 是空数组，用户那边是一条
+      #: 什么都没有的回复。
+      #:
+      #: 抬到 8192：与同一个 provider 的 reasoner 一致（那条一直是 8192），
+      #: 所以端点接受这个量级是有依据的。max_tokens 是**上限不是目标**，
+      #: 抬高它本身不增加成本/延迟 —— 只是不再把思考掐在半路。
+      #:
+      #: ⚠️ 再往上（16384+）需要先确认端点接不接受。本仓库无法验证：
+      #: llm.yaml 里的 key 是 `${ENV}` 引用，而模型层的调用只在应用进程里
+      #: 拿得到那些环境变量。要加就先用一次真实调用试出来，别照猜填 ——
+      #: 端点拒绝时报的是一条与"额度不够"无关的 400。
+      max_tokens: 8192
+    #: 单价（每 1000 token）。**不填就不估成本**（estimated_cost=None），
+    #: 而不是编一个 0 出来 —— 那会让"这家没报价"与"这次真的免费"分不清。
+    #: 价格随时在变，所以它写在配置里而不是硬编码在模块里。
+    # pricing:
+    #   input_per_1k: 0.0
+    #   output_per_1k: 0.0
+    #   currency: USD
+    aliases:
+      - flash
+
+  - provider: kimi
+    model: kimi-k2.7-code
+    display_name: Kimi K2.7 Code
+    context_window: 131072
+    credential_ref: kimi-production
+    capabilities:
+      tool_calling: true
+      structured_output: true
+      streaming: true
+      vision: false
+      reasoning: false
+    config:
+      max_tokens: 4096
+    aliases:
+      - kimi-code
+
+  - provider: deepseek
+    model: deepseek-reasoner
+    display_name: DeepSeek Reasoner
+    context_window: 65536
+    credential_ref: deepseek-production
+    #: ⚠️ 推理能力强，但**不支持工具调用** —— 这是刻意的诚实声明，
+    #: 也是能力门禁的活例子：任何带 tools 的调用都不会降级到它
+    #: （候选链会把它剔除并记一条警告），而需要强推理、不用工具的
+    #: 调用（evaluation_default）正好用它。
+    capabilities:
+      tool_calling: false
+      structured_output: true
+      streaming: true
+      vision: false
+      reasoning: true
+
+    #: ⚠️ 这里**刻意没有** structured_output_extra_body，尽管它显然也是
+    #: 思考模式（reasoner 就是干这个的）。
+    #:
+    #: 理由：上面 flash 那条的值是**实测**出来的（它报过 400）。而"把
+    #: reasoner 的思考关掉"这件事没有被验证过 —— 把它关掉是否等价于
+    #: 换一个普通模型、端点会不会直接拒绝，都还不知道。没验证过的
+    #: 请求体参数不写进配置：写错了报的是另一条 400，而那时没人会想到
+    #: 是这里。
+    #:
+    #: 真要让它承担结构化输出的调用（它声明了 structured_output: true），
+    #: 先确认端点接受这段 extra_body，再加：
+    #:
+    #:     structured_output_extra_body:
+    #:       thinking:
+    #:         type: disabled
+    config:
+      max_tokens: 8192
+    aliases:
+      - reasoner
+
+  - provider: qwen
+    model: qwen3.7-flash
+    display_name: Qwen 3.7 Flash（阿里千问）
+    #: ⚠️ 保守值，**请按该模型的真实文档核一下**。填小了只是预算紧
+    #: （历史被裁得更多），填大了会超窗口 —— 两个方向的代价不对称，
+    #: 所以这里刻意取小。
+    context_window: 32768
+    credential_ref: qwen-production
+    #: 刻意**不写** credential_ref：llm.yaml 里 qwen 那一段自带 api_key，
+    #: 不写的话就走它（见本文件开头"credential_ref 只在要多把 key 时才需要"）。
+    #: 将来要把千问的 key 单独放进环境变量，再加一行
+    #: `credential_ref: qwen-production` 与对应的 credentials: 条目即可。
+    capabilities:
+      tool_calling: true
+      #: ⚠️ 分类器必须的支持 —— 它用 response_format 要结构化输出
+      #: （见 graph/react/agent_builder_node.py）。这一项为 false 的话，
+      #: 能力门禁会把 qwen 从分类调用的候选里剔除。
+      #: 声明是"事实的承诺"：若 DashScope 这台不对该模型实现
+      #: response_format，症状是运行期 provider 报错，那时把这里改成
+      #: false 即可 —— 但分类器就没法用 qwen 了（它离不开结构化输出）。
+      structured_output: true
+      streaming: true
+      vision: false
+      reasoning: false
+
+    #: ⚠️ 同 deepseek 的理由（见上面那段），但**症状完全不同**：
+    #: 该端点默认也在思考模式下，可是它**不报 400** —— 它接受强制
+    #: tool_choice，只是先用一大堆看不见的推理 token 想一遍。
+    #:
+    #: 实测（分类调用的结构化输出路径，同一句输入）：
+    #:
+    #:     不关思考    12.13s
+    #:     关掉思考     1.49s
+    #:
+    #: 更直观的一次测量：让模型「只回复两个字」，它回了 120 个
+    #: 输出 token；关掉思考后是 1 个。
+    #:
+    #: 所以这个坑在 qwen 上不报错、只变慢 —— 比 deepseek 那个难发现
+    #: 得多，而分类档（classification_default）的 primary 正是它，
+    #: 每轮对话都要先付这笔钱。
+    #:
+    #: 键名是 DashScope 的 `enable_thinking`，**不是** deepseek 那套
+    #: `thinking: {type: disabled}`：两家虽然都是 OpenAI 兼容端点，
+    #: 但"关思考"这个私有参数各写各的。写错不报错（会被服务端忽略），
+    #: 只是静默地不生效 —— 改这里时请照 DashScope 的文档核。
+    #:
+    #: 只在"需要模型按结构化协议说话"的那两次调用上生效（结构化输出 /
+    #: 带工具，见 adapters.py 的 thinking_off_extra_body），
+    #: 推理 / 摘要调用照常思考。
+    structured_output_extra_body:
+      enable_thinking: false
+
+    config:
+      max_tokens: 4096
+    aliases:
+      - qwen-flash
+
+# ============================================================
+# Model Profile（规格 §4.3 / §5）
+# ============================================================
+#
+# profile = primary + fallbacks + policy。
+# primary / fallbacks 引用模型 id **或**模型别名（`flash` 这种更好读，
+# 换具体模型时也只改一处）。
+#
+# policy 只谈模型调用本身（超时 / 重试 / 降级），不碰任何 Agent 语义：
+# 这里没有"要不要人工确认""工具该不该执行"的位置（规格 §10）。
+
+profiles:
+
+  reasoning_default:
+    display_name: 默认推理
+    description: ReAct 主循环的推理调用。跨 provider 降级。
+    primary: flash
+    fallbacks:
+      - kimi-code
+    policy:
+      #: 单次 provider attempt 的超时。是 attempt 级而不是整次调用级：
+      #: 降级链上每家都该有自己的预算，否则第一家的超时会把后面吃光。
+      timeout: 90
+      #: 同一个候选最多再试几次（总尝试 = max_retries + 1）。
+      max_retries: 2
+      #: 整条链的时间上限 —— 没有它，最坏情况是 3 候选 × 3 次 × 90s。
+      total_timeout: 240
+      fallback_enabled: true
+      #: 退避基数（秒）：限流时"立刻再撞一次"只会再被限一次。
+      retry_backoff: 0.5
+      max_retry_backoff: 8.0
+
+  fast_default:
+    display_name: 快速档
+    description: 摘要 / 分类这类"要快、要便宜"的调用。
+    primary: flash
+    fallbacks:
+      - kimi-code
+    policy:
+      timeout: 30
+      max_retries: 1
+      total_timeout: 60
+      fallback_enabled: true
+      retry_backoff: 0.2
+
+  evaluation_default:
+    display_name: 评估档
+    description: 评估 / 打分。要强推理，不用工具。
+    primary: reasoner
+    fallbacks:
+      - kimi-code
+    policy:
+      #: 推理模型慢，超时给宽一点。
+      timeout: 180
+      max_retries: 1
+      total_timeout: 420
+      fallback_enabled: true
+
+  #: 分类 / 路由专用档。与 fast_default 分开而不是改它 —— 改 fast_default
+  #: 会连带把 react + summarization（上下文压缩）也换成 qwen，而那次
+  #: 改动只想影响分类调用。
+  classification_default:
+    display_name: 分类档
+    description: 路由 / 分类调用。默认千问 flash，跨 provider 降级。
+    primary: qwen-flash
+    #: 降级链上的两家都必须满足分类调用的能力要求（structured_output），
+    #: 否则能力门禁会在降级时把它们剔除、真降级时无人可降。
+    #: 这两个都声明了 structured_output，见上面各自的 capabilities。
+    fallbacks:
+      - flash
+      - kimi-code
+    policy:
+      #: 与 fast_default 同档：分类是一次窄调用，超时不该给宽。
+      timeout: 30
+      max_retries: 1
+      total_timeout: 60
+      fallback_enabled: true
+      retry_backoff: 0.2
+
+# ============================================================
+# 别名（规格 §4.3）
+# ============================================================
+#
+# 逻辑名 -> 模型 id 或 profile id。Agent 侧只该用逻辑名，不该依赖
+# 实际 provider / 模型名（那是实现维度）。
+#
+# 解析只有一跳（别名不能指向别名）—— 多跳除了制造环没有别的用途。
+# 指向"模型别名"的写法是允许的：读取时会被摊平成模型 id。
+#
+# 刻意**没有** `vision_default`：当前目录里没有任何模型声明 vision，
+# 一个指向非多模态模型的 vision 别名是配置在撒谎。等真有视觉模型时
+# 再加那一行。
+
+aliases:
+  cheap_default: fast_default
+
+# ============================================================
+# 绑定（规格 §5）
+# ============================================================
+#
+# (agent_type, model_role) -> profile。
+#
+# ⚠️ 边界：agent_type 是 **Agent Builder / JEV** 决定的（用哪张图、哪种
+# Agent），本模块不认识它的含义，只拿它查表；model_role 是**模型侧**的
+# 用途。Resolver 只做这张表的等值匹配 —— 它不调 LLM、不理解自然语言、
+# 不做语义分类、不决定 Agent 该执行什么（规格 §5、§6）。
+#
+# ⚠️ 这里**刻意没有** `{agent_type: "*", model_role: "*"}` 兜底
+# ---------------------------------------------------------------
+# 兜底的后果是"新加一个角色忘了配绑定 -> 静默用了 fast_default"，而
+# 症状是"模型答得不太对"，几乎查不出来。没有兜底时它会明确报错并列出
+# 现有绑定。确实想要兜底再加一行即可（那是一个看得见的决定）。
+#
+# planner / evaluator 目前还没有对应的图，属于**预备绑定**：等它们落地
+# 时不必再改 Model 模块。
+
+bindings:
+
+  - agent_type: react
+    model_role: reasoning
+    profile: reasoning_default
+    description: ReAct 主循环的推理调用。
+
+  - agent_type: react
+    model_role: summarization
+    profile: fast_default
+    description: 对话摘要 / 上下文压缩。
+
+  - agent_type: react
+    model_role: classification
+    profile: classification_default
+    description: Agent Builder 对用户输入做的分类（走千问 flash）。
+
+  - agent_type: planner
+    model_role: reasoning
+    profile: reasoning_default
+
+  - agent_type: evaluator
+    model_role: reasoning
+    profile: evaluation_default
+
+  # ---- 记忆（memory_atom）：不在任何图里，由后台任务发起 ----
+  #
+  # ⚠️ agent_type 取 `memory_atom_*` 而不是 `memory`：这个值要能一眼对上
+  # 发起它的那条链（`memory.l1.extract` 任务 / MemoryAtomService），而
+  # `memory` 是本模块的名字、下面还有 L0。
+  #
+  # ⚠️ 抽取与去重是**两次不同的调用**，因此两个 agent_type
+  # -------------------------------------------------
+  # 它们的取舍不一样：抽取要"读得多、写得全"（一次吞吐一整段对话），
+  # 去重要"判得准"（比较语义相近的几条，判断该不该合并）。挤一个
+  # agent_type 就没法只调其中一个的模型。两者都走 reasoning 那一档 ——
+  # 输出直接落库，回读时没有人在中间纠正它，指令遵循优先于"答得漂亮"。
+  - agent_type: memory_atom_extract
+    model_role: memory.atom.extract
+    profile: reasoning_default
+    description: L1 记忆抽取（情境切分 + persona/episodic/instruction）。
+
+  - agent_type: memory_atom_dedup
+    model_role: memory.atom.dedup
+    profile: reasoning_default
+    description: L1 记忆冲突检测（store / skip / update / merge）。
+
+  # ---- 记忆（memory_scene）：L2 场景整合，同样由后台任务发起 ----
+  #
+  # ⚠️ agent_type 取 `memory_scene_*`（表名）而不是 `memory_l2_*`：与上面
+  # 那两条同一口径 —— agent_type 对的是**产物/服务**，model_role 对的是
+  # **动作**。`memory.atom.*` 那两条早先是 `memory.l1.*`，2026-10-11 跟着
+  # 表名一起改掉了（值没进过库，改它是安全的）。
+  # 因为它们长得像就把这条改成 `memory_l2_*`。
+  #
+  # 走 reasoning 那一档：输出是整篇 md（含 META 块与叙事），回读时没有人
+  # 在中间纠正它，指令遵循（模板、字数、文件名规范）优先于"答得漂亮"。
+  - agent_type: memory_scene_consolidate
+    model_role: memory.scene.consolidate
+    profile: reasoning_default
+    description: L2 场景整合（把新增 L1 记忆融合进场景文件）。
+
+  # ---- 记忆（memory_persona）：L3 画像生成，同样由后台任务发起 ----
+  #
+  # ⚠️ 两份系统提示词（个人 User Narrative Profile / 团队 Team Operating
+  # Doctrine）**共用这一条绑定** —— 它们由同一条任务（memory.l3.extract）
+  # 发起、同一个模型，只是产物形态按 scope 有没有 org 分叉。选哪一份落在
+  # prompts/memory_persona_extract.py 的 `_render` 里，不在这里。
+  #
+  # 走 reasoning 那一档，与 L2 同一条理由：输出是整篇 md，回读时没有人在
+  # 中间纠正它，指令遵循（模板、字数上限、no_change 的形状）优先于"答得
+  # 漂亮"。而且这一次的判断（哪些证据值得进 L3、旧结论该不该被推翻）比
+  # 整合场景更依赖推理。
+  - agent_type: memory_persona_extract
+    model_role: memory.persona.extract
+    profile: reasoning_default
+    description: L3 画像生成（把该 scope 变化过的场景抽象成个人 / 团队画像）。

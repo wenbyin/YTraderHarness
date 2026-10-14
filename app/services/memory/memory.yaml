@@ -1,0 +1,397 @@
+openapi: 3.1.0
+
+info:
+  title: Memory Search API
+  version: 1.0.0
+  description: |
+    L0 conversation memory retrieval — hybrid recall (keyword + vector)
+    over the raw messages in `agent_message`.
+
+    Responsibilities:
+      - POST /memory/search — one round of recall over L0 raw messages
+
+    Non-responsibilities:
+      - Extracting or indexing memory (that is the `memory.extract`
+        background task; the search side only reads the two index tables)
+      - L1 / L2 / L3 structured memory and user profiles (separate
+        templates, separate scopes)
+      - Conversation message CRUD (see messages.yaml)
+
+    ⚠️ Scope keys are deliberately NOT in the request body
+    -----------------------------------------------------
+    The request body is also the tool input schema handed to the LLM
+    (the same pydantic model is both the HTTP body and the bind_tools
+    schema). If `user_id` / `org_id` appeared here, the model could fill
+    in somebody else's id and read across tenants. Therefore:
+
+        HTTP   session_id is a **query parameter**; user_id / org_id come
+               from the access token. Session ownership is enforced, and a
+               session that is not the caller's is a 404 — never an empty
+               result ("not yours" and "nothing found" must not look alike)
+        tool   all three are injected by the runtime (ToolRuntime.thread_id
+               -> agent_session). The model only gets to pick
+               scope = session | user.
+
+    Scope keys available on the module (from todolist):
+        session   agent_message.session_id  (≈ LangGraph thread_id)
+        agent     agent_message.business_agent_id (duty_key)
+        user      agent_session.user_id / agent_run.user_id
+        team      agent_session.org_id      (2C: org_id stands in for team)
+
+    ⚠️ agent_message itself carries no user_id / org_id
+    ------------------------------------------------
+    Those live on agent_session (user_id, org_id). The two index tables
+    therefore denormalize the scope columns they need, because a recall
+    that filtered by joining the session table on every query would turn
+    a two-index scan into a three-way join for no gain.
+
+    ⚠️ The two index tables are NOT in this contract
+    -------------------------------------------
+    `agent_message_fts` / `agent_message_vec` are storage, not API
+    surface. They are documented in models.sql (and mirrored on the ORM,
+    which is what actually creates them).
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Memory
+    description: L0 raw conversation memory retrieval
+
+
+paths:
+
+  /memory/search:
+    post:
+      tags:
+        - Memory
+      summary: Search L0 conversation memory
+      operationId: searchMemory
+      description: |
+        One round of hybrid recall. Returns **snippets, not full messages** —
+        take a hit's message_id to messages.yaml when the whole message is
+        needed. Returning whole messages here would make the payload size a
+        function of the conversation, and a tool call that dumps five long
+        messages into the context is worse than one that dumps five sentences.
+
+        The two routes:
+
+            keyword   tsvector + GIN. The text is tokenized **in the
+                      application**, mirroring the ES `cjk` analyzer in the
+                      document module (standard + cjk_width + lowercase +
+                      cjk_bigram). Postgres has no Chinese text-search
+                      configuration on this instance and no zhparser /
+                      pg_jieba — tokenizing before the index is exactly what
+                      the L0 design already did (it stored jieba-tokenized
+                      text in the indexed column), so the same shape ports
+                      over with no extension.
+            vector    pgvector, cosine, HNSW, 512 dimensions —
+                      bge-small-zh-v1.5, the same model the document module
+                      embeds with.
+
+        ⚠️ Scores are comparable only within one response
+        ----------------------------------------------
+        Keyword scores come from ts_rank and vector scores from cosine
+        distance; the fused score is a rank-based combination. Two hits from
+        the same response can be ordered by `score`; two different responses
+        (or two different modes) cannot. Do not threshold across calls.
+
+        ⚠️ A route whose backend is down does not fail the query
+        ------------------------------------------------------
+        The remaining route's hits are genuinely retrievable. What must not
+        happen is a silent skip: the response says which route stayed out
+        via `degraded_routes`, and the same thing goes to a warning log.
+
+      parameters:
+        - name: session_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+            nullable: true
+          description: |
+            Restrict the search to a single session. Omit it to let `scope`
+            decide. A session that does not belong to the caller is a 404 —
+            not an empty 200, because those two mean different things and a
+            client that cannot tell them apart will keep retrying.
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemorySearchRequest'
+
+      responses:
+        '200':
+          description: Recall results (possibly with degraded routes)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySearchResponse'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+components:
+
+  schemas:
+
+    MemorySearchScope:
+      type: string
+      enum:
+        - session
+        - user
+      description: |
+        How wide the recall reaches.
+
+            session   only the current conversation (L0's own scope)
+            user      every conversation of the calling user, across
+                      sessions — the scope L1 facts live in, used here so
+                      one session can still find what was said in another
+
+        "user" is a real widening, not a synonym for "all": agent / team
+        are never widened by it, and both are always pinned to the caller.
+
+    MemorySearchMode:
+      type: string
+      enum:
+        - hybrid
+        - keyword
+        - vector
+      description: |
+        Which routes to run. `hybrid` runs both and fuses them by rank.
+
+        This is the **requested** mode and is echoed back as-is; a route
+        that did not actually run shows up in `degraded_routes` rather than
+        being silently folded into this field.
+
+    MemoryRecallRoute:
+      type: string
+      enum:
+        - keyword
+        - vector
+      description: One recall route. Names match the two index tables.
+
+    MemorySearchRequest:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          minLength: 1
+          description: |
+            Natural-language query, in the user's language.
+
+            This is the only field the model is free to compose — it is
+            also what the keyword route tokenizes and what the vector route
+            embeds, with the same tokenizer / model the index was built
+            with. A query that is a copy of the previous one is usually a
+            mistake worth catching on the calling side, not here.
+
+        scope:
+          $ref: '#/components/schemas/MemorySearchScope'
+          default: session
+
+        mode:
+          $ref: '#/components/schemas/MemorySearchMode'
+          default: hybrid
+
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+          description: |
+            Maximum number of hits. Applied **after** fusion, so it bounds
+            the response, not each route's internal recall depth.
+
+        roles:
+          type: array
+          nullable: true
+          items:
+            type: string
+            enum:
+              - user
+              - assistant
+          description: |
+            Restrict to these message roles. Omitted or null means both —
+            which is the default on purpose: "what did I say" and "what did
+            you say" are both legitimate questions, and requiring the model
+            to spell out both roles to get the default would be noise.
+
+            There is deliberately no "include tool activity" switch: the
+            index holds conversation turns only (kind=chat — see
+            app/services/memory/application/memory_service_impl.py), so
+            such a flag could only ever return nothing. Tool calls and
+            tool results live in agent_message and are reachable from a hit
+            via message_id.
+
+        time_from:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Lower bound on message created_at (inclusive). Null means
+            unbounded.
+
+        time_to:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Upper bound on message created_at (inclusive). Null means
+            unbounded. Both bounds are on **record time**, not on any
+            time mentioned inside the text — a message about last year
+            written today is inside today's window.
+
+    MemorySearchHit:
+      type: object
+      required:
+        - message_id
+        - session_id
+        - seq
+        - role
+        - text
+        - created_at
+        - score
+        - matched_by
+      properties:
+        message_id:
+          type: string
+          format: uuid
+          description: The agent_message row this hit came from. No FK — the index table does not constrain it, same as agent_message itself.
+
+        session_id:
+          type: string
+          format: uuid
+          description: Which conversation it came from. Matters as soon as scope=user, where a hit may belong to a different session than the caller's.
+
+        seq:
+          type: integer
+          description: |
+            Session-scoped sequence of the message. This is the key to
+            fetch neighbours ("what was said right before this") and it is
+            what messages.yaml paginates by. Gaps are allowed.
+
+        role:
+          type: string
+          enum:
+            - user
+            - assistant
+          description: Same values as messages.yaml's Message.role.
+
+        text:
+          type: string
+          description: |
+            The matched snippet, in the **original** wording — never the
+            tokenized form the keyword index stores. Snippet length is the
+            service's business, not the caller's; it is chosen to show the
+            match in context rather than to be the whole message.
+
+        created_at:
+          type: string
+          format: date-time
+          description: When the message was recorded. The field the time_from / time_to bounds filter on.
+
+        score:
+          type: number
+          description: |
+            Fused score. Higher is better. Comparable **only within this
+            response** — see the operation description.
+
+        matched_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryRecallRoute'
+          description: |
+            Which routes recalled this hit. A hit that only the vector
+            route found is the interesting case: it is the one a keyword
+            search would have missed, so the field is also a cheap sanity
+            check on whether hybrid is earning its cost.
+
+    DegradedRoute:
+      type: object
+      required:
+        - route
+        - reason
+      description: |
+        A route that could not take part in this round.
+
+        Deliberately not the document module's DegradedRoute: that one is
+        keyed by `document_retrieval_definition_id` because document has a
+        retrieval-definition table to point at. Memory has two fixed routes
+        and no such table, so the route enum is the whole identity.
+
+        An empty `degraded_routes` means every route ran.
+      properties:
+        route:
+          $ref: '#/components/schemas/MemoryRecallRoute'
+
+        reason:
+          type: string
+          description: |
+            Why the route stayed out — backend error text, or "not wired
+            up yet". Also written to the warning log; it is in the response
+            so the caller is not left guessing which half answered.
+
+    MemorySearchResponse:
+      type: object
+      required:
+        - search_id
+        - query
+        - mode
+        - scope
+        - results
+        - degraded_routes
+      description: |
+        One round of recall.
+
+        Deliberately no total / pagination: this is a round of recall, not
+        a pageable resource collection. The number of hits is decided by
+        `limit`, and "there were 400 more" is not an actionable fact for a
+        caller that will re-query with different words anyway.
+
+        `results` is ordered by fused score, best first. An empty `results`
+        with an empty `degraded_routes` means the corpus genuinely has
+        nothing — that is a real answer, not an error.
+      properties:
+        search_id:
+          type: string
+          format: uuid
+          description: Identifies this call, for aligning logs and traces.
+
+        query:
+          type: string
+          description: |
+            Echoed back. A tool call's arguments and its results get
+            separated in a transcript; echoing lets whoever reads the
+            result know what was asked without scrolling up.
+
+        mode:
+          $ref: '#/components/schemas/MemorySearchMode'
+
+        scope:
+          $ref: '#/components/schemas/MemorySearchScope'
+
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemorySearchHit'
+
+        degraded_routes:
+          type: array
+          items:
+            $ref: '#/components/schemas/DegradedRoute'
+
+
+  responses:
+
+    NotFound:
+      description: >-
+        The session does not exist, or it does not belong to the caller.
+        The two cases are deliberately indistinguishable in the response —
+        telling a caller that someone else's session exists is itself a leak.

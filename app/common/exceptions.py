@@ -40,3 +40,32 @@ class ConflictError(ApplicationError, ValueError):
 
     Controller 映射为 409。
     """
+
+
+class AuthenticationError(ApplicationError, ValueError):
+    """
+    没有凭据，或凭据不成立。
+
+    包括：
+        - 完全没带 token
+        - 签名不符 / 已过期 / audience 不对
+        - token 结构无法解析
+
+    与 PermissionDeniedError 的分界是**"你是谁"与"你能干什么"**：
+    这一条回答不出"你是谁"，所以客户端该换一份凭据重试。
+
+    Controller 映射为 401，并附带 `WWW-Authenticate: Bearer`
+    （RFC 6750 要求 401 指明认证方案）。
+    """
+
+
+class PermissionDeniedError(ApplicationError, ValueError):
+    """
+    凭据成立，但这个人不许做这件事。
+
+    鉴权组件目前只用它表达"token 有效但不在要求的群组里"。
+    客户端**换凭据也没用** —— 所以要给 403 而不是 401，
+    否则前端会陷入"反复重新登录"的循环。
+
+    Controller 映射为 403。
+    """

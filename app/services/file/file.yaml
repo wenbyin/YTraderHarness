@@ -1,0 +1,648 @@
+openapi: 3.1.0
+
+info:
+  title: File Service API
+  version: 1.0.0
+  description: |
+    File 是**文件资产**及其物理存储记录。
+
+    File 表示一份已经落盘的内容（bytes + checksum + storage_key），
+    它**不**表示业务上的文档 —— 文档是 Document / DocumentVersion，
+    上传一个文件不会创建 Document（见下 Non-responsibilities）。
+
+    Responsibilities:
+      - 上传文件资产，落盘并登记元数据
+      - 查询与下载已登记的文件
+      - 逻辑删除文件
+
+    Non-responsibilities:
+      - Document 与 DocumentVersion 的创建与管理（见 document.yaml）
+      - 文档解析、切分、索引（见 pipeline.yaml）
+      - 权限与归属管理
+
+    ⚠️ 两个必须先知道的契约事实
+    ----------------------------
+
+    1. **没有归属过滤（当前刻意如此）**
+
+       上传时会记下 uploaded_by，但**查询与删除都不按它过滤** ——
+       任何持有有效 token 的调用者，只要猜到 file_id，就能读到、下载、
+       删除**别人**的文件。
+
+       这是"只落库、先不设权限边界"的阶段性取舍，不是遗漏。收口的方式是
+       在服务层加 `uploaded_by = 当前用户 OR uploaded_by IS NULL`，
+       与 session 那套同形；在那之前，**不要把本组接口暴露给互不信任的
+       使用方**。
+
+       注意 `uploaded_by` 这个查询参数是**过滤条件，不是授权边界**：
+       传别人的 id 进来能查出别人的文件。
+
+    2. **删除是逻辑删除**
+
+       DELETE 只把 status 改成 deleted 并记 deleted_at，**物理文件不删**。
+       因此磁盘上的内容会一直留着，直到有人另行清理。
+
+    ⚠️ 错误体的形状与其余规格不同
+    -----------------------------
+    本文件里的 Error 是 `{"detail": string}` —— 这是 FastAPI 的默认错误体，
+    也是本服务**实际**返回的形状（api/v1/files.py 直接抛
+    `HTTPException(status_code=..., detail=str(exc))`）。
+
+    其余几份规格（session / memory / tool ...）里声明的
+    `{code, message, request_id}` **当前没有任何代码产出** —— 应用里
+    没有注册全局异常处理器，common/utils/http.py 的 to_http_error 也是
+    `detail=`。本文件按实际写，不跟着抄那个形状。
+
+servers:
+  - url: /api/v1
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Files
+    description: File assets and their stored content
+
+
+paths:
+
+  /files:
+    post:
+      tags:
+        - Files
+      summary: Upload a file asset
+      operationId: uploadFile
+      description: |
+        上传一份文件资产并落盘。
+
+        **只创建 File，不创建 Document** —— 想让这份文件成为业务文档，
+        还需要另外调用 document.yaml 的 POST /documents。
+
+        multipart/form-data，文件字段名固定为 `upload`。
+
+        三个字段的来源是**固定的、不可由调用方指定**的：
+
+            file_name     来自 multipart 的文件名；缺失时归一成 "unknown"
+            content_type  来自 multipart 分片声明的 MIME Type，可为空
+            uploaded_by   **来自 access token**，不接受请求体传入
+
+        最后一条是有意的：multipart 端点本来就不接收任何用户字段，
+        让调用方声明上传人等于允许替别人署名。
+
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - upload
+              properties:
+                upload:
+                  type: string
+                  format: binary
+                  description: 文件内容。
+
+      responses:
+        '201':
+          description: File created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/File'
+
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+    get:
+      tags:
+        - Files
+      summary: List file assets
+      operationId: listFiles
+      description: |
+        分页查询 File 列表。只查 PostgreSQL，**不访问物理存储**。
+
+        过滤条件之间是 AND 关系。
+
+        origin 与 status 的默认值合起来有一条重要后果：
+        默认**既看不到流水线中间产物，也看不到已删除的文件**。
+        要看产物得显式传 origin=pipeline_artifact。
+
+        status 与 include_deleted 的优先级：
+
+            status 显式指定       -> 只按该 status 过滤，include_deleted 被忽略
+            include_deleted=true  -> 不限制 status，active 与 deleted 都返回
+            否则                  -> 只返回 active
+
+        排序固定为 created_at 倒序，**调用方不能指定排序字段**。
+
+      parameters:
+        - name: origin
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/FileOrigin'
+          description: |
+            文件来源。默认 user_upload —— 流水线中间产物不会出现在列表里，
+            要连产物一起看时显式传 pipeline_artifact。
+
+        - name: tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+            nullable: true
+          description: 租户 ID。为空时不按租户过滤。
+
+        - name: status
+          in: query
+          required: false
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/FileStatus'
+            nullable: true
+          description: |
+            文件生命周期状态。显式指定时优先级最高，include_deleted 被忽略。
+
+        - name: file_name
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 500
+          description: 文件名模糊匹配，**不区分大小写**的包含匹配。
+
+        - name: content_type
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 200
+          description: |
+            MIME Type **前缀**匹配。例如 image/ 同时匹配 image/png 与
+            image/jpeg，application/pdf 则精确匹配 PDF。
+
+        - name: uploaded_by
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 255
+          description: |
+            按上传人过滤（Casdoor 的 sub，字符串）。
+
+            ⚠️ 它是过滤条件、**不是**授权边界 —— 本组接口不按登录用户
+            过滤，传别人的 id 进来能查到别人的文件。
+
+        - name: created_from
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: 创建时间下界，**闭区间**。
+
+        - name: created_to
+          in: query
+          required: false
+          schema:
+            type: string
+            format: date-time
+          description: 创建时间上界，**闭区间**。
+
+        - name: include_deleted
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: 是否包含已逻辑删除的文件。status 显式指定时被忽略。
+
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+          description: 页码，从 1 开始。
+
+        - name: page_size
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: 每页数量，上限 100。
+
+      responses:
+        '200':
+          description: Paged file list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FilePage'
+
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+
+  /files/{file_id}:
+    get:
+      tags:
+        - Files
+      summary: Get file metadata
+      operationId: getFile
+      description: |
+        取单个文件的完整元数据。
+
+        与列表项的区别：这里**包含** storage_backend / storage_key 与
+        metadata（列表项刻意不含，见 FileListItem）。
+
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+
+      responses:
+        '200':
+          description: File metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/File'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags:
+        - Files
+      summary: Delete a file (soft)
+      operationId: deleteFile
+      description: |
+        **逻辑删除**：把 status 置为 deleted 并记下 deleted_at。
+
+        物理文件**不删** —— 磁盘上的内容会一直留着，由专门的清理任务
+        （Job / Cron）另行处理。
+
+        ⚠️ **不幂等**：对一个已经 deleted 的文件再删一次得到的是 **404**，
+        不是 200。服务层在状态已是 deleted 时直接拒绝
+        （`File already deleted`），路由把那条 ValueError 映射成 404。
+
+        注意这个 404 与 GET 的行为**不对称**：GET /files/{file_id} 不看
+        status，所以同一个软删文件在 GET 上是 200、在 DELETE 上是 404。
+        这不是笔误，是两处各自的实现决定的。
+
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+
+      responses:
+        '200':
+          description: File marked as deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileDeleted'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+  /files/{file_id}/content:
+    get:
+      tags:
+        - Files
+      summary: Download file content
+      operationId: getFileContent
+      description: |
+        下载文件的原始字节。
+
+        **不是 JSON**：响应体就是文件内容本身，
+        Content-Type 取登记时的那个；登记时为空则回落成
+        application/octet-stream。
+
+        响应带 `Content-Disposition: attachment`，文件名按 RFC 6266 /
+        RFC 5987 编码 —— 同时给出 ASCII 回退名（filename=）与
+        百分号编码的 UTF-8 真名（filename*=UTF-8''...），
+        因此中文文件名在各浏览器下都能正确落地。
+
+        ⚠️ 当前是**一次性返回整个字节数组**，不是流式响应。
+        大文件会占满内存，后续会改成 StreamingResponse。
+
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+
+      responses:
+        '200':
+          description: Raw file content
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: |
+                attachment; filename="<ASCII 回退名>"; filename*=UTF-8''<百分号编码名>
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            text/plain:
+              schema:
+                type: string
+                format: binary
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+
+    FileId:
+      name: file_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+
+    BadRequest:
+      description: >-
+        Request rejected by the service (invalid filter combination,
+        malformed values, and so on). The reason is in `detail`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    NotFound:
+      description: >-
+        No such file (never existed), or — on DELETE only — the file is
+        already soft-deleted.
+
+        A soft-deleted file still resolves on GET (status is `deleted`);
+        use include_deleted on the list endpoint to surface those.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+
+    Error:
+      type: object
+      required:
+        - detail
+      properties:
+        detail:
+          type: string
+          description: 人类可读的失败原因。
+      description: |
+        FastAPI 的默认错误体。**与其余规格里那个
+        {code, message, request_id} 不是同一个东西** —— 见 info 里那段说明。
+
+    FileStatus:
+      type: string
+      enum:
+        - active
+        - deleted
+      description: |
+        File 生命周期状态。
+
+        active   文件正常存在，可被 Document 引用
+        deleted  已逻辑删除；第一阶段不删物理文件
+
+    FileOrigin:
+      type: string
+      enum:
+        - user_upload
+        - pipeline_artifact
+      description: |
+        File 的来源。
+
+        user_upload        用户上传的文件资产，默认出现在列表里
+        pipeline_artifact  流水线中间产物（parsed_text / chunks / vectors ...），
+                           系统生成、没有上传者，**默认不出现在列表里**
+
+        拆这一列是因为两者的生命周期不同：用户文件是资产，
+        产物是可清理的中间态。
+
+    File:
+      type: object
+      required:
+        - file_id
+        - file_name
+        - file_size
+        - checksum
+        - storage_backend
+        - storage_key
+        - status
+        - created_at
+        - updated_at
+      description: 完整的文件记录。上传响应与单条查询都用它。
+      properties:
+        file_id:
+          type: string
+          format: uuid
+          readOnly: true
+
+        tenant_id:
+          type: string
+          format: uuid
+          nullable: true
+
+        file_name:
+          type: string
+          maxLength: 500
+          description: 上传时的原始文件名。用于展示与下载时恢复文件名。
+
+        content_type:
+          type: string
+          maxLength: 200
+          nullable: true
+          description: MIME Type，例如 application/pdf。
+
+        file_size:
+          type: integer
+          minimum: 0
+          description: 实际写入存储的字节数。
+
+        checksum:
+          type: string
+          maxLength: 128
+          description: 内容校验和，默认 SHA-256。用于产物去重。
+
+        storage_backend:
+          type: string
+          maxLength: 50
+          description: 物理存储后端。第一版固定为 local。
+
+        storage_key:
+          type: string
+          maxLength: 1000
+          description: |
+            文件在存储中的 Key，基于 file_id 生成，**不是**用户文件名。
+            ⚠️ 它是存储层实现细节 —— 拿到它也不要绕过本服务去访问物理文件。
+
+        status:
+          $ref: '#/components/schemas/FileStatus'
+
+        metadata:
+          type: object
+          additionalProperties: true
+          description: 调用方自定义的附加信息。
+
+        created_at:
+          type: string
+          format: date-time
+
+        updated_at:
+          type: string
+          format: date-time
+
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    FileListItem:
+      type: object
+      required:
+        - file_id
+        - file_name
+        - file_size
+        - checksum
+        - status
+        - created_at
+        - updated_at
+      description: |
+        列表中的单个条目。
+
+        ⚠️ 刻意**不含** storage_backend / storage_key：存储层实现细节，
+        列表调用方不需要，也不应该绕过本服务直接访问物理文件。
+
+        也**不含** metadata：列表页只需要展示信息，需要完整 metadata
+        时走 GET /files/{file_id}。
+
+        但**含** uploaded_by —— 列表页要能显示"谁传的"。
+      properties:
+        file_id:
+          type: string
+          format: uuid
+          readOnly: true
+
+        tenant_id:
+          type: string
+          format: uuid
+          nullable: true
+
+        file_name:
+          type: string
+
+        content_type:
+          type: string
+          nullable: true
+
+        file_size:
+          type: integer
+          minimum: 0
+
+        checksum:
+          type: string
+
+        status:
+          $ref: '#/components/schemas/FileStatus'
+
+        uploaded_by:
+          type: string
+          nullable: true
+          description: 上传人（Casdoor 的 sub）。
+
+        created_at:
+          type: string
+          format: date-time
+
+        updated_at:
+          type: string
+          format: date-time
+
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    FilePage:
+      type: object
+      required:
+        - items
+        - page
+        - page_size
+        - total
+        - total_pages
+      description: 分页的文件列表结果。
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileListItem'
+
+        page:
+          type: integer
+          minimum: 1
+
+        page_size:
+          type: integer
+          minimum: 1
+          maximum: 100
+
+        total:
+          type: integer
+          minimum: 0
+          description: 命中过滤条件的总条数（不只是本页）。
+
+        total_pages:
+          type: integer
+          minimum: 0
+          description: 由 total 与 page_size 算出。**total=0 时为 0**，不是 1。
+
+    FileDeleted:
+      type: object
+      required:
+        - file_id
+        - status
+        - deleted_at
+      description: 逻辑删除的结果。刻意不回整个 File —— 调用方要的就是这三样。
+      properties:
+        file_id:
+          type: string
+          format: uuid
+
+        status:
+          $ref: '#/components/schemas/FileStatus'
+
+        deleted_at:
+          type: string
+          format: date-time

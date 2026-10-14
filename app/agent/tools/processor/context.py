@@ -1,14 +1,14 @@
 """
 处理器**执行期**看到的东西。
 
-这是一份**契约形状**，不是已经接通的数据结构
-------------------------------------------------
-仓库里目前**没有工具调用路径**（`app/infra/agent/cutom_tool.py`
-是空文件，grep `invoke` 找不到入口）。所以本模块定义的是"将来那条
-路径要把什么交给处理器"，本次不接任何执行链。
+谁在构造这些形状
+----------------
+`app/infra/agent/tool_executor.py` —— 工具执行节点把一次调用交给它，
+它造出 `ToolInvocation`、从库里取链、用 `chain.compile_chain` 折叠成
+嵌套调用，最终把 `ToolOutcome` 还给节点。
 
-先把它定下来的理由与 `capability.py` 先定 `config_schema` 形状同理：
-形状固定了，处理器实现就能先写完，调用方接进来时不必回头改实现。
+本模块只定义**形状**：那条路径要把什么交给处理器。形状与实现分开，
+处理器才能先写完 —— 这也是它当初先于执行层存在的原因。
 
 为什么 arguments 是**可变 dict**
 --------------------------------
@@ -39,17 +39,64 @@ BEFORE / AROUND 拦截器要能改写参数（脱敏、补默认值、改单位�
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
 __all__ = [
     "AsyncToolCall",
+    "CALLER_CONTEXT_KEY",
     "ToolCallDenied",
     "ToolInvocation",
     "ToolOutcome",
+    "build_caller_context",
 ]
+
+
+#: `ToolInvocation.context` 里放"调用者是谁"的那个键。
+#:
+#: 为什么要有这个常量
+#: ----------------
+#: 键名跨越三个模块：构造方（工具执行器，从图的 context 拿）、消费方
+#: （checkauth 这类按角色/组判定的拦截器）、以及给它们定形状的这里。
+#: 三处各写一遍字符串的话，拼错的表现是"拦截器永远看不到身份" ——
+#: 而它的默认行为是**拒绝**，于是症状变成"所有工具都调不动了"，
+#: 离原因（一个字母）非常远。
+CALLER_CONTEXT_KEY = "caller"
+
+
+def build_caller_context(
+        *,
+        user_id: str | None = None,
+        groups: Sequence[str] | None = None,
+        roles: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """
+    构造放进 `ToolInvocation.context[CALLER_CONTEXT_KEY]` 的那个值。
+
+    形状（处理器可以依赖它）：
+
+        {"user_id": str, "groups": [str, ...], "roles": [str, ...]}
+
+    三个键**恒定存在**（缺的给空值，不给 None）—— 处理器据此少写一层
+    `or []` 与"这个键到底有没有"的判断，而"没有身份"是一个独立的、
+    显式的状态（见下），不该与"有身份但没有角色"混成同一种。
+
+    为什么身份是**快照**而不是运行时查询
+    ----------------------------------
+    agent 运行是异步派发的（请求提交后才跑），跑的时候手里没有 token，
+    而 Casdoor 是用户的唯一真相、本地没有用户表 —— 所以角色/组是在
+    **建运行的那一刻**从 token 的 claim 里快照下来的（见
+    app/api/v1/sessions.py 与 agent_run.caller_identity）。
+    处理器拿到的因此是"发起这次运行的人当时的身份"，不是"此刻的身份"。
+    """
+
+    return {
+        "user_id": str(user_id or ""),
+        "groups": [str(item) for item in (groups or ())],
+        "roles": [str(item) for item in (roles or ())],
+    }
 
 
 class ToolCallDenied(Exception):
@@ -96,6 +143,10 @@ class ToolInvocation:
     #: 键名 metrics.started_at）。
     #:
     #: 但**不要改调用方放进去的键**：那些是环境，不是你的便签。
+    #:
+    #: 调用方会放的键（处理器可以读）：
+    #:     tool_call_id          本次调用的 id（模型给的）
+    #:     CALLER_CONTEXT_KEY    调用者身份快照，见 build_caller_context
     context: dict[str, Any] = field(default_factory=dict)
 
 

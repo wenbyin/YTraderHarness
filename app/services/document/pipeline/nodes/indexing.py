@@ -73,6 +73,7 @@ from app.infra.graph import node_span
 
 from app.services.document.domain.schemas import (
     CanonicalChunk,
+    IndexDeleteRequest,
     IndexUpsertRequest,
 )
 from app.services.document.domain.schemas.enum import StorageBackend
@@ -231,7 +232,6 @@ async def indexing_node(
         # 而问题多半在检索定义上 —— 所以在这里补上上下文。
         try:
             backend = context.registry.index_backend(backend_type)
-
         except CapabilityNotFound as exc:
             raise CapabilityNotFound(
                 f"{rid}: retrieval_type={retrieval_type!r} 的 "
@@ -246,6 +246,46 @@ async def indexing_node(
                 "一条 dense_vector / keyword / sparse_vector 的 retrieval "
                 "必须指向 elasticsearch / milvus 之一。"
             ) from exc
+
+        # ----------------------------------------------------
+        # 先清掉上一次写进这个容器的行（重跑路径）
+        # ----------------------------------------------------
+        #
+        # 重跑会生成**新的** document_chunk_id，于是下面的 upsert 覆盖
+        # 不到上一次的行 —— 旧向量留在索引里，指向一批已经不存在的
+        # chunk。症状是检索混进取不出正文的条目（召回后回表查
+        # document_chunk 查不到），**不报错**，只是结果越来越脏。
+        #
+        # 两个后端都实现了 IndexBackend.delete，且都容忍"索引 /
+        # collection 还不存在"：第一次跑走到这里也**不该**报错
+        # （见 milvus.py / es.py 里各自的说明，它们就是为这个调用点写的）。
+        #
+        # 刻意放在**这个位置**（拿到后端之后、写入之前），不是提到
+        # 阶段 5 的规划节点一次性删干净。理由是失败语义：
+        #
+        #   现在就删   删完就写，中间只有一次调用；embedding 阶段失败
+        #              时根本走不到这里，上一次的索引**原样可用**
+        #   提前删     运行一开始旧向量就没了，之后任何一步失败都会让
+        #              这个版本在索引里彻底消失
+        #
+        # ⚠️ 删的是**整个版本在本容器里的行**，不只是本分支写的那些。
+        # 容器名按 retrieval_type 硬编码（见文件头），所以同一个版本的
+        # 两路 dense_vector retrieval 会写进同一个 collection —— 那种
+        # 配置下两个分支并发跑，先写的会被后删的抹掉。当前每种
+        # retrieval_type 在每个文档类型下只有一份定义，撞不上；真要
+        # 支持同类型多份，要改的是这里的删除粒度（按 chunk 身份删），
+        # 而不是给它加重试。
+        # ----------------------------------------------------
+
+        await backend.delete(
+            IndexDeleteRequest(
+                document_id=state["document_id"],
+                document_version_id=state["document_version_id"],
+                index_identifier=container,
+                # 与下面 upsert 传的是同一份，理由见那里的说明。
+                index_config=dict(branch.get("storage_config") or {}),
+            )
+        )
 
         await backend.upsert(
             IndexUpsertRequest(

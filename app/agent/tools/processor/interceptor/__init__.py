@@ -1,10 +1,11 @@
 """
 改控制流的处理器。
 
-    HITL.py     调用前要人点头（BEFORE）
-    cache.py    结果缓存，命中直接短路（BEFORE + AFTER 或 AROUND）
+    approval.py  调用前要人点头（BEFORE），三个选项
+    auth.py      按调用者的角色 / 群组放行或拒绝（BEFORE）
+    cache.py     结果缓存，命中直接短路（BEFORE + AFTER 或 AROUND）
 
-HITL 是 BEFORE：审批要决定的是"这次调用要不要发生"，AFTER 时工具
+审批是 BEFORE：它要决定的是"这次调用要不要发生"，AFTER 时工具
 已经跑完了。
 
 缓存三种都支持，因为它的两半可以拆开挂：BEFORE 查（命中即短路）、

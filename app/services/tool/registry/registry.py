@@ -15,9 +15,9 @@ Tool 注册表：进程级的工具清单。
 "这个代码库里有哪些工具"这个事实。
 
 所以同步之前先 scan()：把配置的包走一遍，缺的模块补上，
-保证结果与进程的 import 状态无关。这与
-document/pipeline/registry.py 的 _import_capability_modules
-是同一个理由、同一套写法。
+保证结果与进程的 import 状态无关。这与 document / retrieve /
+tool-processor / context-builder 那四个注册表是同一个理由，走的是
+同一个实现（app/common/utils/reflection.py）。
 
 进程级单例
 ----------
@@ -29,11 +29,12 @@ from __future__ import annotations
 
 import importlib
 import logging
-import pkgutil
 from collections.abc import Iterator
 from types import ModuleType
 
-from .spec import ToolSpec
+from app.common.utils import iter_module_tree
+
+from .spec import SOURCE_REF_VARIABLE, ToolSpec, derive_source_ref
 
 __all__ = [
     "TOOL_SOURCE_PACKAGES",
@@ -53,6 +54,14 @@ TOOL_SOURCE_PACKAGES: tuple[str, ...] = (
     # @tool 声明所在：各业务模块的服务实现。
     "app.services.document.application",
     "app.services.file.application",
+    # 记忆检索的两个工具（`memory.search` L0 原文 / `memory_atom.search`
+    # L1 提炼记忆）都声明在这里的两个服务实现上。
+    #
+    # ⚠️ 漏了它 = 那两个 @tool **永远不会被登记**，而症状是"模型说它没有
+    # 这个工具" —— 主 agent 的职责提示词里正写着"需要回忆时用 memory.search"，
+    # 于是模型会去调一个不存在的工具。加这一行之前就是这个状态（2026-10-10
+    # 发现并补上）。
+    "app.services.memory.application",
     "app.services.tool.application",
     # langchain @tool 声明所在：跨多个 service 的组合工具。
     "app.agent.tools",
@@ -138,19 +147,80 @@ class ToolRegistry:
         """
         把配置的包走一遍，然后返回全量工具。
 
-        走一遍的目的只是**触发 import** —— 真正的登记发生在
-        各模块的类体执行时（__set_name__）。这里不解析模块内容，
-        因此新增一个 .py 文件就自动生效，不用回来改本文件。
+        **两种工具，两种收法**
+        --------------------
+        `@tool` 服务方法        走一遍包**只是触发 import** —— 真正的登记
+                                发生在各模块的类体执行时（`__set_name__`）。
+                                这里不解析模块内容，因此新增一个 .py
+                                文件就自动生效，不用回来改本文件。
+
+        模块级 langchain 工具   它**没有描述符协议**（是模块命名空间里的
+                                一个 BaseTool 实例，不是类的方法），
+                                import 不会登记任何东西 —— 必须遍历模块
+                                属性去找。见 `_register_langchain_tools`。
+
+        ⚠️ 第二种曾经整条缺失
+        -------------------
+        后果不是"少一个工具"，而是**同步与运行时对不上**：同步那条路
+        （`LangchainToolScanner` → `tool_definition`）看得到它，而
+        `select_specs` 只读本注册表 —— 于是库里明明有这条工具，模型却
+        永远拿不到，每一轮只留一条容易被忽略的 WARNING。
         """
 
-        for package_name in (
+        target_packages = (
                 packages
                 if packages is not None
                 else TOOL_SOURCE_PACKAGES
-        ):
+        )
+
+        for package_name in target_packages:
             self._import_package(package_name)
 
+        self._register_langchain_tools(target_packages)
+
         return self.all()
+
+    def _register_langchain_tools(
+            self,
+            packages: tuple[str, ...],
+    ) -> None:
+        """
+        登记模块级的 langchain 工具。
+
+        ⚠️ 惰性 import：`scanner.py` 在**模块级** import 本模块
+        （它要用 TOOL_SOURCE_PACKAGES 与 iter_package_modules），
+        反向 import 只有放进函数体才不会成环。
+
+        发现逻辑复用 `iter_langchain_tools` —— 与同步那条路是**同一个**
+        遍历。各写一份的话，两处对"哪些算模块级工具"的判定早晚分叉，
+        而那正是这个方法出现之前那个 bug 的形状。
+        """
+
+        from .scanner import iter_langchain_tools
+
+        for value, module, attr_name in iter_langchain_tools(packages):
+
+            declared = getattr(module, SOURCE_REF_VARIABLE, None)
+
+            source_ref = (
+                declared
+                if isinstance(declared, str) and declared
+                else derive_source_ref(module.__name__)
+            )
+
+            name = getattr(value, "name", None) or attr_name
+
+            self.register(
+                ToolSpec(
+                    tool_key=f"{source_ref}.{name}",
+                    name=name,
+                    # 没有 owner 类 —— 执行时直接调 `tool`
+                    # （见 infra/agent/tool_executor.py 的分支）。
+                    tool=value,
+                    description=getattr(value, "description", None),
+                    source_ref=source_ref,
+                )
+            )
 
     def _import_package(self, package_name: str) -> None:
         """
@@ -170,16 +240,24 @@ def iter_package_modules(
     """
     导入一个包下的全部子模块，并逐个交出来。
 
-    两处要用，所以抽成公共函数：
-        ToolRegistry.scan()       触发 @tool 自注册
-        LangchainToolScanner      找模块级的 BaseTool 实例
+    两个调用点：`ToolRegistry.scan()`（触发 @tool 自注册）与
+    `LangchainToolScanner`（找模块级的 BaseTool 实例）。
 
-    包不存在时只警告、不抛：TOOL_SOURCE_PACKAGES 里可能有还没落地
-    的模块（例如 file 目前就没有带工具的服务），那不该让整次同步
-    失败。
+    遍历本身在 `app/common/utils/reflection.py`（本项目四个注册表共用
+    同一套发现机制）。**本函数保留**，因为它是工具侧的公开出口
+    （`__all__` 与 registry/__init__.py 都转发它），而且它带一条
+    工具侧独有的策略：
 
-    不依赖各包的 __init__.py 逐个 re-export：新增一个 .py 文件就
-    自动生效，不用回来改任何清单。
+        包不存在时只警告、不抛 —— TOOL_SOURCE_PACKAGES 里可能有还
+        没落地的模块（例如 file 目前就没有带工具的服务），那不该让
+        整次同步失败。
+
+    ⚠️ 这条策略的作用域是**包自己的 import**，不含包内某个模块。
+    "包不存在"与"包在、但里面某个 .py import 崩了"是两回事：前者该
+    跳过，后者是真实的代码错误，必须让它炸出来。所以这里自己
+    `import_module`，只把**遍历**交给 `iter_module_tree` —— 直接
+    `yield from iter_package_modules(...)` 会让那个 try 连子模块的
+    ImportError 一起吞掉，并把它们误报成"包不存在"。
     """
 
     try:
@@ -191,14 +269,7 @@ def iter_package_modules(
         )
         return
 
-    if not hasattr(package, "__path__"):
-        return
-
-    for module_info in pkgutil.walk_packages(
-            package.__path__,
-            package.__name__ + ".",
-    ):
-        yield importlib.import_module(module_info.name)
+    yield from iter_module_tree(package)
 
 
 #: 进程级单例。装饰器在 import 期就要拿到它，没有注入的入口。

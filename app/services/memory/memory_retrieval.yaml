@@ -1,0 +1,1231 @@
+openapi: 3.1.0
+
+info:
+  title: Memory Retrieval API（四层记忆的检索与组装）
+  version: 1.0.0
+  description: |
+    **给前端的管理员视图**：查某个 (用户|团队) + agent 的记忆，以及把结果
+    与 `memory_retrieval` 的 system_prompt 拼装起来**预览**。
+
+    两类入口
+    ------
+        汇总    POST /memory/retrieval            一次调用给出 prompt 的分段结构
+                                                   + 拼装好的预览文本
+        单层    POST /memory/retrieval/l0|l1|l2|l3 每层各自的形状与条数
+
+    ## 查询条件：`(user_id / team_id 二选一) + agent_id`
+
+    这是所有端点的**共同入口**（`target`），没有它任何一层都无从查起：
+
+        user_id 或 team_id    **恰有一个** —— 个人记忆 / 团队记忆二选一
+        agent_id             必填。它是业务键的另一半（写入侧存的是 L1 记忆上的
+                             `business_agent_id`，即 duty_key）
+
+    ⚠️ API 叫 `team_id`，库里那一列叫 `org_id`
+    ------------------------------------
+    同一个东西两个名字：JWT 的 org claim 写进 `agent_session.org_id`，而
+    契约与前端一直叫它 team（见 todolist："team_id 我直接使用 jwt 中的
+    org_id"）。本文件统一用 `team_id`，读代码时按这条对上。
+
+    ## ⚠️ 召回**默认跨会话**
+
+    L0/L1 的检索**不按会话收窄** —— 一个用户（或团队）的多个会话一起召回。
+    要限定单个会话就**额外传 `session_id`**，那时 L0/L1 再加一层会话过滤
+    （L2/L3 不看它：这两层的粒度是 scope，不是会话）。
+
+    ⚠️ 与 memory.yaml / memory_atom.yaml 的关系
+    --------------------------------------
+    那两个文件是**面向使用者**的检索（也是暴露给模型的工具）：身份从 token
+    取，请求体同时是 `bind_tools` 的 schema，所以 `user_id` / `org_id` 刻意
+    **不进请求体** —— 否则模型能填一个别人的 id，那是跨租户读。
+
+    本文件是**另一组端点**（前端展示用）：查谁由前端显式指定。所以**不能**
+    给那两个端点加 `target`，只能另开 —— 这条不是风格问题，是那两个 body 的
+    身份约束决定的。
+
+    ## ⚠️ 权限：要求 `Y-Trader-Admin` 角色
+
+    本组端点**全部**要求调用者持有该角色（见 securitySchemes 与 403 响应）。
+
+    ⚠️ 这是本仓库**第一次**在 HTTP 端点级按角色放行
+    -----------------------------------------
+    现状是：
+
+        登录门槛      `required_groups`（any-of），不过就 403，整棵树都进不来
+        角色          从 JWT 的 `roles` claim 取出来放进 `AuthenticatedUser`，
+                      **但没有任何 HTTP 端点用它** —— 目前唯一的消费者是
+                      **工具级**的 checkauth 拦截器
+                      （app/agent/tools/processor/interceptor/auth.py）
+
+    所以落地时要做的是：给本组路由挂一个 `require_role("Y-Trader-Admin")`
+    依赖，**匹配语义抄工具级那一套**（精确相等，不做"取 `/` 之后那段"的宽松
+    匹配 —— 那个宽松写法会让任何 owner 下的同名角色都通过，工具级明确拒绝
+    过它；配置里要写 token 里出现的那个形式，`/auth/me` 的 `roles` 就是原文）。
+
+    ⚠️ 与 dev-bypass 的相互作用（落地时会撞到）
+    ------------------------------------
+    鉴权关掉时（`app/main.py` 的本地开发开关），bypass 身份里的
+    `roles` 是**刻意留空**的（见 component.py 那段说明：凭空给几个角色会让
+    "本地能跑、生产拒绝同一个调用"）。因此：
+
+        auth 关闭 -> 本组端点 403（不是 500，也不是放行）
+
+    本地要调它就得走真 token；把角色塞进 bypass 是**另一条**决定，那会引入
+    上面那种本地/生产的差异，别顺手做。
+
+    ## ⚠️ 默认携带什么：L2/L3 恒带，L0/L1 **默认不检索**
+
+    这是本契约最重要的一条默认值，照 `tencentAgentMemory` 的分工：
+
+        L2 场景索引   **默认带**  —— 只带索引（filename + summary + heat），
+                                  不带场景全文
+        L3 画像       **默认带**  —— 一个 scope 一篇，本来就只有一两千字符
+        L1 原子记忆   **默认不检索** —— 要显式打开（`retrieve.l1`）
+        L0 原始对话   **默认不检索** —— 要显式打开（`retrieve.l0`）
+
+    理由是把"每轮都要付的钱"与"这一轮需要才付的钱"分开：
+
+        默认形态 = 画像 + 场景索引 ≈ 几句话的量级，**每一轮都能负担得起**
+        L0/L1   = 一次真正的检索（两路召回 + 融合 + 条数），是**按需**的动作：
+                  "之前说过什么""我们定过什么"这类问题出现时才值得付
+
+    所以默认返回里通常只有 persona 与 scenes 两段 —— 对**前端展示**来说这也
+    是合理的默认：先给人看"这个用户有什么画像、分了哪些场景"（两段都是短文本），
+    而"真的去翻记忆"是操作者勾上 L0/L1 才付的一次检索。
+
+    L2 只给索引，是因为它的用途本来就是**导航**（"这件事在哪一篇里"）——
+    要正文按 scene 取（见 `/memory/retrieval/l2`）。
+
+    ## ⚠️ 本组端点**不调模型**，但会**拼一份 prompt 预览**
+
+    检索侧：L0/L1 走既有的 hybrid 召回，L2 是**列举**（见下），L3 是取那一篇。
+    没有任何一次模型调用。
+
+    组装侧：汇总端点除了分段结构，还返回**拼装好的预览**（`prompt.system` +
+    `prompt.user`）—— 给前端展示"勾了这些之后会拼出什么"。
+
+    ⚠️ 排版仍然归提示词模块，不在这份契约里
+    ------------------------------
+    `prompt.user` 是按 `app/agent/prompt/prompts/memory_retrieval.py` 的渲染
+    函数拼的（见 prompts/__init__.py 的约定：静态文本与动态块都住在提示词
+    文件里）。契约只规定**结构**（`sections`）与**回什么**，不规定分隔符与
+    小节标题怎么写 —— 否则"提示词长什么样"就有两个答案。
+
+    ## ⚠️ L2 没有检索，只有列举（这一层与另外三层不同）
+
+    `memory_scene` **没有挂载表**（既没有 FTS 也没有向量索引）—— 那是写入侧的
+    刻意取舍：一个 scope 的场景文件上限十几篇，生产侧本来就是整段拼进提示词的。
+
+    于是 L2 的"查询"是：**把该 scope 的场景列出来**（默认不带全文，只给
+    filename + summary + heat），需要全文时用 `include_content` 显式要。这比
+    造一套索引合理：十几行的语料，检索的复杂度买不到任何东西。
+
+    ⚠️ 真要按词筛选只能在 `content` 上做 ILIKE —— 而 Postgres 这个实例没有
+    中文分词配置，ILIKE 只能整串匹配，对中文的实际效果很差。所以 `query` 在
+    L2 是**可选**的，而且默认不用它筛。
+
+    ## ⚠️ 团队 target 下 L0/L1 **今天查不了**（能力缺口，如实说）
+
+    L2/L3 本来就是按 (agent_id + user_id 或 team_id) 聚合的，两种 target 都行。
+    但 **L0/L1 没有"按 team 查"这条路径**：
+
+        memory_atom / agent_message_fts 里 org_id 只是**元数据**，
+        检索的过滤维度只有 session_id 与 user_id（见 models/sqlalchemy/
+        _scope.py 的说明：org_id "不参与过滤"是当初刻意的立场）
+
+    所以：
+
+        汇总端点   团队 target 下开了 l0/l1 -> 那两段**不出现**，
+                   并在 `degraded` 里说明原因（不静默少一段）
+        单层端点   团队 target 调 /l0 或 /l1 -> **400**（整个请求就是这一层，
+                   没有"部分成功"可言）
+
+    要真支持，得选一条：给两张表加 org 过滤维度（推翻上面那条"不参与过滤"
+    的立场），或者先按团队解析出成员再逐个按 user 查（贵，而且语义上
+    "团队里所有人说过的话"本身是个隐私面更大的操作）。**这条要你定。**
+
+    ## ⚠️ scope 的口径必须与写入侧逐字一致
+
+    读写两侧对"这份画像属于谁"的判断必须是同一套，否则症状是"明明有数据却
+    一条都查不到"，而不报错：
+
+        org_id 有值     团队：按 (agent_id, org_id) 聚合
+        org_id 为空     个人：按 (agent_id, user_id) 聚合
+        agent_id 缺省   `default`（写入侧 DEFAULT_AGENT_ID 的同一个值）
+
+    同一个 scope 下 user_id 与 org_id **恰有一个**（库里有 CHECK 兜底）。两个
+    都传不算错：**org 赢**，user_id 被忽略 —— 与写入侧的 `SceneScope.resolve`
+    一致。
+
+servers:
+  - url: /api/v1
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Memory Retrieval
+    description: 四层记忆的检索与 system_prompt 组装（管理员视图）
+
+
+paths:
+
+  /memory/retrieval:
+    post:
+      tags:
+        - Memory Retrieval
+      summary: 一次调用，给出 memory_retrieval 那段 system_prompt 的结构
+      operationId: retrieveMemory
+      description: |
+        用**用户这一轮的输入**当查询，把四层记忆各取一段，按 prompt 里的顺序
+        排好返回。
+
+        ⚠️ 返回**两样东西**：分段结构 + 拼装好的预览
+        ------------------------------------
+        `sections`   分段的数据，每段是 `{block, layer, title, items}`。
+                     `block` 是渲染时要选哪套模板的标识（`persona` / `scenes` /
+                     `facts` / `conversation`）—— 前端按它选卡片形状。
+        `prompt`     结构与 `memory_retrieval` 的 system_prompt 拼装之后的
+                     预览文本（`system` 是常量、`user` 是这次的数据）。
+
+        排版归提示词模块（见文件开头），所以 `prompt.user` 是**渲染函数**的
+        产物，不是这里拼的字符串。
+
+        ⚠️ 分段的**顺序**就是 prompt 里的顺序：从最抽象到最原始
+        ------------------------------------------------
+            persona       L3 画像 —— 最稳定，且永远只有一篇（最便宜的那一段）
+            scenes        L2 情境 —— 十几篇，只带摘要
+            facts         L1 原子记忆 —— 检索出来的事实
+            conversation  L0 原文 —— **默认不带**（见 budget）
+
+        把 L0 放最后并且默认关掉是有理由的：调用方（主 agent）的上下文里本来
+        就有最近几轮的原文，再从记忆里塞一遍是重复；而 L0 的每一条都对得上
+        `memory/search` 的命中，要原文时按需再调那一个端点更省。
+
+        ⚠️ 开哪几层由 `retrieve` 决定，条数由 `limits` 决定
+        -------------------------------------------
+        **两个旋钮，不是一件事**：`retrieve.l0 = true` 是"这一轮要去翻原始
+        对话"，`limits.l0` 是"最多给几条"。默认见 `MemoryRetrievalConfig` ——
+        L0/L1 默认**关**，L2/L3 默认**开**（理由见文件开头那段）。
+
+        关掉的层**不出现在 `sections` 里**（不是给一段空的）：一段空的 `items`
+        与"这一层压根没要"对渲染方是两件事。
+
+        ⚠️ L2 段**只给索引**，不给全文
+        -----------------------
+        索引 = filename + summary + heat（导航用）。全文刻意不在这个端点里给：
+        十几篇 × 1500 字符 ≈ 9k token，而它的用途本该是"先看有哪些场景、需要
+        哪一篇再去取"。要正文走单层的 `/memory/retrieval/l2`（那边有
+        `include_content`）。
+
+        ⚠️ 某一层没答上来**不失败整次调用**
+        ---------------------------
+        与 L0/L1 的 `degraded_routes` 同一立场：能取到的部分是真正可用的，
+        取不到的那层如实汇报在 `degraded` 里，并在服务端留一条 warning。静默
+        少一段是最坏的结果 —— 调用方会以为"这个人没有画像"。
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryRetrievalRequest'
+
+      responses:
+        '200':
+          description: 分段结构（可能带 degraded）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryRetrievalPrompt'
+
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+  /memory/retrieval/l0:
+    post:
+      tags:
+        - Memory Retrieval
+      summary: L0 单查 —— 原始对话的 hybrid 召回
+      operationId: retrieveMemoryL0
+      description: |
+        与 `POST /memory/search`（memory.yaml）**同一套检索**，差别只有两处：
+
+            target 进请求体      管理员视图要能取别人的；那个端点不能
+            要求 Admin 角色       本组端点的统一门槛
+
+        ⚠️ 命中是**片段**，不是整条消息
+        -------------------------
+        与 memory.yaml 一致：要整条原文就拿 `message_id` 去 messages.yaml 取。
+        片段长度是服务侧的事 —— 它按"让命中可读"来定，不是"把整条塞进去"。
+
+        ⚠️ 这是四层里**最贵**的一层
+        --------------------
+        候选项是原始消息，条数与长度都是对话的性质。默认 limit 比 L1 小，且
+        在汇总端点里默认压根不带它。
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L0RetrievalRequest'
+
+      responses:
+        '200':
+          description: 召回结果（可能带 degraded_routes）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L0RetrievalResponse'
+
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+  /memory/retrieval/l1:
+    post:
+      tags:
+        - Memory Retrieval
+      summary: L1 单查 —— 原子记忆的 hybrid 召回
+      operationId: retrieveMemoryL1
+      description: |
+        与 `POST /memory-atom/search`（memory_atom.yaml）同一套检索，同样只差
+        `target` 进请求体与角色门槛。
+
+        ⚠️ 正文**整条返回，不截断**
+        ----------------------
+        一条 L1 记忆已经是提炼过的陈述，截断会把"喜欢 X，但**不能** Y"切成
+        半句 —— 那比不返回更糟。与 memory_atom.yaml 同一条取舍。
+
+        ⚠️ score 只在**同一次响应内**可比
+        ---------------------------
+        关键词路是 ts_rank、向量路是余弦相似度，融合按名次做。跨调用（或跨
+        mode）不能拿来比阈值。
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L1RetrievalRequest'
+
+      responses:
+        '200':
+          description: 召回结果（可能带 degraded_routes）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L1RetrievalResponse'
+
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+  /memory/retrieval/l2:
+    post:
+      tags:
+        - Memory Retrieval
+      summary: L2 单查 —— 列出该 scope 的场景文件
+      operationId: retrieveMemoryL2
+      description: |
+        **列举，不是检索** —— 见文件开头那段（L2 没有挂载表，一个 scope 也就
+        十几篇，检索的复杂度买不到东西）。
+
+        默认只回 `filename` + `summary` + `heat`；`include_content` 才带全文。
+        `summary` 与 `heat` 是从 `content` 的 META 块解析出来的（写入侧也是
+        按需解析，没有单独的列）。
+
+        ⚠️ `query` 给了也只是在 `content` 上做 ILIKE
+        --------------------------------------
+        用途仅限于"文件名/正文里确实有这个子串"，**不是**语义检索；对中文的
+        命中率取决于措辞是否一致。要真正的语义检索得先给场景表加挂载表（那是
+        写入侧的改动），当前没做。
+
+        ⚠️ 排序：默认 `updated_at` 倒序
+        -------------------------
+        最近被整合过的场景在前。"按热度"排序需要解析每篇的 META（十几行，代价
+        可接受），当前没做 —— 需要时再加 `order` 参数。
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L2RetrievalRequest'
+
+      responses:
+        '200':
+          description: 该 scope 的场景列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L2RetrievalResponse'
+
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+
+  /memory/retrieval/l3:
+    post:
+      tags:
+        - Memory Retrieval
+      summary: L3 单查 —— 取该 scope 的画像
+      operationId: retrieveMemoryL3
+      description: |
+        一个 scope **只有一篇**画像（`persona.md`），所以这是"取"而不是"查"。
+
+        ⚠️ 没有画像是**正常状态**，不是 404
+        -----------------------------
+        `persona: null` = 这个 scope 还没生成过画像（L3 的生产侧还没落地，见
+        todolist）。与"scope 不存在"不同 —— 后者在管理员视图下**不判**：任何
+        没见过的 scope 都只是"还没有数据"，返回空而不是 404（判存在要回表查
+        会话，而这里本来就没有"这个用户存不存在"的概念）。
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetrievalTargetRequest'
+
+      responses:
+        '200':
+          description: 画像（可能为 null）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L3RetrievalResponse'
+
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+
+components:
+
+  securitySchemes:
+
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Casdoor 签发的访问令牌：`Authorization: Bearer <access_token>`。
+
+        ⚠️ 本组端点在这道令牌之上**再加一道角色门槛**（见文件开头）：
+        token 里的 `roles` claim 必须命中 `Y-Trader-Admin`，否则 403。
+
+
+  schemas:
+
+    RecallMode:
+      type: string
+      enum:
+        - hybrid
+        - keyword
+        - vector
+      description: |
+        跑哪几路召回。`hybrid` 两路都跑并按名次融合。
+
+        ⚠️ 与 memory.yaml / memory_atom.yaml 的同名枚举**取值域一致**，但各自
+        定义各的一份（OpenAPI 组件不能跨文件 $ref）。三处要一起改 ——
+        分叉的症状是"某个 mode 在某一层不认"，而那不报错、只是少召回。
+
+    ScopeKind:
+      type: string
+      enum:
+        - user
+        - team
+      description: |
+        由 `target` 解析出来的归属类型（`org_id` 有值是 team，否则 user）。
+        回显它是为了让调用方知道**自己的 target 被解析成了哪一种** ——
+        "我以为查的是团队记忆、其实查的是个人记忆"是最容易发生的一类误读，
+        而两种查询在数据上都是合法的空结果。
+
+    RetrievalTarget:
+      type: object
+      required:
+        - agent_id
+      description: |
+        查询条件：**(user_id / team_id 二选一) + agent_id**（见文件开头）。
+
+        口径与写入侧（`SceneScope.resolve`）逐字相同 —— 不一致的症状是
+        "有数据却一条都查不到"，而且不报错。
+
+            team_id 有值    团队：按 (agent_id, team_id) 聚合
+            user_id 有值    个人：按 (agent_id, user_id) 聚合
+            agent_id        必填（写入侧缺省成 `default`，但那是个兜底，
+                            不该出现在查询入口）
+
+        ⚠️ 两个都给是 **400**（不是"org 赢"）
+        ------------------------------
+        与写入侧不同：那边遇到两个都有值时会**丢掉 user_id**（它是从会话上
+        读出来的，不是调用方填的），而这里两个都是调用方填的 —— "我到底查的
+        是哪个"必须当场说清楚，静默丢掉一个是最糟的处理方式。
+      properties:
+        user_id:
+          type: string
+          description: 个人记忆的归属用户（Casdoor 的 sub）。
+        team_id:
+          type: string
+          description: |
+            团队记忆的归属组织。**库里那一列叫 `org_id`**（JWT 的 org claim
+            写进 `agent_session.org_id`）—— 同一个东西两个名字，见文件开头。
+        agent_id:
+          type: string
+          description: |
+            归属的 agent。写入侧取的是 L1 记忆上的 `business_agent_id`
+            （duty_key）。**必填**：传错的表现是**空结果**而不是报错（一个
+            scope 下没有数据，与"scope 写错了"长得一样），所以它必须显式给。
+      oneOf:
+        - required:
+            - user_id
+        - required:
+            - team_id
+
+    MemoryRetrievalConfig:
+      type: object
+      description: |
+        这次要不要去**翻**某一层。L0/L1 是真正的检索（两路召回 + 融合），
+        L2/L3 是取（列举 / 取一篇）—— 但四层都给开关，理由是不给的话
+        "只要事实、不要画像"这类调用无从表达。
+
+        默认值就是 `tencentAgentMemory` 的分工：**L2/L3 恒带，L0/L1 默认不检索**。
+        改默认值等于改"每轮注入多少上下文"这条基线，别顺手改。
+      properties:
+        l0:
+          type: boolean
+          default: false
+          description: 是否检索 L0（原始对话）。开了才跑关键词 + 向量两路召回。
+        l1:
+          type: boolean
+          default: false
+          description: 是否检索 L1（原子记忆）。
+        l2:
+          type: boolean
+          default: true
+          description: |
+            是否带 L2 场景索引。**默认开**，而且只带索引（不带全文）。
+            关掉它的典型场景：只要事实、不要场景导航（比如一次纯问答）。
+        l3:
+          type: boolean
+          default: true
+          description: |
+            是否带 L3 画像。**默认开** —— 它是一篇一两千字符的文档，是四层里
+            最便宜、信息密度最高的一段。
+
+    MemoryLimits:
+      type: object
+      description: |
+        各层的条数上限。**只在对应层被打开时有效** —— 关掉的层给多少条都
+        不会出现（见 `MemoryRetrievalConfig`）。
+
+        默认值不是随手取的：
+
+            l0     5    候选项是**原始消息**，一条片段 400 字符左右；5 条 ≈ 2k
+                        字符。这是"找回当时那句话"够用的量，再多是噪声
+            l1    10    L1 是提炼过的陈述，信息密度高，10 条覆盖绝大多数
+                        "之前说过什么"
+            l2    12   与**写入侧的场景数上限**同一个数（`DEFAULT_MAX_SCENES`）
+                        —— 一个 scope 最多也就这么多篇，取小了会漏掉排在后面
+                        的场景；取大了没意义（没有那么多）
+      properties:
+        l0:
+          type: integer
+          minimum: 1
+          default: 5
+        l1:
+          type: integer
+          minimum: 1
+          default: 10
+        l2:
+          type: integer
+          minimum: 1
+          default: 12
+
+    MemoryRetrievalRequest:
+      type: object
+      required:
+        - input
+        - target
+      properties:
+        input:
+          type: string
+          minLength: 1
+          description: |
+            **用户这一轮的输入**（原话）。它同时是：
+
+                检索的 query       L0/L1 的关键词路与向量路都拿它去召回
+                回显            响应里带回来，便于把一次调用与它服务的
+                                那一轮对上
+
+            ⚠️ 传"总结过的意图"还是"原话"，效果不同：向量路对原话更准
+            （分词与 embedding 都是按自然语言调的），而调用方自己总结一遍
+            等于替模型做了它更擅长的事。默认传原话。
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        session_id:
+          type: string
+          format: uuid
+          description: |
+            **可选**。不给就是跨会话召回（默认，见文件开头）；给了则在 L0/L1
+            上**再加一层会话过滤**：
+
+                L0/L1  按该会话收窄
+                L2/L3  不受影响（粒度是 scope，不是会话）
+
+            ⚠️ 这里**不校验归属**：前端视图下"查谁的记忆"由 `target` 决定，
+            这个 id 只是个过滤条件。会话不存在 = 空结果（不是 404）—— 与
+            使用者视图那边刻意不同（那边 session_id 是身份的一部分，
+            别人的会话必须 404）。
+        mode:
+          $ref: '#/components/schemas/RecallMode'
+          default: hybrid
+          description: |
+            只作用于**被打开的那两层检索**（L0/L1）。L2/L3 不走召回，不看它。
+        retrieve:
+          $ref: '#/components/schemas/MemoryRetrievalConfig'
+        limits:
+          $ref: '#/components/schemas/MemoryLimits'
+
+    PersonaRecord:
+      type: object
+      required:
+        - content
+        - filename
+        - version
+        - updated_at
+      properties:
+        content:
+          type: string
+          description: 整篇 `persona.md`（含 META 块），**不截断**。
+        filename:
+          type: string
+          description: 恒为 `persona.md`。带上是为了让渲染方不用知道这个约定。
+        version:
+          type: integer
+          description: 乐观锁基线（写入侧每次改写 +1）。对读方是"改过几次"。
+        updated_at:
+          type: string
+          format: date-time
+
+    SceneRecord:
+      type: object
+      required:
+        - filename
+        - summary
+        - heat
+        - version
+        - updated_at
+      properties:
+        filename:
+          type: string
+          description: |
+            场景文件名（相对 `scene_blocks/` 的路径，本仓库里就是纯文件名）。
+            **它是这一段的身份** —— L1 记忆上的 `scene_name` 与它同源。
+        summary:
+          type: string
+          description: |
+            META 块里的摘要。可能为空（存量场景没写 META）—— 空串是"没有摘要"
+            这个事实，不是"没取到"。
+        heat:
+          type: integer
+          description: |
+            热度（写入侧的合成规则：新建 1 / 更新 旧+1 / 合并 sum+1）。
+            没写或解析不出整数时为 null —— 不是 0（0 是一个有意义的取值）。
+        content:
+          type: string
+          description: |
+            场景全文（含 META 块）。**只在 `include_content` 为 true 时出现**；
+            省略表示"本次没要"，不是"场景是空的"。
+        version:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+
+    FactRecord:
+      type: object
+      required:
+        - record_id
+        - content
+        - type
+        - priority
+        - version
+        - updated_at
+      description: 一条 L1 原子记忆（`memory_atom` 的一行）。
+      properties:
+        record_id:
+          type: string
+          format: uuid
+          description: |
+            ⚠️ 它只在**一次写入内**稳定：merge 保留存活行的 id、删掉被它吃掉
+            的那几条。持有长期引用的调用方要接受这件事。
+        content:
+          type: string
+          description: 记忆陈述，整条返回，不截断（见 /memory/retrieval/l1）。
+        type:
+          type: string
+          description: |
+            persona / episodic / instruction（work_* 四类还没做）。词表会长，
+            所以刻意**不是**枚举。
+        priority:
+          type: integer
+          description: |
+            0-100，-1 = 全局死命令。**不参与排序与过滤** —— 返回它是让调用方
+            （尤其是模型）自己权衡，顺序只由 `score` 决定。
+        scene_name:
+          type: string
+          description: 这条记忆所属的情境名（与 L2 的场景文件名同源，自由文本）。
+        version:
+          type: integer
+        timestamp_str:
+          type: string
+          description: |
+            提示词推出来的时间线主值（TEXT，可能是 "2018 年" 这类半成品）。
+            **不要拿它做范围过滤** —— 要么报错要么静默错。
+        score:
+          type: number
+          description: 融合分，只在同一次响应内可比。
+        matched_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecallRoute'
+        updated_at:
+          type: string
+          format: date-time
+          description: 最后一次被写入/合并的时间（增量对账也是按它）。
+
+    ConversationRecord:
+      type: object
+      required:
+        - message_id
+        - session_id
+        - seq
+        - role
+        - text
+        - created_at
+      description: |
+        一条 L0 命中 —— 与 memory.yaml 的 `MemorySearchHit` 同一形状（同一套
+        检索、同一套片段规则），这里重新声明是为了让本文件自成一体。
+      properties:
+        message_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        seq:
+          type: integer
+          description: 会话内序号（取邻居、翻页都用它；允许有空洞）。
+        role:
+          type: string
+          enum:
+            - user
+            - assistant
+        text:
+          type: string
+          description: 命中片段（原文，不是分词后的形式）。
+        created_at:
+          type: string
+          format: date-time
+        score:
+          type: number
+        matched_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecallRoute'
+
+    RecallRoute:
+      type: string
+      enum:
+        - keyword
+        - vector
+      description: 一路召回。名字与两张挂载表对应。
+
+    PersonaSection:
+      type: object
+      required:
+        - block
+        - layer
+        - title
+        - items
+        - returned
+        - truncated
+      properties:
+        block:
+          const: persona
+        layer:
+          const: l3
+        title:
+          type: string
+        items:
+          type: array
+          description: 0 或 1 条 —— 一个 scope 只有一篇画像。
+          items:
+            $ref: '#/components/schemas/PersonaRecord'
+        returned:
+          type: integer
+        truncated:
+          type: boolean
+
+    SceneSection:
+      type: object
+      description: |
+        L2 场景段的**索引**：一行一个场景，只有 filename + summary + heat，
+        **没有 `content`** —— 汇总端点刻意不带正文（见 /memory/retrieval 的说明）。
+        要正文走 `/memory/retrieval/l2`（那个端点有 `include_content`）。
+      required:
+        - block
+        - layer
+        - title
+        - items
+        - returned
+        - truncated
+      properties:
+        block:
+          const: scenes
+        layer:
+          const: l2
+        title:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SceneRecord'
+        returned:
+          type: integer
+        truncated:
+          type: boolean
+
+    FactSection:
+      type: object
+      required:
+        - block
+        - layer
+        - title
+        - items
+        - returned
+        - truncated
+      properties:
+        block:
+          const: facts
+        layer:
+          const: l1
+        title:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FactRecord'
+        returned:
+          type: integer
+        truncated:
+          type: boolean
+
+    ConversationSection:
+      type: object
+      required:
+        - block
+        - layer
+        - title
+        - items
+        - returned
+        - truncated
+      properties:
+        block:
+          const: conversation
+        layer:
+          const: l0
+        title:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConversationRecord'
+        returned:
+          type: integer
+        truncated:
+          type: boolean
+
+    PromptSection:
+      description: |
+        四段共有的形状由各自声明（不用 `allOf` 继承）—— 生成的客户端对
+        `allOf` + `discriminator` 的支持参差不齐，而这里只有四个字段的重复。
+
+        ⚠️ `title` 是**建议**的小节标题，渲染方可以不用
+        ----------------------------------------
+        真正决定"这段怎么排版"的是 `block`（选哪套模板）。`title` 只是给
+        "想直接拼进去"的调用方一个说得过去的默认值 —— 而模板本身住在提示词
+        模块里，不在这份契约里。
+      oneOf:
+        - $ref: '#/components/schemas/PersonaSection'
+        - $ref: '#/components/schemas/SceneSection'
+        - $ref: '#/components/schemas/FactSection'
+        - $ref: '#/components/schemas/ConversationSection'
+      discriminator:
+        propertyName: block
+        mapping:
+          persona: '#/components/schemas/PersonaSection'
+          scenes: '#/components/schemas/SceneSection'
+          facts: '#/components/schemas/FactSection'
+          conversation: '#/components/schemas/ConversationSection'
+
+    DegradedLayer:
+      type: object
+      required:
+        - layer
+        - reason
+      description: |
+        某一层没能参与这次组装。**必须如实汇报** —— 静默少一段会被读成
+        "这个人没有画像 / 没有相关记忆"，而那是另一个事实。
+
+        与 L0/L1 的 `degraded_routes` 是同一条纪律，粒度不同：那边是"哪一路
+        召回没跑"，这边是"哪一层没取到"。
+      properties:
+        layer:
+          type: string
+          enum:
+            - l0
+            - l1
+            - l2
+            - l3
+        reason:
+          type: string
+          description: 后端错误原文，或"还没接线"。同时写进 warning 日志。
+
+    MemoryRetrievalPrompt:
+      type: object
+      required:
+        - retrieval_id
+        - input
+        - target
+        - scope_kind
+        - sections
+        - degraded
+        - generated_at
+      description: |
+        `memory_retrieval` 那段 system_prompt 的**结构**。
+
+        ⚠️ 没有 `rendered` 字段，这是刻意的
+        -----------------------------
+        排版（分隔符、小节标题怎么写、空段跳不跳）归提示词模块，见文件开头。
+        想直接拼文本的调用方按 `sections` 的 `block` 选模板即可 —— 而"模板长
+        什么样"是从提示词文件里读出来的，不是从这份契约里猜的。
+      properties:
+        retrieval_id:
+          type: string
+          format: uuid
+          description: 标识这次调用，用于对日志与轨迹。
+        input:
+          type: string
+          description: 回显（见 MemoryRetrievalRequest.input 的说明）。
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+          description: 回显**实际生效**的 target（`agent_id` 缺省时这里会补上）。
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        sections:
+          type: array
+          description: |
+            按 prompt 里的顺序：persona -> scenes -> facts -> conversation。
+            **没打开的层不出现在这里**（不是给一段空的）—— 一段空的 `items`
+            与"这一层没要"对渲染方是两件事。
+
+            ⚠️ 默认请求（L0/L1 关）返回的就是**两段**：persona + scenes，而
+            `scenes` 里是**索引**（没有 `content` 字段）。这不是"少给了"，
+            是这一段的用途（导航）。
+          items:
+            $ref: '#/components/schemas/PromptSection'
+        degraded:
+          type: array
+          items:
+            $ref: '#/components/schemas/DegradedLayer'
+        prompt:
+          $ref: '#/components/schemas/MemoryRetrievalPromptText'
+        generated_at:
+          type: string
+          format: date-time
+
+    MemoryRetrievalPromptText:
+      type: object
+      required:
+        - system
+        - user
+      description: |
+        分段结构与 `memory_retrieval` 的 system_prompt **拼装之后**的预览。
+
+        ⚠️ 它是**展示**用的，不是注入路径的产物
+        --------------------------------
+        真正注入由调用方按同一份提示词模块渲染（排版只住在那儿）。这里回一份
+        拼好的，是为了让操作者一眼看到"勾了这些之后会拼出什么"。
+
+        分两半回而不是一整段：`system` 是常量（前端可以缓存、也可以压根不展示），
+        `user` 才是这次的数据。
+      properties:
+        system:
+          description: |
+            `memory_retrieval` 那段系统提示词。**每次调用都一样**（它是常量，
+            只随配置变）。
+
+            ⚠️ `null` = 那份提示词**还没写**（模块还没落地，见 todolist）——
+            与"提示词是空的"（空串）区分开。今天调这个端点通常拿到 null。
+          oneOf:
+            - type: string
+            - type: 'null'
+        user:
+          type: string
+          description: |
+            由 `sections` 渲染出来的用户消息 —— **预览的主体**。L0/L1 关着时
+            它就是画像 + 场景索引那两段。
+
+    RetrievalTargetRequest:
+      type: object
+      required:
+        - target
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+
+    L0RetrievalRequest:
+      type: object
+      required:
+        - target
+        - query
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        query:
+          type: string
+          minLength: 1
+        session_id:
+          type: string
+          format: uuid
+          description: 限定单个会话。不校验归属（见 /memory/retrieval 的说明）。
+        mode:
+          $ref: '#/components/schemas/RecallMode'
+          default: hybrid
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+          description: 融合**之后**的条数上限（不是每路的召回深度）。
+        roles:
+          type: array
+          items:
+            type: string
+            enum:
+              - user
+              - assistant
+          description: 限定消息角色。不传 = 两种都要（"我说过什么"与"你说过什么"都是正当问题）。
+        time_from:
+          type: string
+          format: date-time
+          description: created_at 下界（含）。按**记录时间**，不是正文里提到的时间。
+        time_to:
+          type: string
+          format: date-time
+          description: created_at 上界（含）。
+
+    L1RetrievalRequest:
+      type: object
+      required:
+        - target
+        - query
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        query:
+          type: string
+          minLength: 1
+        session_id:
+          type: string
+          format: uuid
+          description: |
+            限定单个会话。给定时按会话收窄 —— 注意 L1 的**去重候选池**也是
+            会话级的，所以"按会话看"是它最自然的一种视角。
+        mode:
+          $ref: '#/components/schemas/RecallMode'
+          default: hybrid
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+
+    L2RetrievalRequest:
+      type: object
+      required:
+        - target
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        query:
+          type: string
+          description: |
+            可选。给了就在 `content` 上做 ILIKE 子串筛选 —— **不是**语义检索
+            （见操作说明）。不要用它当主要的筛选手段。
+        limit:
+          type: integer
+          minimum: 1
+          default: 50
+          description: |
+            默认 50，比一个 scope 的实际场景数上限（12）宽松得多：这里不该
+            因为一个默认值把场景截掉，`truncated` 是留给"确实超了"的。
+        include_content:
+          type: boolean
+          default: false
+
+    L0RetrievalResponse:
+      type: object
+      required:
+        - query
+        - mode
+        - scope_kind
+        - results
+        - degraded_routes
+      properties:
+        query:
+          type: string
+        mode:
+          $ref: '#/components/schemas/RecallMode'
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConversationRecord'
+        degraded_routes:
+          type: array
+          items:
+            $ref: '#/components/schemas/DegradedRoute'
+
+    L1RetrievalResponse:
+      type: object
+      required:
+        - query
+        - mode
+        - scope_kind
+        - results
+        - degraded_routes
+      properties:
+        query:
+          type: string
+        mode:
+          $ref: '#/components/schemas/RecallMode'
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/FactRecord'
+        degraded_routes:
+          type: array
+          items:
+            $ref: '#/components/schemas/DegradedRoute'
+
+    L2RetrievalResponse:
+      type: object
+      required:
+        - scope_kind
+        - query
+        - scenes
+        - truncated
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        query:
+          type: string
+          description: 回显；没给就是空串（这个端点只有这一个"可选回显"）。
+        scenes:
+          type: array
+          items:
+            $ref: '#/components/schemas/SceneRecord'
+        truncated:
+          type: boolean
+
+    L3RetrievalResponse:
+      type: object
+      required:
+        - scope_kind
+        - persona
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        persona:
+          description: 这个 scope 的画像；**null = 还没生成过**（见操作说明）。
+          oneOf:
+            - $ref: '#/components/schemas/PersonaRecord'
+            - type: 'null'
+
+    DegradedRoute:
+      type: object
+      required:
+        - route
+        - reason
+      description: 一路召回没能参与这一轮（记忆模块有两条固定路线，没有检索定义表，所以路线枚举就是全部身份）。
+      properties:
+        route:
+          $ref: '#/components/schemas/RecallRoute'
+        reason:
+          type: string
+
+
+  responses:
+
+    BadRequest:
+      description: >-
+        入参不成立。包括：
+
+            target 里 user_id 与 team_id 都没给，或者**都给了**
+            （两个都是调用方填的，"到底查哪个"必须当场说清楚 —— 与写入侧
+             "org 赢"不同，那是从会话上读出来的、不是调用方填的）
+            target 缺 agent_id
+            mode 取值不在枚举里；limit 越界
+            团队 target 调 L0/L1 单层端点（这两层今天没有按 team 的查法，
+            见文件开头 —— 汇总端点那边是 degraded，因为那里还有别的段可用）
+
+        都是调用方可以自己修的问题，所以是 400。
+
+    PermissionDenied:
+      description: >-
+        调用者没有 `Y-Trader-Admin` 角色。**403 而不是 404** —— 这与使用者
+        视图那边刻意相反（那边"不属于你的会话"是 404，因为它同时在隐藏
+        "这个 id 存不存在"）。管理员视图的这条只关于角色本身：够格的调用方
+        可以读任何人的记忆，所以没有"存在但不可见"这一档。
+
+        客户端文案刻意含糊（只说不符合），全部线索留在服务端日志 ——
+        与登录门槛那条 403 同一口径（见 app/common/auth/component.py）。
+
+    NotFound:
+      description: >-
+        只在**给了 `session_id` 但那个会话不存在**时返回。注意与使用者视图
+        的差别：那边 session_id 是身份的一部分（别人的会话必须 404），这边
+        它只是个过滤条件，所以"会话不在"与"这次没有命中"要分清 —— 前者说明
+        id 给错了，后者是正常结果。

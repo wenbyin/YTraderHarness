@@ -4,4 +4,10 @@
 /.idea/
 __pycache__/
 *.pyc
-/app/common/llm.yaml
+/.pytest_cache/
+/app/config/llm.yaml
+/app/config/casdoor.yaml
+/app/config/cert.pem
+/pytest.ini
+/milvus_flush_probe.py
+/todolist

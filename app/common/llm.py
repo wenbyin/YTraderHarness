@@ -22,10 +22,20 @@
 本地那套服务的是 embedding / reranker 这类必须在本机跑的小模型；这里的
 是生成式大模型，本机跑不动也没必要跑。）
 
-为什么配置读取放在 app/common 而不是 app/config
------------------------------------------------
-`app/config/` 被数据源加载器整目录扫描，多一个不含 `type` 的 yaml 会
-**直接让启动失败**。理由与取舍写在 `llm.yaml` 的开头。
+配置住在 app/config/，但不在被扫描的那个子目录里
+------------------------------------------------
+`llm.yaml` 与 casdoor、模型目录、事件流并排放在 `app/config/` 下，
+与读它的本模块**不同目录**。
+
+它不会被数据源加载器扫到，因为加载器只 glob 交给它的那**一个**目录，
+而 `app/main.py` 给它的是 `app/config/datasource/`（见
+infra/datasource/loader.py）。所以"不含 `type` 的 yaml 混在配置目录里"
+这件事在这里不成立 —— 它在上一层。
+
+（历史：这份配置原先住在 app/common/ 下，为的是躲开加载器的整目录
+扫描 —— 那时判据还是"没有 `type` 就 raise"，一个空文件都能让应用起不来。
+那条判据后来放宽成"跳过 + 打 warning"，躲的理由就没了，文件搬回了
+app/config/。见 tests/infra/test_datasource_loader.py。）
 
 密钥只在用的时候才校验
 ----------------------
@@ -36,21 +46,25 @@
 
 from __future__ import annotations
 
-import os
-import re
+from dataclasses import dataclass
 from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.common.utils import expand_env
+
 __all__ = [
+    "ChatModelWarmup",
     "LLMConfig",
     "LLMProviderConfig",
     "get_chat_model",
     "load_llm_config",
+    "warmup_chat_models",
 ]
 
 
@@ -58,8 +72,15 @@ __all__ = [
 #:
 #: 大多数家都在 `init_chat_model` 的支持列表里，这里列出**本项目实际用到**
 #: 的那几个，而不是把 27 个全抄一遍：多抄一个就多一处会过期的信息。
+#:
+#: ⚠️ 值可以是**别名**：本项目自己的 provider 名（llm.yaml 的键）与
+#: `init_chat_model` 认的名字不必相同。qwen 就是这一种 —— 它的端点是
+#: OpenAI 兼容的（`/compatible-mode/v1`），`init_chat_model` 也不认得
+#: "qwen" 这个名字，因此映射到它认得的 "openai"，由 base_url 指向
+#: 阿里那台（base_url 由 get_chat_model 从 provider 配置透传，见下）。
 _INIT_PROVIDERS: dict[str, str] = {
     "deepseek": "deepseek",
+    "qwen": "openai",
 }
 
 
@@ -79,18 +100,14 @@ _DIRECT_PROVIDERS: dict[str, tuple[str, str]] = {
     "moonshot": ("langchain_moonshot", "ChatMoonshot"),
 }
 
-#: 默认配置文件位置 —— 与读它的本模块同目录。
-DEFAULT_CONFIG_PATH = Path(__file__).with_name("llm.yaml")
-
-
-#: `${NAME}` / `${NAME:-default}`。
+#: 默认配置文件位置 —— app/config/llm.yaml。
 #:
-#: 与 infra/datasource/loader.py 的 `_expand_env` 是**同一套语法**，
-#: 但那边是那个类的私有方法、且绑着数据源的语义（必填项缺失就跳过整个
-#: 数据源），复用它反而要迁就那套语义。这里按同样的规则重写一份，
-#: 语法一致、行为独立。
-_ENV_PATTERN = re.compile(
-    r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}"
+#: 不再用 `Path(__file__).with_name(...)`：配置已经不住在本模块旁边了。
+#: 从 __file__ 往上推而不是写相对路径，理由和 tests 里那条一样 ——
+#: 相对路径只在 CWD 恰好是仓库根时成立，而"读配置"这件事在 IDE 里点运行、
+#: 从别处跑脚本时都会发生。
+DEFAULT_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1] / "config" / "llm.yaml"
 )
 
 
@@ -165,7 +182,7 @@ class LLMConfig(BaseModel):
             raise ValueError(
                 f"未知的 LLM provider: {name!r}。"
                 f"已配置的有：{known}。"
-                "请检查 app/common/llm.yaml。"
+                "请检查 app/config/llm.yaml。"
             )
 
         return name, config
@@ -192,16 +209,19 @@ def load_llm_config(
 
     raw = yaml.safe_load(file_path.read_text(encoding="utf-8")) or {}
 
-    return LLMConfig.model_validate(_expand_env(raw))
+    return LLMConfig.model_validate(expand_env(raw))
 
 
 def get_chat_model(
         provider: str | None = None,
         *,
+        model: str | None = None,
+        api_key: str | None = None,
         temperature: float | None = None,
         timeout: float = 120.0,
         max_retries: int = 2,
         config: LLMConfig | None = None,
+        **model_kwargs: Any,
 ) -> Any:
     """
     取一个配置好的 chat 客户端。
@@ -223,6 +243,38 @@ def get_chat_model(
     决定。实测 `kimi-k3` 只接受 1，传 0 直接 400 并让整个窗口失败。不传
     就没有这个风险。
 
+    `model` / `api_key` 是给 **Model 模块的 Factory** 留的覆盖口
+    ----------------------------------------------------------
+    本文件描述的是"一个 provider 怎么连"，而模型目录
+    （`app/agent/model/model.yaml`）描述的是"有哪些模型、用哪份凭据"。
+    同一个 provider 底下常常有多个模型（`deepseek-chat` /
+    `deepseek-reasoner`），也可能有多把 key（生产 / 沙箱 / 多租户），
+    所以这两个值必须能被调用方覆盖：
+
+        model      覆盖 llm.yaml 里该 provider 的 model
+                   （缺省 None = 不覆盖，保持既有行为）
+        api_key    覆盖 llm.yaml 里该 provider 的 api_key
+                   （缺省 None = 用配置里那份；给了就不再校验配置里
+                   那份是否为空 —— 覆盖的意义就是不用它）
+
+    这两个参数**不引入第二套配置**：连接信息、provider 分派、密钥展开
+    仍然只有本文件这一份。Model 模块只是把"用哪个模型 / 哪份凭据"
+    这两件事参数化。
+
+    `**model_kwargs` 是**provider 参数的透传口**
+    ------------------------------------------
+    `max_tokens` / `top_p` / `frequency_penalty` / `extra_body` 这类
+    参数**各家不同、也随模型变**，因此本文件不替它们定签名，原样交给
+    客户端构造。模型目录（model.yaml 的 `config:`）里的键就走这条路。
+
+    为什么值得留这个口子：不留下它，"某个模型要多一个参数"就只能改
+    本文件 —— 而那意味着**每接一个模型都要动共享内核**。有了它，
+    provider 特有的东西留在配置里（谁用谁负责），本文件只管"怎么连"。
+
+    已具名的参数（provider / model / api_key / temperature / timeout /
+    max_retries / config）不在其中：它们是**每个 provider 都成立**的
+    共同部分，因此有明确的默认与文档。
+
     惰性 import 的理由与 embedder/rerank 那边一致：这些客户端会拖起
     `openai` + `httpx` 一整串依赖，而本模块被 `app.common` 下的其他代码
     间接引用 —— 在模块顶层 import 它们会让"只想读个配置"的场景也付这份
@@ -233,11 +285,19 @@ def get_chat_model(
 
     name, provider_config = resolved.resolve(provider)
 
-    if not provider_config.api_key.strip():
+    # 覆盖优先。`api_key` 给了就不再要求配置里那份非空 —— 显式覆盖
+    # 的语义就是"不用那一份"。
+    effective_key = (
+        api_key if api_key is not None else provider_config.api_key
+    )
+
+    effective_model = model or provider_config.model
+
+    if not effective_key.strip():
         raise ValueError(
             f"LLM provider {name!r} 没有配置 API Key。"
             f"请设置环境变量后重启服务"
-            f"（见 app/common/llm.yaml 里 {name} 那段的 api_key）。"
+            f"（见 app/config/llm.yaml 里 {name} 那段的 api_key）。"
         )
 
     # 三级优先：调用方显式指定 > provider 配置 > **不传**。
@@ -252,10 +312,17 @@ def get_chat_model(
     )
 
     common: dict[str, Any] = {
-        "api_key": provider_config.api_key,
+        "api_key": effective_key,
         "timeout": timeout,
         "max_retries": max_retries,
     }
+
+    # provider 特有参数原样透传。
+    #
+    # 不可能覆盖上面那几个：provider / model / api_key / temperature /
+    # timeout / max_retries / config 都是**具名参数**，Python 不会把它们
+    # 同时收进 **model_kwargs。
+    common.update(model_kwargs)
 
     if effective_temperature is not None:
         common["temperature"] = effective_temperature
@@ -285,7 +352,7 @@ def get_chat_model(
                 "（见 requirements.txt）。"
             ) from exc
 
-        return client_class(model=provider_config.model, **common)
+        return client_class(model=effective_model, **common)
 
     # ---- 其余走 init_chat_model --------------------------
 
@@ -300,7 +367,7 @@ def get_chat_model(
 
     try:
         return init_chat_model(
-            provider_config.model,
+            effective_model,
             model_provider=_INIT_PROVIDERS.get(name, name),
             **common,
         )
@@ -319,41 +386,248 @@ def get_chat_model(
 
 
 # ============================================================
-# internals
+# 启动预热
 # ============================================================
 
 
-def _expand_env(value: Any) -> Any:
+@dataclass(frozen=True, slots=True)
+class ChatModelWarmup:
     """
-    递归展开配置里的 `${NAME}` / `${NAME:-default}`。
+    一次 provider 预热的账。
 
-    与数据源加载器同一套语法（含 `:-` 的 POSIX 语义：未设置**和**设置为
-    空串都算缺省）。区别只有一个：这里**没有"必填"的概念** —— 缺省值
-    省略时展开成空串，而不是抛异常。
-
-    理由：数据源缺 host 就没法工作，早失败是对的；而 LLM 的 key 缺了，
-    只影响真正要调 LLM 的那条路径。让"没配 key"在启动时就炸，会把
-    只用检索的场景一起拦下。
+    `warmed` 与 `skipped` **都要**记：只报一句"预热完成"会让"某一家
+    其实没装上 / 没配 key"这件事从启动日志里消失，而那正是之后某个
+    fallback 候选第一次被用到时才会炸的东西。
     """
 
-    if isinstance(value, dict):
-        return {key: _expand_env(item) for key, item in value.items()}
+    warmed: tuple[str, ...] = ()
 
-    if isinstance(value, list):
-        return [_expand_env(item) for item in value]
+    #: `(provider 名, 原因)`。原因分两种，见 `_NotWorthWarming`。
+    skipped: tuple[tuple[str, str], ...] = ()
 
-    if not isinstance(value, str):
-        return value
+    elapsed: float = 0.0
 
-    def replace(match: re.Match) -> str:
-        name = match.group(1)
-        default = match.group(2)
+    def describe(self) -> str:
+        """一行账，给启动日志用。"""
 
-        env_value = os.getenv(name)
+        parts = [f"已预热 {len(self.warmed)} 家"]
 
-        if env_value:
-            return env_value
+        if self.warmed:
+            parts.append("（" + "、".join(self.warmed) + "）")
 
-        return default if default is not None else ""
+        if self.skipped:
+            parts.append(
+                "；跳过 "
+                + "、".join(
+                    f"{name}（{reason}）" for name, reason in self.skipped
+                )
+            )
 
-    return _ENV_PATTERN.sub(replace, value)
+        parts.append(f"；耗时 {self.elapsed:.2f}s")
+
+        return "".join(parts)
+
+
+class _NotWorthWarming(Exception):
+    """
+    **有理由地**跳过 —— 与"热失败了"是两件事。
+
+    分开的理由：日志里"kimi（没配 API Key）"和
+    "kimi（ImportError: No module named 'langchain_moonshot'）"
+    该被读出不同的结论（一个是配置没开，一个是装少了包），
+    而合成一句"预热跳过 2 家"两种都看不出来。
+    """
+
+
+def warmup_chat_models(
+        config: LLMConfig | None = None,
+) -> ChatModelWarmup:
+    """
+    把 provider SDK 的 **import 成本**挪到启动阶段。
+
+    为什么需要
+    ----------
+    实测（loop_watchdog 抓到的现场）：进程起来后的**第一次**模型调用
+    会卡在 `get_chat_model` 里的一串惰性 import 上 ——
+
+        langchain.chat_models -> langchain_openai -> openai.types...
+
+    （挂在 PyCharm 调试器下这一串实测 7 秒）。而它是**同步**的、跑在
+    事件循环线程上，于是它按住循环的这段时间里，SSE 那条
+    `XREAD ... BLOCK 1000` 的读超时定时器在循环恢复的瞬间先到期，
+    把"回复早就到了"谎报成：
+
+        TimeoutError: Timeout reading from localhost:6379
+
+    也就是说：**那条 Redis 报错的根因在这里，与 Redis 无关**。完整
+    链路见 app/common/loop_watchdog.py 与 app/agent/event/reader.py
+    的模块 docstring。
+
+    预热把这份成本从"第一个请求"挪到"服务就绪之前"——总额不变，
+    但没人在这段时间里等。**它不是并发优化，是延迟搬家。**
+
+    为什么只热 import、不建客户端
+    -----------------------------
+    建客户端需要凭据、需要 definition（每个模型的 timeout / 参数都
+    不同），那是 `app/agent/model/` 的目录知识，不是本文件知道的。
+    本函数只用它能回答的那件事：**这个 provider 的包该不该 import**。
+    （要连客户端一起预热是另一件事，属于组合根 —— 见
+    app/agent/model/factory.py 里 ModelClientFactory 的说明。）
+
+    失败**不抛**
+    ------------
+    预热是优化，不是前置条件。装少了一个包不该让服务起不来（那家
+    可能压根没被 model.yaml 引用）。每一家的结果都记在返回的
+    `ChatModelWarmup` 里，由调用方决定怎么打日志。
+    """
+
+    resolved = config or load_llm_config()
+
+    warmed: list[str] = []
+    skipped: list[tuple[str, str]] = []
+
+    started = perf_counter()
+
+    for name in sorted(resolved.providers):
+
+        try:
+            _warm_one(name, resolved.providers[name])
+
+        except _NotWorthWarming as exc:
+            skipped.append((name, str(exc)))
+
+        except Exception as exc:
+            # 连类名一起记：ImportError / ValueError / AttributeError
+            # 在这里的含义完全不同，丢掉类名就等于丢掉线索。
+            skipped.append((name, f"{type(exc).__name__}: {exc}"))
+
+        else:
+            warmed.append(name)
+
+    return ChatModelWarmup(
+        warmed=tuple(warmed),
+        skipped=tuple(skipped),
+        elapsed=perf_counter() - started,
+    )
+
+
+def _warm_one(name: str, provider_config: LLMProviderConfig) -> None:
+    """
+    热一个 provider 会用到的那串 import。热不了就抛。
+
+    **不建客户端、不联网** —— 只把模块拉进 `sys.modules`。
+
+    这里热的是**两段**互相独立的惰性 import：客户端**构造**那段（本函数
+    的主体）与**结构化输出**那段（`_warm_structured_output_path`）。
+    少了后者的后果见它的说明 —— 那不是理论风险，是实测抓到过的现场。
+    """
+
+    if not provider_config.api_key.strip():
+        raise _NotWorthWarming(
+            "没配 API Key —— 它在 get_chat_model 里必然报错，"
+            "为它付 import 成本不合理（那家的包很可能根本没装）"
+        )
+
+    direct = _DIRECT_PROVIDERS.get(name)
+
+    if direct is not None:
+
+        # 不走 init_chat_model 的那几家：模块名与类名就写在表里，
+        # 类名正好是下面判断 mro 要用的东西。
+        module_name, class_name = direct
+
+        _warm_structured_output_path(
+            getattr(import_module(module_name), class_name)
+        )
+
+        return
+
+    # ⚠️ 与 get_chat_model 用的是**同一个表达式**。这里多写一份映射，
+    # 就多一处会过期的信息（而且过期的方式很隐蔽：请求路径 import
+    # 的是 A 包，预热热的是 B 包，表现为"预热了但没生效"）。
+    key = _INIT_PROVIDERS.get(name, name)
+
+    # 借 langchain 自己的分派表把 provider 键落到模块名上。
+    #
+    # 用**私有**函数（`_get_chat_model_creator`）是有意的取舍：它正是
+    # `init_chat_model` 内部调用的那一个，而且带 lru_cache —— 这里热过
+    # 之后，请求路径直接命中缓存。自己维护一份"provider -> 包名"的表
+    # 则是抄 langchain 那 27 家，抄错一家的症状是"某个 provider 永远
+    # 首调卡顿"，且不会被任何测试发现。
+    #
+    # 代价是绑了 langchain 的内部结构：它改名时这里会显式报错（下面
+    # 那条 RuntimeError），而不是静默失效 —— 这正是可接受的降级。
+    base = import_module("langchain.chat_models.base")
+
+    creator = getattr(base, "_get_chat_model_creator", None)
+
+    if creator is None:
+        raise RuntimeError(
+            "langchain 的 _get_chat_model_creator 不在了（内部结构变了）—— "
+            "预热要跟着改，见 app/common/llm.py 的 _warm_one。"
+        )
+
+    # langchain 返回的是 `functools.partial(creator_func, cls=类)`，因此
+    # 顺带就能拿到"将来会构造哪个客户端类"—— 下面判断 mro 要用。
+    created = creator(key)
+
+    _warm_structured_output_path(
+        getattr(created, "keywords", {}).get("cls")
+    )
+
+
+def _warm_structured_output_path(client_class: Any) -> None:
+    """
+    热**结构化输出**那条分支上的惰性 import。
+
+    为什么它是独立的一段
+    --------------------
+    预热 `langchain_openai` **碰不到它**。`BaseChatOpenAI._astream` 在
+    payload 带 `response_format` 时走的是另一条分支：
+
+        # langchain_openai/chat_models/base.py:2103
+        response_stream = self.root_async_client.beta.chat.completions.stream(...)
+
+    而 openai SDK 的 `client.beta` 是 **cached_property**，首次访问才
+
+        # openai/_client.py:1212
+        from .resources.beta import AsyncBeta
+
+    —— 那一串会拉进 `resources/beta/realtime/**` 与
+    `types/beta/realtime/**` 整棵生成树。构造客户端不碰 `.beta`，因此
+    只热 `langchain_openai` 是**不生效**的：要等真发一次带
+    `response_format` 的流式请求才付这份钱。
+
+    本地实测这正是一条 7.4 秒停顿（loop_watchdog 的现场）：
+
+        .../langchain_openai/.../base.py:2103 in _astream
+          -> openai/_client.py:1212 in beta
+             -> openai/resources/beta/beta.py:40
+                -> .realtime.realtime -> types.beta.realtime.*
+
+    而 `response_format` 正是本项目分类/工具调用（`with_structured_output`）
+    每次都要带的东西 —— 所以它必然发生在**第一个请求**上。
+
+    判据为什么看 mro 而不是 provider 名
+    ----------------------------------
+    `deepseek` 与 `kimi` 都不叫 "openai"，但它们的客户端
+    （`ChatDeepSeek` / `ChatMoonshot`）都继承 `BaseChatOpenAI`，
+    因此**同样**走这条分支。按 provider 名判断会漏掉它们。
+
+    `client_class` 为 None（拿不到类）时**照样热**：漏热 = 那个 7.4 秒
+    的停顿原样回来，多热 = 启动多花零点几秒。两者不对等，所以不确定
+    时选多热。
+    """
+
+    mro = getattr(client_class, "__mro__", None)
+
+    if mro is not None and not any(
+            klass.__module__ == "langchain_openai.chat_models.base"
+            for klass in mro
+    ):
+        # 不是 BaseChatOpenAI 的后代 —— 它有自己的 _astream，不走 .beta。
+        return
+
+    # 用 openai 自己的惰性钩子取符号（正是 _client.py 那一行做的事），
+    # 而不是直接 import 子模块：它内部挪了位置也仍然解析得到。
+    from openai.resources.beta import AsyncBeta  # noqa: F401

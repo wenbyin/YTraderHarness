@@ -146,7 +146,7 @@ class FileRepository(BaseRepository):
             origin: FileOrigin | None = None,
             file_name: str | None = None,
             content_type: str | None = None,
-            uploaded_by: UUID | None = None,
+            uploaded_by: str | None = None,
             created_from: datetime | None = None,
             created_to: datetime | None = None,
             offset: int = 0,

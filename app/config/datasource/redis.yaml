@@ -1,0 +1,75 @@
+# Redis 数据源。
+#
+# 对应容器（AOF 打开，否则重启就丢；数据放命名卷，否则 docker rm 就丢）：
+#   docker volume create redis-data
+#   docker run -d --name redis -p 6379:6379 \
+#     -v redis-data:/data \
+#     redis:8-alpine \
+#     redis-server --appendonly yes --requirepass 123456
+#
+# 上面这条**我没代跑过**（本机当时没有 redis 镜像），是照
+# elasticsearch.yaml / milvus.yaml 的写法给的：密码 123456 与那两个
+# 保持一致，省得本地开发记三套口令。起容器前请自行确认镜像 tag。
+#
+# 覆盖方式：REDIS_URL / REDIS_CLIENT_NAME
+#
+# ⚠️ 密码在 URL 的用户信息段里，且**那个空冒号不能省**：
+#       redis://:123456@localhost:6379/0     ← 对：无用户名，密码 123456
+#       redis://123456@localhost:6379/0      ← 错：被当成"用户名=123456、无密码"
+#    后者连不上时服务端报的是 NOAUTH / WRONGPASS，而不是"URL 写错了"，
+#    容易往权限配置那边查。用户名密码含 `@` `:` `/` 时需百分号转义。
+#
+# ⚠️ 末尾的 /0 是**库号**，别当成 PG 那种库
+#   Redis 的多个库共用一份 keyspace 统计和一份 maxmemory，也没有
+#   任何权限隔离（ACL 管的是命令和键前缀，不是库）。要真隔离就再起
+#   一个实例 —— 指望换库号来隔离环境是会出事的。
+
+name: redis
+type: redis
+
+enabled: true
+
+# 连不上时只打 warning 并跳过，应用照常启动；
+# 生产要强校验（连不上就别启动）就改成 true。
+required: false
+
+startup_timeout_seconds: 5
+
+config:
+  url: "${REDIS_URL:-redis://:123456@localhost:6379/0}"
+
+  # **短命令**池的上限（业务读写、health_check）。
+  # Redis 执行命令是单线程的，连接开大并不会更快。
+  max_connections: 10
+
+  # **长连接**池的上限（事件流订阅专用，独立于上面那个）。
+  #
+  # ⚠️ 为什么要分开：短命令是"借一下还回去"，而事件流订阅者在整个订阅
+  #    期间**一直占着**它那条连接。共用同一个池时，并发订阅数一到上限就
+  #    会让全进程的 Redis 访问一起失败（实测：10 个订阅打满 max_connections，
+  #    报 MaxConnectionsError，连与事件流无关的调用都跟着挂）。
+  #
+  # 该开多大：**同时在看的 run 数**，不是订阅者数 —— 新设计下一个 run 的
+  # 所有订阅者共用一条连接（app/agent/event/run_stream.py）。
+  #
+  # ⚠️ 必须严格大于 event_stream.yaml 的 max_active_run_streams：redis-py
+  #    的池满时是立刻抛异常、不排队，取等号时一次重试就能撞出来。
+  stream_max_connections: 20
+
+  # 命令读写超时 / 建连超时（秒）。
+  # 不设时 redis-py 会无限等，卡住的 Redis 会把调用方协程永久挂起。
+  # ⚠️ 用 BLPOP / SUBSCRIBE 这类阻塞命令时，阻塞时长必须小于
+  #    socket_timeout，否则会被超时打断 —— 那时按需调大或写 null。
+  socket_timeout: 5
+  socket_connect_timeout: 5
+
+  # 连接空闲超过 30 秒后，下次取用前先 PING，用来踢掉被中间设备
+  # 静默断开的"半开连接"。0 = 关闭该检查。
+  health_check_interval: 30
+
+  # false = 返回 bytes。默认这个值，理由见 models.py::RedisConfig：
+  # bytes 是唯一没有信息损失的形态，解码该由消费方按自己的格式决定。
+  decode_responses: false
+
+  # 会通过 CLIENT SETNAME 设到服务端，在 CLIENT LIST 里认得出是谁连的。
+  client_name: "${REDIS_CLIENT_NAME:-y_trader}"

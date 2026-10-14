@@ -14,11 +14,12 @@ from uuid import UUID
 
 from sqlalchemy import delete, func, or_, select, update
 
+from app.services.capability.models.sqlalchemy.capability import (
+    Capability as CapabilityModel,
+)
+
 from ..domain.entities import ToolDefinition
 from ..domain.schemas.enum import SourceState, SourceType
-from ..models.sqlalchemy.tool_classification import (
-    ToolClassification as ToolClassificationModel,
-)
 from ..models.sqlalchemy.tool_classification import (
     ToolDefinitionClassification as LinkModel,
 )
@@ -290,19 +291,23 @@ class ToolDefinitionRepositoryImpl(ToolDefinitionRepository):
             )
 
         if classification_code:
-            # 用 EXISTS 而不是 join：一个 Tool 可能同时挂着多个分类，
+            # 用 EXISTS 而不是 join：一个 Tool 可能同时挂着多个能力，
             # join 会让它在结果里出现多行，分页与 total 就都错了。
+            #
+            # 这里 join 的是 capability 表（跨模块）—— 参数名仍是
+            # classification_code，因为它是 /tools 这个工具侧接口的
+            # 查询参数，术语与 /tools/{tool_id}/classifications 一致。
             conditions.append(
                 select(LinkModel.tool_id)
                 .join(
-                    ToolClassificationModel,
-                    ToolClassificationModel.classification_id
+                    CapabilityModel,
+                    CapabilityModel.capability_id
                     == LinkModel.classification_id,
                 )
                 .where(
                     LinkModel.tool_id
                     == ToolDefinitionModel.tool_id,
-                    ToolClassificationModel.code
+                    CapabilityModel.code
                     == classification_code,
                 )
                 .exists()
@@ -330,6 +335,45 @@ class ToolDefinitionRepositoryImpl(ToolDefinitionRepository):
         )
 
         return [self._to_entity(m) for m in result.scalars()], total
+
+    async def list_active_by_classification_codes(
+            self,
+            codes: list[str],
+    ) -> list[ToolDefinition]:
+
+        if not codes:
+            # 空列表不能落成 `IN ()`：SQL 里那是语法错误，而"没给
+            # 任何 code"是一个完全正常的输入（分类判不出模块）。
+            return []
+
+        # 与 list_paged 的 classification_code 同一条 EXISTS 写法
+        # （同一个理由：一个 Tool 挂多个能力时 join 会出多行），
+        # 只把单值相等换成 IN。
+        #
+        # 不递归 parent_id：调用方给的是"挂着工具的那一层"的 code，
+        # 见仓储契约里的说明。
+        result = await self._session.execute(
+            select(ToolDefinitionModel)
+            .where(
+                ToolDefinitionModel.source_state
+                == SourceState.ACTIVE.value,
+                select(LinkModel.tool_id)
+                .join(
+                    CapabilityModel,
+                    CapabilityModel.capability_id
+                    == LinkModel.classification_id,
+                )
+                .where(
+                    LinkModel.tool_id
+                    == ToolDefinitionModel.tool_id,
+                    CapabilityModel.code.in_(codes),
+                )
+                .exists(),
+            )
+            .order_by(ToolDefinitionModel.tool_key)
+        )
+
+        return [self._to_entity(m) for m in result.scalars()]
 
     # ========================================================
     # internals

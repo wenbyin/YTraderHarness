@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from ..domain.entities import DocumentChunk
 from ..models.sqlalchemy.document_chunk import (
@@ -60,6 +60,35 @@ class DocumentChunkRepositoryImpl(DocumentChunkRepository):
         )
 
         await self._session.flush()
+
+    async def delete_by_identity(
+            self,
+            document_version_id: UUID,
+            chunker_key: str,
+            chunker_config: dict[str, Any],
+    ) -> int:
+
+        # 过滤条件与 `list()` 里那三个逐字一致 —— 它们合起来正是
+        # 唯一约束 uq_document_chunk_version_chunker_index 去掉
+        # chunk_index 之后的部分。写偏一个，重跑就会在插入时撞约束。
+        stmt = (
+            delete(DocumentChunkModel)
+            .where(
+                DocumentChunkModel.document_version_id
+                == document_version_id,
+                DocumentChunkModel.chunker_key == chunker_key,
+                # jsonb 的 = 是语义相等（键序无关），与写入侧存进去的
+                # 那份（chunker 存的是请求里原样的 dict）能直接比。
+                DocumentChunkModel.chunker_config
+                == dict(chunker_config),
+            )
+        )
+
+        result = await self._session.execute(stmt)
+
+        await self._session.flush()
+
+        return result.rowcount
 
     # ============================================================
     # Read

@@ -1,0 +1,254 @@
+openapi: 3.1.0
+info:
+  title: Agent Platform - Messages API
+  version: 1.0.0
+
+servers:
+  - url: /api/v1
+
+security:
+  - bearerAuth: []
+
+paths:
+  /sessions/{session_id}/messages:
+    get:
+      operationId: listSessionMessages
+      summary: Get session chat history
+      description: |
+        Returns persisted, user-visible messages in chronological
+        order. Each message is an immutable, complete record.
+        The default query returns the latest page.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          description: Session ID
+          schema:
+            type: string
+
+        - name: limit
+          in: query
+          required: false
+          description: Number of messages per page
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+
+        - name: before
+          in: query
+          required: false
+          description: |
+            Opaque cursor. Returns older messages
+            preceding the cursor.
+          schema:
+            type: string
+
+        - name: after
+          in: query
+          required: false
+          description: |
+            Opaque cursor. Returns newer messages
+            following the cursor.
+          schema:
+            type: string
+
+      responses:
+        '200':
+          description: Chat history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessagePage'
+
+        '400':
+          description: Invalid pagination parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+        '401':
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+        '403':
+          description: Access denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+        '404':
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    ContentBlock:
+      type: object
+      required:
+        - type
+      properties:
+        type:
+          type: string
+          description: Content block type
+        text:
+          type: string
+        artifact_id:
+          type: string
+        source_id:
+          type: string
+      additionalProperties: true
+
+    Message:
+      type: object
+      required:
+        - message_id
+        - seq
+        - run_id
+        - role
+        - kind
+        - content
+        - status
+        - created_at
+        - updated_at
+        - metadata
+      properties:
+        message_id:
+          type: string
+          format: uuid
+
+        seq:
+          type: integer
+          format: int64
+
+        run_id:
+          type: [string, 'null']
+
+        role:
+          type: string
+          enum:
+            - user
+            - assistant
+
+        kind:
+          type: string
+          enum:
+            - chat
+            - interaction
+            - tool_activity
+            - notice
+
+        business_agent_id:
+          type: [string, 'null']
+
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContentBlock'
+
+        # 模型的思维链（CoT）。null = 这条消息没有思维链：
+        # 非推理模型、用户消息（那边是人说的话，没有草稿纸）、取消公告。
+        # 不进 required，与 business_agent_id 同一个形状。
+        #
+        # ⚠️ 前端取值规则（存量数据的形状与这里不同，必须按这条读）
+        # ----------------------------------------------------
+        #     reasoning = reasoning_content ?? content 里 type=reasoning 的块
+        #
+        # 新写入的消息里推理**只**在 reasoning_content（content 只放可见
+        # 内容块，两个容器不重叠）。但这一列是后加的，**存量行没有它**：
+        # 实测库里 169 条 assistant 消息的推理就躺在 content 的块数组里
+        # （全是 kind=chat 那种最终答复）。那批行刻意不回填（回填要 UPDATE
+        # agent_message，会把 updated_at 推走，见库表的说明）。
+        #
+        # 也就是说这条 `??` 不是临时的兼容代码，而是**长期**的读法：
+        # 只读新字段会让所有历史会话的推理消失；只读 content 块会让新会话的
+        # 推理消失。
+        reasoning_content:
+          type: [string, 'null']
+
+        status:
+          type: string
+          enum:
+            - completed
+            - interrupted
+            - failed
+            - cancelled
+
+        reply_to_message_id:
+          type: [string, 'null']
+
+        created_at:
+          type: string
+          format: date-time
+
+        # 目前恒等于 created_at：消息写一次就不再改（见 ORM 与实体的说明）。
+        # 进契约是为了给前端一个统一的"最后有效时间"。
+        updated_at:
+          type: string
+          format: date-time
+
+        metadata:
+          type: object
+          additionalProperties: true
+
+    Pagination:
+      type: object
+      required:
+        - limit
+        - has_more_before
+        - has_more_after
+      properties:
+        limit:
+          type: integer
+        has_more_before:
+          type: boolean
+        before_cursor:
+          type: [string, 'null']
+        has_more_after:
+          type: boolean
+        after_cursor:
+          type: [string, 'null']
+
+    MessagePage:
+      type: object
+      required:
+        - session_id
+        - messages
+        - pagination
+      properties:
+        session_id:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        request_id:
+          type: [string, 'null']

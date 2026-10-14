@@ -6,6 +6,7 @@ from uuid import UUID
 
 from fastapi import (
     APIRouter,
+    Depends,
     File as FastAPIFile,
     Header,
     HTTPException,
@@ -15,6 +16,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from app.common.auth import AuthenticatedUser, current_user
 from app.services.dependencies import Service
 from app.services.file.application.service import FileService
 
@@ -86,6 +88,16 @@ def _content_disposition(
     )
 
 
+# ⚠️ 上传会记下 uploaded_by，但**查询不做归属过滤**（刻意的取舍）
+# ------------------------------------------------------------
+# 只落库、先不设权限边界：GET /files、GET /files/{id}、/{id}/content、
+# DELETE /{id} 目前对**任何**登录用户开放 —— 猜中 file_id 就能拿到别人的
+# 文件。要收口时在 FileService 的 list_files / get_file / delete_file 上
+# 加 `uploaded_by = 当前用户 OR uploaded_by IS NULL` 即可（与 session
+# 那一套同形，NULL 同样是"加这列之前的存量"）。
+#
+# 值一律来自 access token、**不从请求体取**：multipart 端点本来就不接收
+# 任何用户字段，保持这样 —— 让调用方声明上传人等于允许替别人署名。
 @router.post(
     "",
     response_model=FileResponse,
@@ -94,6 +106,7 @@ def _content_disposition(
 async def upload_file(
         upload: UploadFile = FastAPIFile(...),
         service: FileService = Service[FileService],
+        user: AuthenticatedUser = Depends(current_user),
 ):
     """
     上传一个新的文件资产。
@@ -109,6 +122,9 @@ async def upload_file(
         file_name=upload.filename or "unknown",
         content_type=upload.content_type,
         content=content,
+        # 空 subject 归一成 None（列里 NULL）—— 与会话那套同一条规矩，
+        # 见 api/v1/sessions.py 的 _owner_id。
+        uploaded_by=user.subject or None,
     )
 
     try:
@@ -164,9 +180,13 @@ async def list_files(
             ),
         ),
 
-        uploaded_by: UUID | None = Query(
+        uploaded_by: str | None = Query(
             default=None,
-            description="上传用户 ID。",
+            max_length=255,
+            description=(
+                "按上传用户过滤（Casdoor 的 sub，字符串）。"
+                "⚠️ 它是过滤条件、**不是**授权边界 —— 见本文件上方那段说明。"
+            ),
         ),
 
         created_from: datetime | None = Query(

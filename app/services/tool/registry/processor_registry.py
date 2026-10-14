@@ -3,11 +3,13 @@
 
 与 PipelineRegistry 是同一套做法
 --------------------------------
-`app/services/document/pipeline/registry.py` 的 `found_capabilities()`
-先 `_import_capability_modules()` 遍历包触发 import，再
-`_leaf_subclasses(基类)` 收叶子类。这里逐字照抄那两个函数 ——
-理由完全相同：`__subclasses__()` 只认识**已经被 import 的类**，
-所以反射之前必须先把模块走一遍。
+先遍历包触发 import（`__subclasses__()` 只认识**已经被 import 的
+类**），再收叶子类。
+
+那两个函数在 `app/common/utils/reflection.py` —— 本项目有四个注册表
+用同一套发现机制，各自抄一份的代价是同一条坑踩四次。共享内核里那份
+的 docstring 把三个坑（`__init__.py`、先 import 后 `__subclasses__`、
+抽象类要在结果上过滤而不能在递归里剪枝）一次说清了。
 
 为什么注册表住在服务侧、实现住在 agent 侧
 ------------------------------------------
@@ -28,12 +30,12 @@
 
 from __future__ import annotations
 
-import importlib
-import inspect
-import pkgutil
-
 from app.agent.tools.processor.base import BaseToolProcessor
 from app.common.exceptions import NotFoundError
+from app.common.utils import (
+    import_package_modules,
+    leaf_subclasses,
+)
 
 __all__ = [
     "PROCESSOR_PACKAGES",
@@ -50,54 +52,6 @@ __all__ = [
 PROCESSOR_PACKAGES: tuple[str, ...] = (
     "app.agent.tools.processor",
 )
-
-
-def _import_processor_modules() -> None:
-    """
-    导入处理器包下的所有模块。
-
-    `__subclasses__()` 只认识已经被导入的类，所以反射之前必须先把
-    模块走一遍。不依赖各包的 `__init__.py` 逐个 re-export：
-    新增一个 .py 文件就自动生效，不用回来改任何清单。
-
-    ⚠️ `walk_packages` 不会走进没有 `__init__.py` 的目录 ——
-    因此 processor/ 下的每个子包都必须留着那个空文件。
-    """
-
-    for package_name in PROCESSOR_PACKAGES:
-
-        package = importlib.import_module(package_name)
-
-        if not hasattr(package, "__path__"):
-            continue
-
-        for module_info in pkgutil.walk_packages(
-                package.__path__,
-                package.__name__ + ".",
-        ):
-            importlib.import_module(module_info.name)
-
-
-def _leaf_subclasses(cls: type) -> list[type]:
-    """
-    深度优先收集 cls 下所有"最小子类"，即自己不再有子类的那些。
-
-    与 pipeline/registry.py 的同名函数一致：中间基类（只做共性、
-    这里就是三个 type 基类）不进结果 —— 它们对注册表没有意义。
-    """
-
-    result: list[type] = []
-
-    for subclass in cls.__subclasses__():
-
-        children = _leaf_subclasses(subclass)
-
-        if children:
-            result.extend(children)
-        else:
-            result.append(subclass)
-
-    return result
 
 
 class ToolProcessorRegistry:
@@ -152,19 +106,18 @@ class ToolProcessorRegistry:
         PipelineRegistry 的能力键冲突检查是同一套立场。
         """
 
-        _import_processor_modules()
+        import_package_modules(*PROCESSOR_PACKAGES)
 
         result: dict[str, BaseToolProcessor] = {}
 
-        for processor_cls in _leaf_subclasses(BaseToolProcessor):
+        for processor_cls in leaf_subclasses(
+                BaseToolProcessor, skip_abstract=True
+        ):
 
             if BaseToolProcessor in processor_cls.__bases__:
                 continue
 
             if processor_cls.processor_type is None:
-                continue
-
-            if inspect.isabstract(processor_cls):
                 continue
 
             instance = processor_cls()

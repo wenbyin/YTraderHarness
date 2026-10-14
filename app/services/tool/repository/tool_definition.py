@@ -174,6 +174,44 @@ class ToolDefinitionRepository(BaseRepository):
         raise NotImplementedError
 
     @abstractmethod
+    async def list_active_by_classification_codes(
+            self,
+            codes: list[str],
+    ) -> list[ToolDefinition]:
+        """
+        一批能力 code -> 挂在它们下面的 ACTIVE 工具。
+
+        与 list_paged 的 classification_code 过滤是同一件事，
+        两点不同：
+
+            单值 -> 一批（IN）    给 Agent Builder 用：它一次判出
+                                  好几个模块，逐个查就是几次往返
+            不分页                见下
+
+        **精确匹配，不含子孙能力**
+        ------------------------
+        code 命中即取，不沿 capability.parent_id 递归。理由是调用方
+        拿到的是"分类模型从候选集里挑出来的 code"，它就是挂工具的
+        那一层；递归会让"选了一个父节点"从"这几个工具"变成"这一片
+        工具"，而这个扩张在上下文里是静默发生的。
+
+        只取 ACTIVE
+        -----------
+        MISSING 是"代码里已经没有了、但行还留着"（不删是刻意的，
+        见 mark_missing）。这类工具既不能给模型看、更不能被执行 ——
+        让同步状态泄漏进暴露集，症状是"模型调了一个早已删除的工具"。
+
+        不分页
+        ------
+        分页在这里只会**静默截断**：调用方要的是"这次能用的全部
+        工具"，给它前 20 个既没报错也没提示。工具数真的大到需要
+        上限时，应该在那一步显式拒绝并说清原因，而不是在这里悄悄
+        切一刀。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
     async def list_all(
             self,
             *,

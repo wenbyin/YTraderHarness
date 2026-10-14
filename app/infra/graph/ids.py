@@ -6,19 +6,22 @@
     thread_id            一次运行的幂等标识（断点续跑靠它）
     topology_fingerprint 图拓扑的指纹（防误改，也给前端做兼容判断）
     node_slug / branch_key  观测表的稳定键（历史行永远能对上）
+    branch_scope_id      扇出分支的身份：本来没有 UUID 的地方由它
+                         从稳定字符串派生一个（必须是确定性的，
+                         否则 resume 会给同一分支多写一行）
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 from collections.abc import Iterable, Sequence
-from uuid import UUID
+from uuid import UUID, uuid5
 
-from app.common.utils import to_snake
+from app.common.utils import canonical_json, sha256_text, to_snake
 
 __all__ = [
     "branch_key",
+    "branch_scope_id",
+    "new_session_thread_id",
     "new_thread_id",
     "normalize_edges",
     "to_node_slug",
@@ -75,6 +78,62 @@ def new_thread_id(
     return thread_id
 
 
+def new_session_thread_id(
+        run_level: str,
+        agent_type: str,
+        thread_uuid: UUID,
+) -> str:
+    """
+    构造**按会话稳定**的 LangGraph thread_id。
+
+    形如：
+
+        <run_level>:<agent_type>:<thread_uuid>
+
+    例如 dev 环境的 react 会话：
+
+        dev:react:550e8400-e29b-41d4-a716-446655440000
+
+    ⚠️ 为什么不复用 `new_thread_id`（**两者的语义正好相反**）
+    ----------------------------------------------------
+    `new_thread_id` 刻意把 `pipeline_run_id` 放进唯一分量，理由写在它
+    自己的 docstring 里：document 被 reprocess 时**必须**得到全新的
+    thread，否则第二次会从第一次的 checkpoint 续跑而不是重新处理。
+
+    而这一张图要的恰恰是反面：同一会话的多轮**必须**落在同一个 thread
+    上，否则每轮都是全新 checkpoint、上一轮的消息不在。这正是"同一会话
+    多次 invoke，messages 里只有一条 HumanMessage"的成因。
+
+    一个函数不可能同时满足这两种要求 —— 共用一个必然把另一边写错，
+    而且错法是**静默**的（thread_id 照样是个合法字符串，只是语义不对，
+    要等下一次跑才发现历史没了）。因此两个函数并存，各自带自己的理由。
+
+    run_level / agent_type 由调用方给，infra 不认识它们的含义
+    ------------------------------------------------------
+    与 `new_thread_id` 的 namespace 同一条规矩：本模块只负责拼与校验，
+    不负责解释。"什么算一个环境"是 app.common.environment 的事，
+    "这张图是哪一种 Agent"是 react catalog 的事。
+
+    ⚠️ thread_uuid 必须是**跨轮不变**的那个
+    --------------------------------------
+    调用方要把它持久化（会话行上），不能每次调用都新生成 —— 那等于
+    退化成"每轮换 thread"。传进来而不是在这里生成，就是为了让这个
+    事实摆在调用点看得见。
+    """
+
+    thread_id = f"{run_level}:{agent_type}:{thread_uuid}"
+
+    if len(thread_id) > THREAD_ID_MAX_LENGTH:
+        # UUID 定长、前后缀都很短，构造上不可能超；真超了说明有人
+        # 往 run_level / agent_type 里塞了别的东西。
+        raise ValueError(
+            "thread_id exceeds "
+            f"{THREAD_ID_MAX_LENGTH} chars: {thread_id!r}"
+        )
+
+    return thread_id
+
+
 # ============================================================
 # Topology
 # ============================================================
@@ -107,16 +166,14 @@ def topology_fingerprint(
         ),
     }
 
-    canonical = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
+    # ⚠️ default_str=False：拓扑指纹**不做** str() 兜底。
+    # 它是对外契约（有 golden 校验），输入本该全是 str/int；真混进
+    # 别的对象时抛 TypeError，比按 repr 摘要要好 —— repr 会随对象
+    # 状态变，摘要跟着变，而没人知道为什么。详见
+    # app/common/utils/digest.py 的说明。
+    return sha256_text(
+        canonical_json(payload, default_str=False)
     )
-
-    return hashlib.sha256(
-        canonical.encode("utf-8")
-    ).hexdigest()
 
 
 # ============================================================
@@ -171,6 +228,47 @@ def branch_key(
         if branch_scope_id is None
         else str(branch_scope_id)
     )
+
+
+def branch_scope_id(
+        namespace: UUID,
+        key: str,
+) -> UUID:
+    """
+    从一个**稳定字符串**派生出扇出分支的 scope ID。
+
+    与 `branch_key` 的分工：那个把已有 UUID 变成观测键，这个负责
+    "本来没有 UUID 的地方怎么造一个稳定的"。
+
+    ⚠️ 必须是**确定性**的（因此是 uuid5 而不是 uuid4）
+    -------------------------------------------------
+    扇出分支第一次执行时 `node_span` 会 upsert 一行
+    `branch_key=<这个值>`。而 `interrupt()` 会让那个分支在 resume 时
+    **重新执行**一次节点函数 —— 如果这次算出一个不同的 scope，
+    观测表里就会多出一行（唯一键是
+    `(pipeline_run_id, node_id, branch_key, attempt)`），
+    一次中断换来一行幽灵数据。
+
+    所以调用方给的 `key` 必须是"同一次运行里同一个分支永远是同一个
+    字符串"。真正撑住这件事的通常不是这个函数，而是
+    **Send payload 会被 checkpoint 原样恢复**（路由不会在 resume 时
+    重算）—— 本函数只负责把那个字符串变成一个 UUID。
+
+    `key` 的含义由业务侧定义（与 `branch_key` 同一约定）：infra 不
+    关心它是工具调用 id、分支名还是别的，只要求它稳定且非空。
+
+    空 key 直接报错而不是照算：uuid5 对空串是合法的，算得出一个
+    "所有忘记传 key 的地方都长一样"的值 —— 那种碰撞是静默的，
+    而唯一约束要到写库时才炸，离原因很远。
+    """
+
+    if not key:
+        raise ValueError(
+            "branch_scope_id 的 key 不能为空 —— 空 key 会让所有忘了"
+            "传 key 的分支拿到同一个 scope，观测行互相覆盖。"
+        )
+
+    return uuid5(namespace, key)
 
 
 def normalize_edges(

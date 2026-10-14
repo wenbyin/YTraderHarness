@@ -1,0 +1,341 @@
+openapi: 3.1.0
+
+info:
+  title: Memory Atom (L1) Search API
+  version: 1.0.0
+  description: |
+    L1 structured-memory retrieval — hybrid recall (keyword + vector) over
+    the distilled memories in `memory_atom`.
+
+    Responsibilities:
+      - POST /memory-atom/search — one round of recall over L1 memories
+
+    Non-responsibilities:
+      - L0 raw-conversation recall (that is memory.yaml)
+      - Extracting or deduplicating memories (that is the `memory.l1.extract`
+        background task; the search side only reads the tables)
+      - L2 scenes / L3 profiles (separate templates, separate scopes)
+
+    ⚠️ Scope keys are deliberately NOT in the request body
+    -----------------------------------------------------
+    The request body is also the tool input schema handed to the LLM (the
+    same pydantic model is both the HTTP body and the `bind_tools` schema).
+    If `user_id` / `session_id` appeared here, the model could fill in
+    somebody else's id and read across tenants. Therefore:
+
+        HTTP   session_id is a **query parameter**; user_id comes from the
+               access token. Session ownership is enforced, and a session
+               that is not the caller's is a 404 — never an empty result
+               ("not yours" and "nothing found" must not look alike)
+        tool   both are injected by the runtime (ToolRuntime.thread_id ->
+               agent_session). The model only gets to pick scope.
+
+    ⚠️ scope=user is where L1 lives
+    -------------------------------
+    L0 memories are "what was literally said in this conversation", so
+    searching per-session is the norm there. L1 memories are facts about a
+    **user**, accumulated across sessions (memory.yaml says the same thing:
+    "the scope L1 facts live in" is the user). So most callers should pass
+    scope=user.
+
+    The default is still `session` — the smallest reach, and the one least
+    likely to surface something unexpected when the caller did not think
+    about it.
+
+    ⚠️ Three things this contract deliberately cannot filter on
+    --------------------------------------------------------
+        type        `type` is not on the mount tables (it takes no part in
+                    filtering), so a filter here would mean either joining
+                    back to the main table or denormalizing it into the
+                    index — not worth it for a filter nobody asked for
+        time window `timestamp_*` holds LLM-inferred text (possibly "2018"),
+                    so range-filtering it would either fail or be silently
+                    wrong
+        priority    it explicitly takes no part in ordering or filtering
+                    (see its column comment); it is returned so the caller
+                    (especially the model) can weigh the hits themselves
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Memory Atom
+    description: L1 distilled-memory retrieval
+
+
+paths:
+
+  /memory-atom/search:
+    post:
+      tags:
+        - Memory Atom
+      summary: Search L1 distilled memories
+      operationId: searchMemoryAtom
+      description: |
+        One round of hybrid recall over the distilled memories.
+
+        Two routes:
+
+            keyword   tsvector + GIN. Tokenized **in the application**
+                      (jieba, mirroring the ES `cjk` analyzer used by the
+                      document module) — the same tokenizer the index was
+                      built with, because Postgres here has no Chinese
+                      text-search configuration.
+            vector    pgvector, cosine, HNSW, 512 dimensions —
+                      bge-small-zh-v1.5, the same model the document
+                      module embeds with.
+
+        ⚠️ Scores are comparable only within one response
+        ----------------------------------------------
+        Keyword scores come from ts_rank and vector scores from cosine
+        distance; the fused score is a rank-based combination. Two hits
+        from the same response can be ordered by `score`; two different
+        responses (or two different modes) cannot.
+
+        ⚠️ A route whose backend is down does not fail the query
+        ------------------------------------------------------
+        The remaining route's hits are genuinely retrievable. What must not
+        happen is a silent skip: the response says which route stayed out
+        via `degraded_routes`, and the same thing goes to a warning log.
+
+        ⚠️ content is returned whole, never truncated
+        ------------------------------------------
+        Unlike L0 (which returns snippets — the length of a raw message is
+        a property of the conversation), an L1 memory is already a distilled
+        statement. Truncating it can cut "likes X, but **cannot** Y" in
+        half, which is worse than returning nothing.
+
+      parameters:
+        - name: session_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+            nullable: true
+          description: |
+            Restrict the search to a single session. Omit it to let `scope`
+            decide. A session that does not belong to the caller is a 404 —
+            not an empty 200, because those two mean different things and a
+            client that cannot tell them apart will keep retrying.
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryAtomSearchRequest'
+
+      responses:
+        '200':
+          description: Recall results (possibly with degraded routes)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryAtomSearchResponse'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+components:
+
+  schemas:
+
+    MemoryAtomSearchScope:
+      type: string
+      enum:
+        - session
+        - user
+      description: |
+        How wide the recall reaches.
+
+            session   only memories distilled from the current conversation
+            user      every conversation of the calling user, across
+                      sessions — where L1 facts live
+
+        "user" is a real widening, not a synonym for "all": it never reaches
+        another user's memories.
+
+    MemoryAtomSearchMode:
+      type: string
+      enum:
+        - hybrid
+        - keyword
+        - vector
+      description: |
+        Which routes to run. `hybrid` runs both and fuses them by rank.
+
+        This is the **requested** mode and is echoed back as-is; a route
+        that did not actually run shows up in `degraded_routes` rather than
+        being silently folded into this field.
+
+    MemoryAtomRecallRoute:
+      type: string
+      enum:
+        - keyword
+        - vector
+      description: One recall route. Names match the two index tables.
+
+    MemoryAtomSearchRequest:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          minLength: 1
+          description: |
+            Natural-language query, in the user's language.
+
+            It is both what the keyword route tokenizes and what the vector
+            route embeds — the tokenizer and the model must be the same ones
+            the index was built with, or the two routes answer different
+            questions.
+
+        scope:
+          $ref: '#/components/schemas/MemoryAtomSearchScope'
+          default: session
+
+        mode:
+          $ref: '#/components/schemas/MemoryAtomSearchMode'
+          default: hybrid
+
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+          description: |
+            Maximum number of hits. Applied **after** fusion, so it bounds
+            the response, not each route's internal recall depth.
+
+    MemoryAtomSearchHit:
+      type: object
+      required:
+        - record_id
+        - content
+        - type
+        - priority
+        - scene_name
+        - score
+        - matched_by
+      properties:
+        record_id:
+          type: string
+          format: uuid
+          description: |
+            The memory this hit came from.
+
+            ⚠️ It is stable only within one write: a merge keeps the id of
+            the surviving row and deletes the ones it absorbed. Anything
+            holding a long-lived reference has to accept that.
+
+        content:
+          type: string
+          description: |
+            The memory statement, whole. See the operation description for
+            why it is not truncated.
+
+        type:
+          type: string
+          description: |
+            persona / episodic / instruction. The vocabulary grows
+            (work_* categories are still to come), so it is deliberately
+            not an enum here either.
+
+        priority:
+          type: integer
+          description: |
+            0-100, -1 = strict global instruction.
+
+            ⚠️ It takes no part in ordering or filtering — it is returned so
+            the caller can weigh the hits themselves. Ordering comes from
+            `score` alone.
+
+        scene_name:
+          type: string
+          description: |
+            The scene this memory belongs to. Free text generated by the
+            model (no enum, no normalization) — see memory_l1.md.
+
+        score:
+          type: number
+          description: |
+            Fused score. Comparable **only within this response** — see the
+            operation description.
+
+        matched_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryAtomRecallRoute'
+          description: |
+            Which routes recalled this hit. One found only by the vector
+            route is the interesting case: it is what a keyword search would
+            have missed, so the field is also a cheap sanity check on
+            whether hybrid is earning its cost.
+
+    DegradedAtomRoute:
+      type: object
+      required:
+        - route
+        - reason
+      description: |
+        A route that could not take part in this round.
+
+        An empty `degraded_routes` means every requested route ran. An empty
+        `results` with an empty `degraded_routes` means the corpus genuinely
+        has nothing — that is a real answer, not an error.
+      properties:
+        route:
+          $ref: '#/components/schemas/MemoryAtomRecallRoute'
+
+        reason:
+          type: string
+          description: |
+            Why the route stayed out — backend error text, or "not wired up
+            yet". Also written to the warning log; it is in the response so
+            the caller is not left guessing which half answered.
+
+    MemoryAtomSearchResponse:
+      type: object
+      required:
+        - search_id
+        - query
+        - mode
+        - scope
+        - results
+        - degraded_routes
+      properties:
+        search_id:
+          type: string
+          format: uuid
+          description: Identifies this call, for aligning logs and traces.
+
+        query:
+          type: string
+          description: Echoed back.
+
+        mode:
+          $ref: '#/components/schemas/MemoryAtomSearchMode'
+
+        scope:
+          $ref: '#/components/schemas/MemoryAtomSearchScope'
+
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryAtomSearchHit'
+
+        degraded_routes:
+          type: array
+          items:
+            $ref: '#/components/schemas/DegradedAtomRoute'
+
+
+  responses:
+    NotFound:
+      description: >-
+        The session does not exist, or it does not belong to the caller.
+        The two cases are deliberately indistinguishable in the response —
+        telling a caller that someone else's session exists is itself a leak.

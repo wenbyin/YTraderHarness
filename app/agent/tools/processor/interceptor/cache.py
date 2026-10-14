@@ -33,8 +33,6 @@ BEFORE / AFTER 时缓存落在调用链的固定位置，与重试无关。
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -47,6 +45,7 @@ from ..context import (
     ToolOutcome,
 )
 from ..runtime.cache import get_tool_cache
+from app.common.utils import canonical_json, sha256_text
 from app.services.tool.domain.schemas.enum import (
     ExecutionMode,
     ProcessorHook,
@@ -255,17 +254,9 @@ class CacheToolProcessor(ToolInterceptor):
                 if field in invocation.arguments
             }
 
-        canonical = json.dumps(
-            {
+        return sha256_text(
+            canonical_json({
                 "tool_key": invocation.tool_key,
                 "arguments": selected,
-            },
-            sort_keys=True,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
+            })
         )
-
-        return hashlib.sha256(
-            canonical.encode("utf-8")
-        ).hexdigest()

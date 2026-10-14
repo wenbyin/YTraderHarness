@@ -38,6 +38,7 @@ post-commit 钩子。这一串顺序是有讲究的，见 scope() 的 docstring�
 from __future__ import annotations
 
 import inspect
+import logging
 import typing
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -51,11 +52,18 @@ from app.common.introspect import (
 from app.common.repository.base import BaseRepository
 from app.common.repository.factory import UNSET, RepositoryFactory
 
-from .base import BaseService, PostCommitHook, ServiceContext
+from .base import (
+    BaseService,
+    PostCommitHook,
+    RollbackHook,
+    ServiceContext,
+)
 
 __all__ = [
     "ServiceFactory",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 class ServiceFactory:
@@ -212,8 +220,17 @@ class ServiceFactory:
 
             调用方抛异常时，异常在 yield 点被抛回本生成器，
             穿过 session.begin()（回滚）与 session_factory()，
-            于是下面那个 for 循环**整段被跳过** ——
+            于是 post_commit 那个循环**整段被跳过** ——
             不会出现"事务回滚了但任务已投出去"。
+
+        回滚钩子（与 post_commit 恰好互斥）
+        ---------------------------------
+            提交成功 -> 跑 post_commit
+            没有提交 -> 跑 rollback
+
+        "没有提交"包含两件事：调用方抛异常，以及**COMMIT 本身失败**。
+        后者是补偿钩子真正的理由 —— 那时业务代码已经正常返回了，
+        它自己没有任何机会去撤销事务之外的副作用。见 RollbackHook。
 
         begin=False 用于只读路径（不开显式事务）。
         """
@@ -228,29 +245,46 @@ class ServiceFactory:
             )
 
         post_hooks: list[PostCommitHook] = []
+        rollback_hooks: list[RollbackHook] = []
 
-        async with session_factory() as session:
-            repositories = self._repositories.with_session(session)
+        try:
+            async with session_factory() as session:
+                repositories = (
+                    self._repositories.with_session(session)
+                )
 
-            ctx = self._build_context(
-                session=session,
-                post_commit=post_hooks,
-            )
+                ctx = self._build_context(
+                    session=session,
+                    post_commit=post_hooks,
+                    rollback=rollback_hooks,
+                )
 
-            service = self.create(
-                contract,
-                ctx=ctx,
-                repositories=repositories,
-                **overrides,
-            )
+                service = self.create(
+                    contract,
+                    ctx=ctx,
+                    repositories=repositories,
+                    **overrides,
+                )
 
-            if begin:
-                async with session.begin():
+                if begin:
+                    async with session.begin():
+                        yield service
+                else:
                     yield service
-            else:
-                yield service
 
-        # 走到这里 = 事务已提交（回滚路径在 yield 点就抛走了）。
+        except BaseException:
+            # 走到这里 = **没提交**。两种来源：
+            #   调用方在 yield 点抛了            （业务校验失败等）
+            #   session.begin() 收尾时 COMMIT 失败（连接断、序列化冲突）
+            #
+            # 后者才是这个分支存在的真正理由：事务内的东西数据库自己会
+            # 回滚，但**事务之外的副作用**（进程内锁、外部配额）没有别人
+            # 会去撤 —— 而"提交失败所以锁永远不放"是一个只能重启进程
+            # 才能恢复的死局。补偿钩子就是为它准备的。
+            await _run_rollback_hooks(rollback_hooks)
+            raise
+
+        # 走到这里 = 事务已提交。与上面的分支**互斥**：一次调用只跑一边。
         for hook in post_hooks:
             await hook()
 
@@ -263,6 +297,7 @@ class ServiceFactory:
             *,
             session: Any = None,
             post_commit: list[PostCommitHook] | None = None,
+            rollback: list[RollbackHook] | None = None,
     ) -> ServiceContext:
         """按当前工厂的池子与 session 拼一个上下文。"""
 
@@ -272,6 +307,9 @@ class ServiceFactory:
             dispatcher=self._pool.get("dispatcher"),
             post_commit=(
                 post_commit if post_commit is not None else []
+            ),
+            rollback=(
+                rollback if rollback is not None else []
             ),
             # 池子整份放进 extras：模块专属依赖（图名、输出目录…）
             # 也走这里，避免每加一个就要改 ServiceContext 的字段。
@@ -407,3 +445,39 @@ class _NoMatch:
 
 
 _NO_MATCH = _NoMatch()
+
+
+# ============================================================
+# 补偿钩子
+# ============================================================
+
+
+async def _run_rollback_hooks(
+        hooks: list[RollbackHook],
+) -> None:
+    """
+    跑补偿钩子。**倒序**，且逐个兜住异常。
+
+    倒序：后登记的往往依赖先登记的资源，撤销该按相反顺序 —— 与析构
+    同一个道理。
+
+    逐个兜异常（而不是让第一个的失败冲掉其余）：
+
+        - 一个钩子失败不该让别的资源漏掉不收
+        - 更不该把**原始异常**换掉 —— 此刻正在传播的那个异常
+          （回滚的原因）才是有信息量的，用 `logger.exception` 记下来
+          就好，别顶替它。
+
+    这里 catch 的是 `BaseException`：回滚路径上完全可能带着
+    `CancelledError` 走，而"因为任务被取消所以锁不放"正是要避免的。
+    """
+
+    for hook in reversed(hooks):
+
+        try:
+            await hook()
+
+        except BaseException:  # noqa: BLE001 - 见 docstring
+            logger.exception(
+                "回滚钩子执行失败（已忽略，不影响原始异常）。"
+            )

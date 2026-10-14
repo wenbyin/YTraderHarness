@@ -175,6 +175,35 @@ class ToolDocumentationRepositoryImpl(
             for tool_id, override in result.all()
         }
 
+    async def map_parameter_overrides(
+            self,
+            tool_ids: list[UUID],
+    ) -> dict[UUID, dict[str, str | None]]:
+
+        if not tool_ids:
+            return {}
+
+        result = await self._session.execute(
+            select(
+                ParameterDocumentationModel.tool_id,
+                ParameterDocumentationModel.parameter_path,
+                ParameterDocumentationModel.description_override,
+            ).where(
+                ParameterDocumentationModel.tool_id.in_(tool_ids)
+            )
+        )
+
+        mapped: dict[UUID, dict[str, str | None]] = {}
+
+        # 只按 tool_id 聚，**不在这里过滤 None**：空覆盖行照样交出去，
+        # 由调用方按自己的口径判"算不算覆盖"。在这里滤掉的话，
+        # 上层就再也分不出"这个参数有行但人没写"与"这个参数根本
+        # 没有行"—— 而两者在排查时指向完全不同的地方。
+        for tool_id, path, override in result.all():
+            mapped.setdefault(tool_id, {})[path] = override
+
+        return mapped
+
     async def count_for_tools(
             self,
             tool_ids: list[UUID],

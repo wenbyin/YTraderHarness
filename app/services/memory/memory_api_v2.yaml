@@ -1,0 +1,1310 @@
+openapi: 3.1.0
+info:
+  title: Memory API（上下文预览、记忆记录查询与提取进度）
+  version: 2.1.0
+  description: |
+    管理端 Memory API，明确区分五类操作：
+
+    1. `POST /memory/retrieval`：模拟每轮上下文组装。默认只携带 L3 画像和 L2 场景索引（每轮都带的东西）；`retrieve.l0` / `retrieve.l1` 打开时会以 `input` 为查询串**真的**跑一轮 L0/L1 混合召回 —— 那两层是一次真正的检索，所以是按需的，因此 `input` 必填。
+    2. `POST /memory/query/l0|l1|l2|l3`：浏览当前已经保存的记忆记录，不执行向量召回或 hybrid 召回。
+    3. `POST /memory/extraction/l1|l2|l3`：读取**提取进度水位** —— 这个会话 / 这个 scope 的记忆抽到哪了，用于排查"为什么记忆没更新"。
+    4. `POST /memory/query/l1/sources` 与 `POST /memory/query/l0/atoms`：跨层溯源 —— 这条记忆是从哪几句原话来的，以及反过来的那一个方向。
+    5. Agent 使用的 L0/L1 语义召回工具仍由 `memory.yaml` 与 `memory_atom.yaml` 定义，不属于本文件的管理员浏览 API。
+
+    ## Target 与权限
+
+    所有接口都要求 `target`：`user_id` 与 `team_id` 必须恰好提供一个，且 `agent_id` 必填。`team_id` 对应数据库中的 `org_id`。
+    本组端点要求调用者持有精确匹配的 `Y-Trader-Admin` 角色。管理员视图允许显式指定目标 scope，因此后端必须继续执行角色鉴权和参数校验。
+
+    角色门槛只放宽了"只能看自己"这一条 —— **归属校验照常执行**：`target` 里的 `user_id` 仍要对该会话可见（不可见的会话与不存在的会话共用 404）。
+    提取进度这一组的 `agent_id` 只在 L3 参与定位（水位表的键是 `agent_id + scope`）；L1/L2 的水位表上没有 agent 维度，`agent_id` 在那里只做 `target` 合法性校验。
+
+    ## 各层语义
+
+    - L0：浏览原始消息记录，返回完整消息正文；支持会话、角色、时间与简单文本包含过滤。
+    - L1：浏览原子记忆记录；支持类型、优先级、场景、更新时间与简单文本包含过滤。
+    - L2：列出场景索引；需要正文时调用场景详情接口。当前场景数据量较小，不建立语义检索接口。
+    - L3：读取单篇画像；画像尚未生成时返回 `persona: null`。
+
+    `text_contains` / `filename_contains` 表示字面文本过滤，不代表语义检索或向量相似度检索。列表接口使用不透明游标分页，服务端应使用稳定的排序键和唯一键作为分页边界。
+
+    ## 提取进度（水位）
+
+    四层里只有后三层有水位，因为只有它们有"增量"：L0 是**幂等全量重写**（一个 run 一轮，消息本身就是权威表），没有"抽到哪了"这个状态。
+
+        L1   `memory_atom_cursor`     按**会话**：已抽过的最大 `agent_message.seq`
+        L2   `memory_scene_cursor`    按**会话**：已整合过的最大 `memory_atom.updated_time`
+        L3   `memory_persona_cursor`  按 **scope**：已抽象过的最大 `memory_scene.updated_at`
+
+    三条的水位表都带一个"上次跑完的时刻"（L2 的 `last_l2_at` / L3 的 `last_l3_at`），它**含空转那一次** —— 与水位是两件事，读的时候别只看水位。
+
+    水位**按原样返回，不做派生**：不返回"还剩几轮没抽"。理由是本仓库"一轮"的定义只有一处（`role=user` 且 `kind=chat`），在这里按消息条数另算一个近似值会让同一个问题出现两个答案，而两者不一致不会报错。
+
+    ## 跨层溯源
+
+    层与层之间的引用**只有一条真落在库里的边**：
+
+        L1 -> L0   `memory_atom.source_message_ids`（本文件的 sources / atoms 两个端点）
+        L2 -> L1   没有存储映射。场景文件名是模型自己写的路径，L1 抽出的 `scene_name` 是**情境名**，两者不是同一个东西，join 不上
+        L3 -> L2   没有。`memory_persona_cursor` 上只剩**边界那一批**（`last_scene_ids`），上一次生成到底看过哪些场景没有落库
+
+    后两条**不提供近似接口**，也不打算用 `scene_name` 匹配文件名或拿边界批冒充全量 —— 那会给出看起来完整、实际缺一半的答案。要它们得先在写入侧落一条映射。
+
+    `source_message_ids` 上没有外键，也不保证消息还在（会话可能被删），所以 sources 那个端点会单独回报 `missing_message_ids`。
+
+    ## 当前能力边界
+
+    当前 L0/L1 查询路径不能按 `team_id` 过滤团队全部消息/原子记忆。团队 scope 调用 L0/L1 Query 返回 400；L2/L3 支持个人与团队 scope。要支持团队级 L0/L1 浏览，需要单独落实数据过滤与隐私边界，不能仅通过 API 改名实现。
+
+    同一条边界适用于提取进度与溯源的 **L1/L2 部分**：那两张水位表的键是 `session_id`、只带一列 `user_id`（没有 org 列），而"一个团队的 L1 抽到哪了"本身也不是一句话 —— 水位按会话记，团队下 N 个会话就有 N 条。所以带 `team_id` 调这三个端点返回 400，而不是返回空（空读起来像"这个团队没有记忆"）。
+
+    L2 -> L1 的反查同样不可用：`source_message_ids` 上没有 GIN 索引，包含查询会全表扫，所以溯源端点要求 `session_id` 把候选收窄到单个会话；跨会话反查要一张索引，那是写入侧的决定。
+servers:
+  - url: /api/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: Memory Retrieval
+    description: 预览默认记忆上下文的组装结果
+  - name: Memory Query
+    description: 浏览当前已保存的 L0-L3 记忆记录，以及层与层之间的溯源（管理员视图）
+  - name: Memory Extraction
+    description: 读取各层提取进度的权威水位（管理员视图）
+paths:
+  /memory/retrieval:
+    post:
+      tags: [Memory Retrieval]
+      summary: 预览本轮会拼出的记忆上下文
+      operationId: previewMemoryContext
+      description: |
+        读取当前 target 的记忆，并返回上下文分段与 prompt 预览。**不调用模型**。
+
+        默认组装顺序为 `persona (L3) -> scenes (L2)`，两者是「每轮都带」的东西，成本只有几句话的量级。L2 只包含 `filename`、`summary`、`heat` 等索引字段，不包含场景全文。
+
+        ## L0/L1 是可选的，而且**真的去召回**
+
+        打开 `retrieve.l0` / `retrieve.l1` 之后，服务端会以 `input` 为查询串真的跑一轮混合召回（两路召回 + 融合 + 条数），走的就是 Agent 调 `memory.search` / `memory_atom.search` 那条实现 —— 预览里看到的就是 Agent 能拿到的。所以 `input` **必填**。
+
+        默认关闭是有意的：那两层是一次真正的检索，绝大多数轮次并不需要 —— Agent 那边由它自己决定要不要调工具，管理端这里由调用方显式勾。这一组开关**不影响** Agent 运行时的任何决策。
+
+        L0/L1 在团队 target 下开不起来（`agent_message` 没有 org 列、`memory_atom` 的 org_id 不参与过滤），此时它们不出现在 `sections` 里，而是进 `degraded` 并说明原因 —— 不静默少两段。
+
+        ## 部分降级
+
+        某一层查不出来时那一层进 `degraded`、其余照常返回。层内**某一路**召回没跑成是另一回事：那一层照样给结果，route 级原因在 section 自己的 `degraded_routes` 里。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryRetrievalRequest'
+      responses:
+        '200':
+          description: 上下文分段与 prompt 预览（单层失败时可能部分降级）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryRetrievalPrompt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+  /memory/query/l0:
+    post:
+      tags: [Memory Query]
+      summary: 分页浏览 L0 原始对话记录
+      operationId: queryMemoryL0
+      description: |
+        查询已保存的原始消息记录，不执行 hybrid、向量或关键词召回。默认按消息创建时间倒序分页，返回完整消息正文。
+
+        `session_id` 可用于将结果限定在单个会话。传入的会话不存在时返回 404；会话存在但没有符合条件的消息时返回空列表。
+        当前不支持 `team_id` 下的 L0 浏览，传团队 target 返回 400。
+        此端点要求 `Y-Trader-Admin` 角色。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L0QueryRequest'
+      responses:
+        '200':
+          description: 分页后的原始消息记录
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L0QueryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /memory/query/l1:
+    post:
+      tags: [Memory Query]
+      summary: 分页浏览 L1 原子记忆记录
+      operationId: queryMemoryL1
+      description: |
+        查询已保存的原子记忆记录，不执行 hybrid、向量或关键词召回。默认按 `updated_at` 倒序分页。
+
+        `text_contains` 是字面文本过滤，不等同于 Agent 工具中的语义召回。当前不支持 `team_id` 下的 L1 浏览，传团队 target 返回 400。
+        此端点要求 `Y-Trader-Admin` 角色。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L1QueryRequest'
+      responses:
+        '200':
+          description: 分页后的原子记忆记录
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L1QueryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+  /memory/query/l2:
+    post:
+      tags: [Memory Query]
+      summary: 分页列出 L2 场景索引
+      operationId: queryMemoryL2
+      description: |
+        列出 target scope 下已经保存的场景。默认只返回摘要索引，不包含全文；需要全文时使用 `POST /memory/query/l2/detail`。
+
+        当前场景数量上限较小，本接口是列表查询而不是语义检索。`filename_contains` 只做场景文件名的字面包含筛选。
+        此端点要求 `Y-Trader-Admin` 角色。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L2QueryRequest'
+      responses:
+        '200':
+          description: 分页后的场景索引
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L2QueryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+  /memory/query/l2/detail:
+    post:
+      tags: [Memory Query]
+      summary: 获取单篇 L2 场景全文
+      operationId: queryMemoryL2Detail
+      description: |
+        根据 target 与场景 `filename` 读取单篇场景全文（包含 META 块）。此接口是精确读取，不执行语义检索。
+        未找到指定场景时返回 404。此端点要求 `Y-Trader-Admin` 角色。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L2DetailRequest'
+      responses:
+        '200':
+          description: 场景全文
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L2DetailResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /memory/query/l3:
+    post:
+      tags: [Memory Query]
+      summary: 读取 L3 画像
+      operationId: queryMemoryL3
+      description: |
+        读取 target scope 下的 `persona.md`。一个 scope 至多有一篇画像；画像尚未生成是正常状态，返回 `persona: null` 而不是 404。
+        此端点要求 `Y-Trader-Admin` 角色。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TargetRequest'
+      responses:
+        '200':
+          description: 当前画像；尚未生成时为 null
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L3QueryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+  /memory/extraction/l1:
+    post:
+      tags: [Memory Extraction]
+      summary: 读取某个会话的 L1 抽取水位
+      operationId: getL1Extraction
+      description: |
+        读 `memory_atom_cursor` 那**一行权威水位**：`last_seq` 就是"抽到哪了"的全部答案 —— 下一次 L1 抽取读 `seq > 它`。
+
+        不返回"还剩几轮没抽"这类派生值（理由见本文件 info 的提取进度那一段）。会话不存在、或不属于 `target` 指向的 user 时返回 404（两者共用同一个响应）。
+        传 `team_id` 返回 400：这张水位表的键是 `session_id`，没有 org 维度。
+
+        `last_scene_name` 是 L1 的**情境名**（提示词「结合上一个情境」的输入），不是 L2 的场景名 —— 拿它去对 `/memory/query/l2` 返回的 `filename` 是对不上的。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L1ExtractionRequest'
+      responses:
+        '200':
+          description: 该会话的 L1 水位
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L1ExtractionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /memory/extraction/l2:
+    post:
+      tags: [Memory Extraction]
+      summary: 读取某个会话的 L2 整合水位
+      operationId: getL2Extraction
+      description: |
+        读 `memory_scene_cursor` 那**一行**。三个字段要一起看：
+
+            last_atom_updated_time   整合到哪条 L1 记忆了（进度）
+            last_atom_ids            恰好落在那个时间戳上的那一批，**只是边界**
+            last_l2_at               上次 L2 跑完的时刻（**含空转那一次**）
+
+        `last_atom_ids` 不是一份消费台账 —— 上一次整合真正看过哪些记忆，库里没有记（见 info 的跨层溯源那一段）。
+        错误语义与 `/memory/extraction/l1` 相同（团队 target 400，会话不可见 404）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L2ExtractionRequest'
+      responses:
+        '200':
+          description: 该会话的 L2 水位
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L2ExtractionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /memory/extraction/l3:
+    post:
+      tags: [Memory Extraction]
+      summary: 读取某个 scope 的 L3 画像生成水位
+      operationId: getL3Extraction
+      description: |
+        读 `memory_persona_cursor` 那**一行**。与上面两条**粒度不同**：水位的键是 scope（`agent_id` + `user_id`|`team_id`），不是会话 —— 画像本身就是跨会话聚合的产物，`memory_scene` 上没有 `session_id`。所以请求体里只有 `target`。
+
+        这个 scope 从没生成过画像**不是错误**：返回一组默认值（两个水位 `null`、空 id 集），与 `/memory/query/l3` 那边"画像尚未生成时返回 `persona: null`"是同一条取舍。
+        团队 scope **支持**（这是唯一支持团队的一条）。返回里回显 scope 的两半 —— `agent_id` 是最容易传错的那一半（同一个 user 在不同 duty 下是两份画像）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L3ExtractionRequest'
+      responses:
+        '200':
+          description: 该 scope 的 L3 水位；从没生成过时是一组默认值
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L3ExtractionResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+
+  /memory/query/l1/sources:
+    post:
+      tags: [Memory Query]
+      summary: 一条 L1 记忆是从哪几句原话来的
+      operationId: queryMemoryL1Sources
+      description: |
+        按 `memory_atom.source_message_ids` 取回来源消息。这是层间**唯一一条真落在库里的边**。
+
+        返回同时给出 `content`（这条记忆**当下**的样子）、`version` 与 `missing_message_ids` —— 那一列没有外键、也不保证消息还在，而 L1 的合并会把两条记忆的来源并起来。所以"记得有 5 条来源、只找到 3 条"必须是看得见的事实：只返回找到的那三条，读起来就是"这条记忆只有三条来源"。
+
+        因此来源列表是**当下的**，不是"最初那次抽取读了什么" —— 被合并过的记忆，它的来源覆盖所有被合并进来的那几条。
+
+        记忆不存在、或承载它的会话对 `target` 不可见，都返回 404（不区分）。传 `team_id` 返回 400。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L1SourcesRequest'
+      responses:
+        '200':
+          description: 这条记忆的来源消息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L1SourcesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /memory/query/l0/atoms:
+    post:
+      tags: [Memory Query]
+      summary: 反查一条原话进了哪些记忆
+      operationId: queryMemoryL0Atoms
+      description: |
+        同一列的反向：`source_message_ids @> [message_id]`。
+
+        `session_id` **必填**，不是可选收窄 —— 那一列上没有 GIN 索引，包含查询本身会全表扫，靠会话把候选收窄到单个会话的记忆上（几条到几十条）。跨会话反查要一张索引，那是写入侧的决定，本组不提供。
+
+        消息不存在、或不属于该会话，返回 404 而不是空列表：后者读起来是"这条消息没有产生任何记忆"，而那是另一件事。
+        消息存在但没有任何记忆引用它 -> **空列表**（这是常态：抽不出东西的轮次本来就不产生记忆）。传 `team_id` 返回 400。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/L0AtomsRequest'
+      responses:
+        '200':
+          description: 引用了这条消息的记忆
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/L0AtomsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/PermissionDenied'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        使用 Casdoor 签发的访问令牌。除登录门槛外，本组端点还要求 JWT 的 `roles` 中精确包含 `Y-Trader-Admin`。
+  schemas:
+    RetrievalTarget:
+      type: object
+      description: 查询 scope：`user_id` 与 `team_id` 必须恰好提供一个，`agent_id` 必填。
+      required: [agent_id]
+      properties:
+        user_id:
+          type: string
+          minLength: 1
+          description: 个人记忆的归属用户（Casdoor sub）。
+        team_id:
+          type: string
+          minLength: 1
+          description: 团队记忆的归属组织；数据库列名为 `org_id`。
+        agent_id:
+          type: string
+          minLength: 1
+          description: 归属的业务 agent（写入侧对应 business_agent_id / duty_key）。
+      oneOf:
+        - required: [user_id]
+        - required: [team_id]
+
+    ScopeKind:
+      type: string
+      enum: [user, team]
+      description: 由 target 解析得到的 scope 类型。
+
+    TargetRequest:
+      type: object
+      required: [target]
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+
+    MemoryRetrievalRequest:
+      type: object
+      required: [target]
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        input:
+          type: [string, 'null']
+          minLength: 1
+          description: |
+            本轮的用户输入。**开了 `retrieve.l0` / `retrieve.l1` 时必填** —— 混合召回以它为查询串；只取 L2/L3 时可以不给自己（那两层与「这一轮问了什么」无关，而取它们的那条路在一个没有用户消息的轮次上根本没有查询串）。
+
+            条件必填的理由：缺了它「开了 L0 却没输入」只剩两种坏选择 —— 静默不召回，或报一个与原因无关的错。服务端按「开了 L0/L1 就必须有它」校验（400）。它原样回显在响应里。
+        retrieve:
+          $ref: '#/components/schemas/MemoryPreviewLayers'
+        limits:
+          $ref: '#/components/schemas/MemoryPreviewLimits'
+        session_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            限定 **L0** 的召回范围到单个会话；省略则跨会话。
+            对 L1 **无效** —— 那是跨会话累积的用户事实，按会话过滤会把它削成本轮对话的记忆，与那一层的定义冲突。
+            L2/L3 同样不受影响（它们的粒度是 scope，本来就没有会话维度）。
+            这一层不做归属校验：id 只是过滤条件，谁有资格看这个会话的记忆由调用方那道门槛决定。
+
+    MemoryPreviewLayers:
+      type: object
+      description: |
+        预览里展示哪几层，**以及要不要真的去召回**。
+
+        默认只开 L2/L3 —— 那不是省事，是成本的分界：画像 + 场景索引是几句话的量级、每一轮都负担得起（它们本来就是每轮都进上下文的）；L0/L1 是一次**真正的检索**（两路召回 + 融合 + 条数），所以是按需的动作。
+
+        `l0` / `l1` 为 true 时服务端**真的跑一轮混合召回**（与 Agent 调 `memory.search` / `memory_atom.search` 同一条实现），查询串就是 `input`。
+        团队 target 下这两层开不起来（没有团队维度），此时它们不出现在 `sections` 里，而是进 `degraded` 并说明原因。
+      properties:
+        l0:
+          type: boolean
+          default: false
+          description: 是否真的跑一轮 L0 原始消息召回。默认关闭。
+        l1:
+          type: boolean
+          default: false
+          description: 是否真的跑一轮 L1 原子记忆召回。默认关闭。
+        l2:
+          type: boolean
+          default: true
+          description: 是否包含 L2 场景索引，默认开启。
+        l3:
+          type: boolean
+          default: true
+          description: 是否包含 L3 画像，默认开启。
+
+    MemoryPreviewLimits:
+      type: object
+      description: |
+        预览中各层的条数上限。
+
+        L0/L1 的默认值与取值范围**跟着召回端点**（10 / 最大 50）—— 同一次召回的条数在预览与工具里必须是同一套口径，否则「预览里看到 5 条」与「Agent 拿到 10 条」会被当成两个答案。
+      properties:
+        l0:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+          description: L0 召回最多返回几条（融合之后截断）。
+        l1:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 10
+          description: L1 召回最多返回几条（融合之后截断）。
+        l2:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 12
+          description: 最多返回的场景索引数量。
+
+    PersonaRecord:
+      type: object
+      required: [content, filename, version, updated_at]
+      properties:
+        content:
+          type: string
+          description: 整篇 persona.md（含 META 块），不截断。
+        filename:
+          type: string
+          const: persona.md
+        version:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+
+    SceneSummary:
+      type: object
+      required: [filename, summary, heat, version, created_at, updated_at]
+      properties:
+        filename:
+          type: string
+          description: 相对 scene_blocks/ 的场景文件名，是该场景的标识。
+        summary:
+          type: string
+          description: META 块里的摘要；空字符串表示没有摘要。
+        heat:
+          type: [integer, 'null']
+          description: 场景热度；无法解析时为 null。
+        version:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+          description: 这篇场景第一次写下来的时间。合并会改写 `updated_at`、它不动。
+        updated_at:
+          type: string
+          format: date-time
+
+    SceneDetail:
+      allOf:
+        - $ref: '#/components/schemas/SceneSummary'
+        - type: object
+          required: [content]
+          properties:
+            content:
+              type: string
+              description: 场景全文（含 META 块）。
+
+    FactRecord:
+      type: object
+      description: 一条已经保存的 L1 原子记忆记录，不包含召回分数。
+      required: [record_id, content, type, priority, version, updated_at]
+      properties:
+        record_id:
+          type: string
+          format: uuid
+          description: 当前存活记录的 ID；合并后不保证旧 ID 长期稳定。
+        content:
+          type: string
+          description: 原子记忆陈述，整条返回，不截断。
+        type:
+          type: string
+          description: 记忆类型，例如 persona、episodic、instruction；词表可扩展。
+        priority:
+          type: integer
+          minimum: -1
+          maximum: 100
+          description: -1 表示全局指令；普通优先级为 0-100。
+        scene_name:
+          type: [string, 'null']
+          description: 所属场景名；可能为空。
+        version:
+          type: integer
+        timestamp_str:
+          type: [string, 'null']
+          description: 从提示词提取的时间线文本，不应用作可靠的时间范围过滤。
+        updated_at:
+          type: string
+          format: date-time
+
+    ConversationRecord:
+      type: object
+      description: 一条已经保存的 L0 原始消息记录，不是搜索命中片段。
+      required: [message_id, session_id, seq, role, text, created_at]
+      properties:
+        message_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        seq:
+          type: integer
+          description: 会话内消息序号，允许存在空洞。
+        role:
+          type: string
+          enum: [user, assistant]
+        text:
+          type: string
+          description: 完整消息正文。
+        created_at:
+          type: string
+          format: date-time
+
+    Pagination:
+      type: object
+      required: [limit, has_more]
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+        next_cursor:
+          type: [string, 'null']
+          description: 不透明的下一页游标；无下一页时为 null。
+        has_more:
+          type: boolean
+          description: 是否还有下一页。
+
+    PersonaSection:
+      type: object
+      required: [block, layer, title, items, returned, truncated]
+      properties:
+        block:
+          const: persona
+        layer:
+          const: l3
+        title:
+          type: string
+        items:
+          type: array
+          maxItems: 1
+          items:
+            $ref: '#/components/schemas/PersonaRecord'
+        returned:
+          type: integer
+        truncated:
+          type: boolean
+
+    SceneSection:
+      type: object
+      required: [block, layer, title, items, returned, scenes_total, truncated]
+      properties:
+        block:
+          const: scenes
+        layer:
+          const: l2
+        title:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SceneSummary'
+        returned:
+          type: integer
+        scenes_total:
+          type: integer
+          description: |
+            这个 scope 总共有多少篇场景（**不是** `items` 的长度）。
+            该 scope 的场景多于 `limits.l2` 时，`items` 会被截断，而"共 N 篇、以下 M 篇"这个计数必须让模型看得见 —— 它看不到被截掉的部分时，会以为清单就是全部。
+            与 `items` 同源、同一次读取算出，因此两者不会对不上。
+        truncated:
+          type: boolean
+
+    RecallRoute:
+      type: string
+      enum: [keyword, vector]
+      description: 一路召回。两层的取值域相同（名字跟着那两张挂载表走）。
+
+    ConversationHit:
+      type: object
+      description: |
+        L0 召回的一条命中。
+
+        ⚠️ `text` 是**片段**，与 `ConversationRecord.text`（`/memory/query/l0` 的整条消息）不是一回事 —— 这里给的是截断后的片段（400 字符），因为它的消费者是模型。所以它是**独立**的 schema，不是 `ConversationRecord` 加两个字段。
+      required: [message_id, session_id, seq, role, text, created_at, score, matched_by]
+      properties:
+        message_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+        seq:
+          type: integer
+        role:
+          type: string
+          enum: [user, assistant]
+        text:
+          type: string
+          description: 命中的**片段**（截断过），不是整条消息。
+        created_at:
+          type: string
+          format: date-time
+        score:
+          type: number
+          description: 融合分，越大越相关。**只在本次响应内可比**（关键词分来自 ts_rank、向量分来自余弦距离）。
+        matched_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecallRoute'
+          description: 这条被哪几路召回到。
+
+    FactHit:
+      type: object
+      description: |
+        L1 召回的一条命中。
+
+        ⚠️ `content` **不截断**（与 L0 的片段相反）：这边已经是提炼过的陈述，截断可能把「用户喜欢 X，但不能 Y」切掉后半句。
+      required: [record_id, content, type, priority, scene_name, score, matched_by, created_at, updated_at]
+      properties:
+        record_id:
+          type: string
+          format: uuid
+          description: 记忆身份。合并会改写它保活的那条、删掉被吃掉的。
+        content:
+          type: string
+        type:
+          type: string
+        priority:
+          type: integer
+        scene_name:
+          type: string
+        score:
+          type: number
+          description: 融合分。**只在本次响应内可比**。
+        matched_by:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecallRoute'
+        created_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            这条记忆第一次被写下来的时间（源列 `memory_atom.created_time`）。
+            合并会改写 `updated_at`、它不动 —— 「早就有的事实」与「刚被合并
+            改写过的事实」是两件事，两个一起给才分得出来。
+        updated_at:
+          type: [string, 'null']
+          format: date-time
+          description: 最后一次被写入 / 合并的时间（源列 `memory_atom.updated_time`）。
+
+    DegradedHitRoute:
+      type: object
+      description: |
+        这一层里**某一路**召回没跑成（关键词路或向量路）。
+
+        与顶层 `degraded` 不是一回事：顶层说的是一层**整体**没查成（没有 section），这个说的是"这一层查成了、但其中一路挂了"（有 section，带着另一路的结果）。分开是刻意的 —— 合成一个的话，「向量路挂了但还是给了关键词结果」会看起来像「整层没跑成」。
+      required: [route, reason]
+      properties:
+        route:
+          $ref: '#/components/schemas/RecallRoute'
+        reason:
+          type: string
+
+    ConversationHitSection:
+      type: object
+      description: |
+        L0 那一段（一次**真召回**的结果）。
+
+        ⚠️ 没有 `truncated`：召回是 top-K、不是分页 —— 融合之后「还有没有更多」没有定义（分数是相对的，`limit` 就是答案的边界）。要更多就调大 `limits.l0`。硬塞一个布尔量进去只会是一个猜出来的值。
+      required: [block, layer, title, items, returned, degraded_routes]
+      properties:
+        block:
+          const: conversations
+        layer:
+          const: l0
+        title:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConversationHit'
+          description: 按融合分降序。
+        returned:
+          type: integer
+        degraded_routes:
+          type: array
+          items:
+            $ref: '#/components/schemas/DegradedHitRoute'
+
+    FactHitSection:
+      type: object
+      description: L1 那一段（一次**真召回**的结果）。字段与 L0 那段同形。
+      required: [block, layer, title, items, returned, degraded_routes]
+      properties:
+        block:
+          const: facts
+        layer:
+          const: l1
+        title:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FactHit'
+          description: 按融合分降序。
+        returned:
+          type: integer
+        degraded_routes:
+          type: array
+          items:
+            $ref: '#/components/schemas/DegradedHitRoute'
+
+    PromptSection:
+      oneOf:
+        - $ref: '#/components/schemas/PersonaSection'
+        - $ref: '#/components/schemas/SceneSection'
+        - $ref: '#/components/schemas/ConversationHitSection'
+        - $ref: '#/components/schemas/FactHitSection'
+      discriminator:
+        propertyName: block
+        mapping:
+          persona: '#/components/schemas/PersonaSection'
+          scenes: '#/components/schemas/SceneSection'
+          conversations: '#/components/schemas/ConversationHitSection'
+          facts: '#/components/schemas/FactHitSection'
+
+    DegradedLayer:
+      type: object
+      required: [layer, reason]
+      properties:
+        layer:
+          type: string
+          enum: [l0, l1, l2, l3]
+        reason:
+          type: string
+          description: |
+            层查询失败的原因；服务端同时应记录 warning 日志。
+            团队 target 下开了 L0/L1 也走这里（那两层没有团队维度，而汇总端点不能整单 400）。
+
+    MemoryRetrievalPromptText:
+      type: object
+      required: [system, user]
+      properties:
+        system:
+          type: [string, 'null']
+          description: memory_retrieval 的系统提示词常量；尚未实现时为 null。
+        user:
+          type: string
+          description: 根据 sections 渲染得到的用户消息预览。
+
+    MemoryRetrievalPrompt:
+      type: object
+      required: [retrieval_id, input, target, scope_kind, sections, degraded, prompt, generated_at]
+      properties:
+        retrieval_id:
+          type: string
+          format: uuid
+        input:
+          type: [string, 'null']
+          description: 本轮输入回显。请求里是条件必填，所以只取 L2/L3 的那次预览会是 null（键恒在）。
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        sections:
+          type: array
+          description: 按 prompt 顺序返回：画像 -> 场景 -> L0 命中 -> L1 命中（后两段只在 retrieve.l0 / retrieve.l1 为 true 时出现）。
+          items:
+            $ref: '#/components/schemas/PromptSection'
+        degraded:
+          type: array
+          items:
+            $ref: '#/components/schemas/DegradedLayer'
+        prompt:
+          $ref: '#/components/schemas/MemoryRetrievalPromptText'
+        generated_at:
+          type: string
+          format: date-time
+
+    L0QueryRequest:
+      type: object
+      required: [target]
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        session_id:
+          type: string
+          format: uuid
+          description: 可选；限定单个会话。不传则跨该个人 scope 的会话查询。
+        roles:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            enum: [user, assistant]
+          description: 限定消息角色；不传表示两种角色都返回。
+        time_from:
+          type: string
+          format: date-time
+          description: created_at 下界（含）。
+        time_to:
+          type: string
+          format: date-time
+          description: created_at 上界（含）。
+        text_contains:
+          type: string
+          minLength: 1
+          description: 可选的字面文本包含过滤；不执行语义或向量召回。
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 20
+        cursor:
+          type: [string, 'null']
+          description: 上一页返回的 next_cursor；第一页不传。
+        order:
+          type: string
+          enum: [created_at_desc, created_at_asc, session_seq_asc, session_seq_desc]
+          default: created_at_desc
+          description: 默认按创建时间倒序；session_seq 排序建议仅与 session_id 一起使用。
+
+    L0QueryResponse:
+      type: object
+      required: [scope_kind, items, page]
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConversationRecord'
+        page:
+          $ref: '#/components/schemas/Pagination'
+
+    L1QueryRequest:
+      type: object
+      required: [target]
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        type:
+          type: string
+          description: 精确匹配记忆类型，例如 persona、episodic、instruction；不传表示全部类型。
+        priority:
+          type: integer
+          minimum: -1
+          maximum: 100
+          description: 精确匹配 priority；-1 表示全局指令。
+        scene_name:
+          type: string
+          description: 精确匹配所属场景名。
+        updated_from:
+          type: string
+          format: date-time
+          description: updated_at 下界（含）。
+        updated_to:
+          type: string
+          format: date-time
+          description: updated_at 上界（含）。
+        text_contains:
+          type: string
+          minLength: 1
+          description: 可选的记忆正文字面包含过滤；不执行语义或向量召回。
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 20
+        cursor:
+          type: [string, 'null']
+          description: 上一页返回的 next_cursor；第一页不传。
+        order:
+          type: string
+          enum: [updated_at_desc, updated_at_asc, priority_desc, priority_asc]
+          default: updated_at_desc
+          description: 同一排序值下由服务端追加稳定的唯一键作为 tie-breaker。
+
+    L1QueryResponse:
+      type: object
+      required: [scope_kind, items, page]
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/FactRecord'
+        page:
+          $ref: '#/components/schemas/Pagination'
+
+    L2QueryRequest:
+      type: object
+      required: [target]
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        filename_contains:
+          type: string
+          minLength: 1
+          description: 可选的文件名字面包含过滤。
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 50
+        cursor:
+          type: [string, 'null']
+          description: 上一页返回的 next_cursor；第一页不传。
+        order:
+          type: string
+          enum: [updated_at_desc, updated_at_asc, filename_asc]
+          default: updated_at_desc
+
+    L2QueryResponse:
+      type: object
+      required: [scope_kind, items, page]
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SceneSummary'
+        page:
+          $ref: '#/components/schemas/Pagination'
+
+    L2DetailRequest:
+      type: object
+      required: [target, filename]
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        filename:
+          type: string
+          minLength: 1
+          description: 精确场景文件名，来自 L2 列表返回的 filename。
+
+    L2DetailResponse:
+      type: object
+      required: [scope_kind, scene]
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        scene:
+          $ref: '#/components/schemas/SceneDetail'
+
+    L3QueryResponse:
+      type: object
+      required: [scope_kind, persona]
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        persona:
+          oneOf:
+            - $ref: '#/components/schemas/PersonaRecord'
+            - type: 'null'
+          description: 当前画像；null 表示此 scope 尚未生成画像。
+
+    L1ExtractionRequest:
+      type: object
+      required: [target, session_id]
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        session_id:
+          type: string
+          format: uuid
+          description: 要查的会话。水位是会话级的（`memory_atom_cursor` 的主键），所以必填。
+
+    L1CursorRecord:
+      type: object
+      required: [last_seq, last_scene_name]
+      properties:
+        last_seq:
+          type: integer
+          minimum: 0
+          description: 已抽过的最大 `agent_message.seq`。下一次抽取读 `seq > 它`。**没有水位行等价于 0**（行是惰性创建的）。
+        last_scene_name:
+          type: string
+          description: |
+            上一次抽取结束时处在哪个情境 —— 提示词任务一「结合上一个情境」的输入。空串 = 还没有过情境。
+            它不是 L2 的场景名（见 `/memory/extraction/l1` 的说明）。
+
+    L1ExtractionResponse:
+      type: object
+      required: [scope_kind, session_id, cursor]
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        session_id:
+          type: string
+          format: uuid
+        cursor:
+          $ref: '#/components/schemas/L1CursorRecord'
+
+    L2ExtractionRequest:
+      type: object
+      required: [target, session_id]
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        session_id:
+          type: string
+          format: uuid
+
+    L2CursorRecord:
+      type: object
+      required: [last_atom_updated_time, last_atom_ids, last_l2_at]
+      properties:
+        last_atom_updated_time:
+          type: [string, 'null']
+          format: date-time
+          description: 已经整合过的 L1 记忆的最大 `updated_time`。null = 还没有任何 L1 进过画像。
+        last_atom_ids:
+          type: array
+          items:
+            type: string
+          description: 恰好落在上面那个时间戳上、已经消费过的记忆 id。**只是边界那一批**，不是消费台账。
+        last_l2_at:
+          type: [string, 'null']
+          format: date-time
+          description: 上一次 L2 跑完的时刻（**含"跑了但没有新记忆"那一次**）。null = 这个会话从没跑过整合。
+
+    L2ExtractionResponse:
+      type: object
+      required: [scope_kind, session_id, cursor]
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        session_id:
+          type: string
+          format: uuid
+        cursor:
+          $ref: '#/components/schemas/L2CursorRecord'
+
+    L3ExtractionRequest:
+      type: object
+      required: [target]
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+
+    L3CursorRecord:
+      type: object
+      required: [last_scene_updated_time, last_scene_ids, last_l3_at]
+      properties:
+        last_scene_updated_time:
+          type: [string, 'null']
+          format: date-time
+          description: 已经抽象过的场景的最大 `updated_at`。null = 还没有任何场景进过画像。
+        last_scene_ids:
+          type: array
+          items:
+            type: string
+          description: 恰好落在上面那个时间戳上、已经抽象过的场景 id。与 L2 的 `last_atom_ids` 同一个成因，同样**只是边界那一批**。
+        last_l3_at:
+          type: [string, 'null']
+          format: date-time
+          description: 上一次画像生成的时刻（**含空转那一次**）。触发条件 2（距上次生成 >= N 轮）拿它当基准。null = 从没生成过。
+
+    L3ExtractionResponse:
+      type: object
+      required: [scope_kind, agent_id, user_id, team_id, cursor]
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        agent_id:
+          type: string
+          description: 回显 scope 的两半之一 —— 同一个 user 在不同 duty 下是两份画像，这一半最容易传错。
+        user_id:
+          type: [string, 'null']
+        team_id:
+          type: [string, 'null']
+        cursor:
+          $ref: '#/components/schemas/L3CursorRecord'
+
+    L1SourcesRequest:
+      type: object
+      required: [target, record_id]
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        record_id:
+          type: string
+          format: uuid
+          description: L1 记忆 id（`memory_atom.record_id`）。
+
+    L1SourcesResponse:
+      type: object
+      required: [scope_kind, record_id, session_id, content, version, sources, missing_message_ids]
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        record_id:
+          type: string
+          format: uuid
+        session_id:
+          type: string
+          format: uuid
+          description: 承载这条记忆的会话。来源消息全部落在它里面。
+        content:
+          type: string
+          description: 这条记忆**当下**的正文（合并会改写它，见 `/memory/query/l1/sources` 的说明）。
+        version:
+          type: integer
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConversationRecord'
+        missing_message_ids:
+          type: array
+          items:
+            type: string
+          description: |
+            `source_message_ids` 里**取不到**的那些（按存进库里的原始字符串给出，不是重排成 UUID 的写法）。
+            没有外键、也不保证消息还在，所以这个差集是"记得有 N 条、只找到 M 条"的唯一痕迹。
+
+    L0AtomsRequest:
+      type: object
+      required: [target, session_id, message_id]
+      properties:
+        target:
+          $ref: '#/components/schemas/RetrievalTarget'
+        session_id:
+          type: string
+          format: uuid
+          description: 消息所属会话。同时用来把包含查询收窄到该会话的记忆。
+        message_id:
+          type: string
+          format: uuid
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 20
+          description: 最多返回几条记忆（一句话可以支撑好几条不同的结论）。
+
+    L0AtomsResponse:
+      type: object
+      required: [scope_kind, session_id, message_id, atoms]
+      properties:
+        scope_kind:
+          $ref: '#/components/schemas/ScopeKind'
+        session_id:
+          type: string
+          format: uuid
+        message_id:
+          type: string
+          format: uuid
+        atoms:
+          type: array
+          items:
+            $ref: '#/components/schemas/FactRecord'
+
+    ErrorResponse:
+      type: object
+      description: Lightweight error envelope; align code and message with the application's common error response.
+      properties:
+        code:
+          type: [string, 'null']
+        message:
+          type: string
+
+  responses:
+    BadRequest:
+      description: |
+        请求参数不合法，包括：target 中 user_id 与 team_id 都未提供或同时提供、agent_id 缺失、筛选或分页参数越界，或者在当前不支持的团队 scope 下调用 L0/L1 Query。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    PermissionDenied:
+      description: 调用者未通过登录门槛，或 JWT roles 未精确包含 Y-Trader-Admin。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: 指定的 session_id 或场景 filename 不存在。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'

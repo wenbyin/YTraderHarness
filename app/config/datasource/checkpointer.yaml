@@ -1,0 +1,41 @@
+name: checkpointer
+type: postgresql_checkpointer
+
+enabled: true
+required: true
+
+startup_timeout_seconds: 15
+
+config:
+  # DSN 从 postgresql 数据源推导：取其 dsn 并去掉 +asyncpg 方言后缀。
+  # 这样密码只写在一处，不会出现两边不一致。
+  #
+  # 推导结果等价于：
+  #   postgresql://postgres:***@localhost:5432/ytrader_agent
+  #
+  # 也可以直接写死，二选一：
+  #   dsn: "postgresql://postgres:***@localhost:5432/ytrader_agent"
+  derive_from: postgresql
+
+  # checkpointer 的连接池与业务池相互独立（驱动不同、生命周期不同）。
+  # 一次运行期间会反复写 checkpoint，但不能占太多连接。
+  pool_min_size: 1
+  pool_max_size: 5
+
+  # 同一个池上的 LangGraph store（跨轮存储）。目前唯一的消费者是审批
+  # 拦截器的批准账本（app/agent/tools/processor/interceptor/approval.py）
+  # —— 批准记录必须落在**持久**存储上，否则重启后停在 waiting_input 的
+  # 运行 resume 时，之前批过的会再问一遍。
+  #
+  # ⚠️ 单位是**分钟**。langgraph 的 BaseStore 就按分钟收 ttl，而本仓库
+  # 审批配置里那个 always_ttl_seconds 是**秒** —— 两者不要互相折算，
+  # 换算收在 StoreApprovalLedger 那一处。这里按分钟原样填。
+  store:
+    # 7 天。**没显式传 ttl** 的写入拿到的是这个有效期，审批账本里
+    # 「单次批准」那一笔就是这种写入。它不能省：没有它那些行的
+    # expires_at 是 NULL，而清扫只删 expires_at 非空的行 —— 表只增不减。
+    default_ttl_minutes: 10080
+
+    # 后台清扫间隔。清扫任务不会自动启动，由 GraphCheckpointerProvider
+    # 在 open 时拉起、close 时停掉。
+    sweep_interval_minutes: 60

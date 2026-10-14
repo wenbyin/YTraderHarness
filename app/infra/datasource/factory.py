@@ -14,9 +14,11 @@ from .models import (
     MilvusDataSourceDefinition,
     Neo4jDataSourceDefinition,
     PostgreSQLDataSourceDefinition,
+    RedisDataSourceDefinition,
 )
 from .neo4j import Neo4jDataSource
 from .postgresql import PostgreSQLDataSource
+from .redis import RedisDataSource
 
 
 class DataSourceFactory:
@@ -57,6 +59,15 @@ class DataSourceFactory:
                 pool_max_size=(
                     definition.config.pool_max_size
                 ),
+                # store 与 checkpointer 共用上面那个池（理由见
+                # GraphCheckpointerProvider 的模块 docstring）。
+                # 单位是**分钟** —— 见 StoreSettings 的说明。
+                store_default_ttl_minutes=(
+                    definition.config.store.default_ttl_minutes
+                ),
+                store_sweep_interval_minutes=(
+                    definition.config.store.sweep_interval_minutes
+                ),
             )
 
         if isinstance(
@@ -88,6 +99,14 @@ class DataSourceFactory:
                 Neo4jDataSourceDefinition,
         ):
             return Neo4jDataSource(
+                definition
+            )
+
+        if isinstance(
+                definition,
+                RedisDataSourceDefinition,
+        ):
+            return RedisDataSource(
                 definition
             )
 

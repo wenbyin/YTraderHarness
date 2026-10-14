@@ -25,12 +25,13 @@ parser/、policy/ 下也没有任何具体实现。因此默认构造出来的
 
 from __future__ import annotations
 
-import importlib
-import inspect
-import pkgutil
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.common.utils import (
+    import_package_modules,
+    leaf_subclasses,
+)
 from app.services.document.domain.schemas.enum import (
     EmbeddingOutput, StorageBackend, ModalityType, ProcessorRole,
 )
@@ -68,69 +69,6 @@ CAPABILITY_PACKAGES = (
     # 于是 registry.enrichers 一直是空表。见 enricher/base.py。
     "app.services.document.enricher",
 )
-
-
-def _import_index_modules() -> None:
-    """
-    导入索引后端包下的所有模块。
-
-    与 _import_capability_modules 同样的理由：`__subclasses__()` 只认识
-    已经被导入的类，反射之前必须先把模块走一遍。
-    """
-
-    package = importlib.import_module(INDEX_PACKAGE)
-
-    if not hasattr(package, "__path__"):
-        return
-
-    for module_info in pkgutil.walk_packages(
-            package.__path__,
-            package.__name__ + ".",
-    ):
-        importlib.import_module(module_info.name)
-
-
-def _import_capability_modules() -> None:
-    """
-    导入各 role 包下的所有模块。
-
-    `__subclasses__()` 只认识**已经被导入**的类，所以反射之前必须
-    先把模块走一遍。这里不依赖各包的 __init__.py 逐个 re-export：
-    新增一个 .py 文件就自动生效，不用回来改注册表。
-    """
-
-    for package_name in CAPABILITY_PACKAGES:
-        package = importlib.import_module(package_name)
-
-        if not hasattr(package, "__path__"):
-            continue
-
-        for module_info in pkgutil.walk_packages(
-                package.__path__,
-                package.__name__ + ".",
-        ):
-            importlib.import_module(module_info.name)
-
-
-def _leaf_subclasses(cls: type) -> list[type]:
-    """
-    深度优先收集 cls 下所有"最小子类"，即自己不再有子类的那些。
-
-    中间基类（只做共性、通常还是抽象的，如 TextDocumentParser）
-    不进结果 —— 它们对注册表没有意义。
-    """
-
-    result: list[type] = []
-
-    for subclass in cls.__subclasses__():
-        children = _leaf_subclasses(subclass)
-
-        if children:
-            result.extend(children)
-        else:
-            result.append(subclass)
-
-    return result
 
 
 class CapabilityNotFound(LookupError):
@@ -437,14 +375,13 @@ class PipelineRegistry:
         比让某个分支悄悄跳过写入要好。
         """
 
-        _import_index_modules()
+        import_package_modules(INDEX_PACKAGE)
 
         backends: dict[StorageBackend, IndexBackend] = {}
 
-        for backend_cls in _leaf_subclasses(IndexBackend):
-
-            if inspect.isabstract(backend_cls):
-                continue
+        for backend_cls in leaf_subclasses(
+                IndexBackend, skip_abstract=True
+        ):
 
             # 没声明 backend_type 的不会被注册：注册表按它索引，
             # 留空等于"这个实现不知道该服务哪个后端"。
@@ -482,16 +419,13 @@ class PipelineRegistry:
         叶子实现排在同层通用实现之前，同层内按模块名排序。
         """
 
-        _import_capability_modules()
+        import_package_modules(*CAPABILITY_PACKAGES)
 
         result: list[DocumentProcessor] = []
 
-        leaf_subclasses = _leaf_subclasses(DocumentProcessor)
-
-        for capability_cls in leaf_subclasses:
-            if inspect.isabstract(capability_cls):
-                continue
-
+        for capability_cls in leaf_subclasses(
+                DocumentProcessor, skip_abstract=True
+        ):
             result.append(capability_cls())
 
         return result

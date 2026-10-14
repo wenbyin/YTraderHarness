@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from typing import Any, Protocol, runtime_checkable
 
 from ..domain.schemas.enum import SourceType
@@ -87,6 +88,15 @@ class ServiceMethodScanner:
         return [
             self._to_manifest(spec)
             for spec in self._registry.scan()
+            # ⚠️ 模块级 langchain 工具**跳过**：它们由
+            # LangchainToolScanner 负责产出 manifest，而两个扫描器
+            # 产出的是同一个 tool_key —— `ToolDiscoverer.discover()`
+            # 对"同一个 key 被两条来源声明"是**直接抛错**的，
+            # 不跳过就会让同步接口整个崩掉。
+            #
+            # 注册表里两种都收（select_specs 需要它们都在），
+            # 但"同步的产出"只能由一条来源负责。
+            if spec.owner is not None
         ]
 
     @staticmethod
@@ -160,46 +170,25 @@ class LangchainToolScanner:
 
     def scan(self) -> list[ToolManifestData]:
 
-        base_tool = _import_base_tool()
-
-        if base_tool is None:
-            # 没装 langchain 就安静跳过 —— 管理功能（同步、文档、
-            # 分类）不该因为少一个可选依赖就跑不起来。
-            return []
-
         found: dict[str, ToolManifestData] = {}
-        seen_objects: set[int] = set()
 
-        for module in _iter_modules(self._packages):
+        for value, module, attr_name in iter_langchain_tools(
+                self._packages
+        ):
+            manifest = self._to_manifest(value, module, attr_name)
 
-            for attr_name, value in vars(module).items():
+            existing = found.get(manifest.tool_key)
 
-                if not isinstance(value, base_tool):
-                    continue
-
-                # 同一个对象被两个名字引用（别名、re-export）时只算一次，
-                # 否则一个工具会在库里出现两行。
-                if id(value) in seen_objects:
-                    continue
-
-                seen_objects.add(id(value))
-
-                manifest = self._to_manifest(
-                    value, module, attr_name
+            if existing is not None:
+                # 两个不同的对象抢同一个 key —— 静默取其一比报错
+                # 危险，与 ToolRegistry.register 同一套取舍。
+                raise ValueError(
+                    f"tool_key {manifest.tool_key!r} 被两个 langchain "
+                    f"工具占用：{existing.entrypoint} 与 "
+                    f"{manifest.entrypoint}。请给其中一个改 name。"
                 )
 
-                existing = found.get(manifest.tool_key)
-
-                if existing is not None:
-                    # 两个不同的对象抢同一个 key —— 静默取其一比报错
-                    # 危险，与 ToolRegistry.register 同一套取舍。
-                    raise ValueError(
-                        f"tool_key {manifest.tool_key!r} 被两个 langchain "
-                        f"工具占用：{existing.entrypoint} 与 "
-                        f"{manifest.entrypoint}。请给其中一个改 name。"
-                    )
-
-                found[manifest.tool_key] = manifest
+            found[manifest.tool_key] = manifest
 
         return list(found.values())
 
@@ -299,6 +288,54 @@ def _docstring(
 def _iter_modules(packages: tuple[str, ...]):
     for package_name in packages:
         yield from iter_package_modules(package_name)
+
+
+#: 供 `ToolRegistry.scan()` 复用同一份发现逻辑 —— 它是**运行时**那一侧，
+#: 本模块 import 了 registry，所以那边只能**惰性** import 它。
+def iter_langchain_tools(
+        packages: tuple[str, ...] | None = None,
+) -> Iterator[tuple[Any, Any, str]]:
+    """
+    遍历包，产出模块级的 langchain 工具：(工具本体, 所属模块, 属性名)。
+
+    ⚠️ 两个消费方，必须是**同一份**发现逻辑
+    -------------------------------------
+        LangchainToolScanner   同步：产出 manifest 写进 tool_definition
+        ToolRegistry.scan()    运行时：登记进注册表，select_specs 才看得见
+
+    各写一份遍历的话，两处对"哪些算模块级工具"的判定早晚会分叉 ——
+    而分叉的症状正是这个函数出现之前那个 bug：库里明明有这条工具、
+    模型却永远拿不到（同步看得到，运行时看不到）。
+
+    同一个对象被两个名字引用（别名、re-export）时只产出一次，
+    否则一个工具会在库里出现两行。
+
+    没装 langchain 就安静跳过 —— 管理功能（同步、文档、分类）不该
+    因为少一个可选依赖就跑不起来。
+    """
+
+    base_tool = _import_base_tool()
+
+    if base_tool is None:
+        return
+
+    seen: set[int] = set()
+
+    for module in _iter_modules(
+            packages if packages is not None else TOOL_SOURCE_PACKAGES
+    ):
+
+        for attr_name, value in vars(module).items():
+
+            if not isinstance(value, base_tool):
+                continue
+
+            if id(value) in seen:
+                continue
+
+            seen.add(id(value))
+
+            yield value, module, attr_name
 
 
 def _import_base_tool() -> type | None:

@@ -14,7 +14,7 @@ domain/schemas/
 │   └── ToolDocumentation / ParameterDocumentation 及其 Update 版本
 │
 ├── classification.py
-│   └── Classification 及其 Create / Update，以及 ToolClassificationUpdate
+│   └── ToolClassificationUpdate（工具 ↔ 能力的关联）
 │
 ├── discovery.py
 │   └── ToolSyncRequest / ToolSyncResult
@@ -25,14 +25,14 @@ domain/schemas/
 
 全部结构逐字段对应 tool.yaml 与 tool_processor.yaml 的
 components/schemas；字段名与枚举取值都以那两份 spec 为准。
+
+⚠️ 能力（Capability）本体的契约**不在本模块** —— 它跟着能力树去了
+app/services/capability/domain/schemas/，对应 capability.yaml。
+本模块只在嵌一份能力进 ToolSummary / ToolDefinitionDetail 时 import
+它（见 tool.py）。
 """
 
-from .classification import (
-    Classification,
-    ClassificationCreate,
-    ClassificationUpdate,
-    ToolClassificationUpdate,
-)
+from .classification import ToolClassificationUpdate
 from .discovery import (
     ToolSyncRequest,
     ToolSyncResult,
@@ -69,9 +69,6 @@ from .tool import (
 )
 
 __all__ = [
-    "Classification",
-    "ClassificationCreate",
-    "ClassificationUpdate",
     "CreateToolProcessorRequest",
     "ExecutionMode",
     "PagedProcessorDefinitionResponse",

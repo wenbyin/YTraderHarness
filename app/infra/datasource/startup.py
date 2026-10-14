@@ -110,6 +110,12 @@ class DataSourceStartup:
                 )
             )
 
+            # 构造是同步的，所以那些"构造即建连"的客户端（Milvus 的
+            # gRPC）需要一个 await 得着的地方把阻塞挪出事件循环 ——
+            # 见 DataSource.initialize 的说明。默认空实现，绝大多数
+            # 数据源一行都不用写。
+            await source.initialize()
+
             healthy = await asyncio.wait_for(
                 source.health_check(),
                 timeout=(

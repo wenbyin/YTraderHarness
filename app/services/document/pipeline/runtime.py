@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
 )
 
+from app.common.utils import to_uuid, to_uuid_or_none
 from app.infra.graph import (
     DispatchEnvelope,
     GraphDefinition,
@@ -313,16 +314,11 @@ def _uuid(payload: dict[str, Any], key: str) -> UUID:
             f"Got: {sorted(payload)}."
         )
 
-    return value if isinstance(value, UUID) else UUID(str(value))
+    return to_uuid(value)
 
 
 def _optional_uuid(
         payload: dict[str, Any],
         key: str,
 ) -> UUID | None:
-    value = payload.get(key)
-
-    if value is None:
-        return None
-
-    return value if isinstance(value, UUID) else UUID(str(value))
+    return to_uuid_or_none(payload.get(key))

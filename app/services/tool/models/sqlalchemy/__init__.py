@@ -8,25 +8,28 @@ ToolDefinition.documentation -> "ToolDocumentation"），SQLAlchemy
 配置就会以 "expression 'ToolDocumentation' failed to locate a name"
 失败 —— 而且报错离原因很远。
 
-import 本包 = 6 张表全部注册完毕。
+import 本包 = 本模块的表全部注册完毕。
+
+⚠️ 能力树（capability 表）**不在本模块**，它搬去了
+app/services/capability/。这里只剩关联表，它跨模块地指向
+Capability，因此 app/infra/datasource/initializer.py 必须把两个
+模块的模型包都 import 一遍，mapper 才能解析那个字符串目标。
 """
 
-from .tool_classification import (
-    ToolClassification,
-    ToolDefinitionClassification,
-)
+from .tool_classification import ToolDefinitionClassification
 from .tool_definition import ToolDefinition
 from .tool_documentation import ToolDocumentation
+from .tool_execution import ToolExecution
 from .tool_parameter_documentation import (
     ToolParameterDocumentation,
 )
 from .tool_processor import ToolProcessor
 
 __all__ = [
-    "ToolClassification",
     "ToolDefinition",
     "ToolDefinitionClassification",
     "ToolDocumentation",
+    "ToolExecution",
     "ToolParameterDocumentation",
     "ToolProcessor",
 ]

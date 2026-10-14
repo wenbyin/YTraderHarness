@@ -1,0 +1,50 @@
+# Milvus 数据源。
+#
+# 对应容器：见 F:\milvus\docker-compose.yml（镜像 milvusdb/milvus:v3.0.2）。
+#   cd /f/milvus && docker-compose up -d
+#
+# 容器关键参数：
+#   -p 19530:19530 -p 9091:9091
+#   -e ETCD_USE_EMBED=true -e ETCD_DATA_DIR=/var/lib/milvus/etcd
+#   -e COMMON_STORAGETYPE=local -e DEPLOY_MODE=STANDALONE
+#   -v milvus-data-v2:/var/lib/milvus
+#     （卷名 2026-10-14 从 milvus-data 换成 -v2：旧卷内 text_log 有文件系统级
+#      坏块，删不掉只能弃用。详见 F:\milvus\docker-compose.yml 里的说明。）
+#   -v F:\milvus\user.yaml:/milvus/configs/user.yaml:ro
+#   milvus run standalone
+#
+# ⚠️ 不要在 Git Bash 里直接 `docker run ... -e ETCD_DATA_DIR=/var/lib/milvus/etcd`。
+#    MSYS 会把参数中的 /var/lib/... 当成 POSIX 路径改写成 Windows 路径
+#    F:/Git/var/lib/...，embedded etcd 的 data-dir 于是变成容器内的相对路径，
+#    元数据写进容器可写层（overlayfs）而不是命名卷。etcd 在 overlayfs 上
+#    fsync / 文件锁语义不可靠，启动即报 `etcdserver: leader changed`
+#    然后 panic，容器 exit 134（2026-10-14 实测踩过）。
+#    改用 compose 文件可彻底规避 —— 参数不经 shell。
+#    非要用 docker run 就前置 MSYS_NO_PATHCONV=1。
+#
+# ⚠️ 数据目录必须是命名卷，不能用 Windows bind mount：挂在
+#    F:\milvus\volumes（9p / virtiofs）时 embedded etcd 同样会 panic。
+#
+# 鉴权在 F:\milvus\user.yaml 里开启（authorizationEnabled: true）。
+# root 初始密码由 user.yaml 的 defaultRootPassword 定为 123456
+# （v3.0.2 已修复 beta 上"配了该键就 panic"的 bug）。
+# y_trader 是启动后用 API 建的 admin 用户，不在配置文件里 ——
+# 删 milvus-data 卷后必须重建，见 user.yaml 里的说明。
+
+name: milvus
+type: milvus
+
+enabled: true
+
+# 连不上时只打 warning 并跳过；生产要强校验就改成 true。
+required: false
+
+startup_timeout_seconds: 5
+
+config:
+  uri: "${MILVUS_URI:-http://localhost:19530}"
+
+  # Milvus 的凭据格式就是 "用户名:密码" 一个字符串。
+  token: "${MILVUS_TOKEN:-y_trader:123456}"
+
+  db_name: "default"

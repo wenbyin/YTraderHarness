@@ -10,13 +10,16 @@ info:
       - Discover and synchronize tool definitions from code/runtime sources.
       - Expose code-owned tool metadata.
       - Manage documentation overrides.
-      - Manage business classifications used by LLM and JEV.
+      - Manage the tool <-> capability association.
 
     Non-responsibilities:
       - Group management
       - Permission management
       - Tag management
       - Processor chain management
+      - The capability taxonomy itself — that is capability.yaml
+        (app/services/capability/). The association stays here because
+        its subject is the tool: /tools/{tool_id}/classifications.
 
 servers:
   - url: /api/v1
@@ -27,9 +30,7 @@ tags:
   - name: Tool Documentation
     description: Tool docstring overrides
   - name: Tool Classifications
-    description: Tool business classification
-  - name: Classifications
-    description: Classification taxonomy management
+    description: Tool <-> capability association
   - name: Discovery
     description: Tool discovery and synchronization
 
@@ -226,104 +227,6 @@ paths:
                   $ref: '#/components/schemas/Classification'
 
 
-  /classifications:
-    get:
-      tags:
-        - Classifications
-      summary: List classification taxonomy
-      operationId: listClassifications
-
-      parameters:
-        - name: parent_id
-          in: query
-          schema:
-            type: string
-            format: uuid
-            nullable: true
-
-        - name: keyword
-          in: query
-          schema:
-            type: string
-
-        - name: is_active
-          in: query
-          schema:
-            type: boolean
-
-      responses:
-        '200':
-          description: Classification list
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  $ref: '#/components/schemas/Classification'
-
-    post:
-      tags:
-        - Classifications
-      summary: Create classification
-      operationId: createClassification
-
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ClassificationCreate'
-
-      responses:
-        '201':
-          description: Classification created
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Classification'
-
-
-  /classifications/{classification_id}:
-    get:
-      tags:
-        - Classifications
-      summary: Get classification
-      operationId: getClassification
-
-      parameters:
-        - $ref: '#/components/parameters/ClassificationId'
-
-      responses:
-        '200':
-          description: Classification
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Classification'
-
-    patch:
-      tags:
-        - Classifications
-      summary: Update classification
-      operationId: updateClassification
-
-      parameters:
-        - $ref: '#/components/parameters/ClassificationId'
-
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ClassificationUpdate'
-
-      responses:
-        '200':
-          description: Updated classification
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Classification'
 
 
 components:
@@ -332,14 +235,6 @@ components:
 
     ToolId:
       name: tool_id
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
-
-    ClassificationId:
-      name: classification_id
       in: path
       required: true
       schema:
@@ -552,6 +447,15 @@ components:
 
 
     Classification:
+      description: >-
+        A capability object as seen from the tool side. The definition of
+        record is Capability in capability.yaml (the capability table) —
+        it is repeated here under the name this association endpoint has
+        always used, because /tools/{tool_id}/classifications speaks about
+        the tool and its terminology is deliberately frozen.
+
+        ⚠️ Kept in sync by hand: if Capability gains a field, add it here
+        too. The two specs are read together; there is no cross-file $ref.
       type: object
       required:
         - id
@@ -596,54 +500,6 @@ components:
           items:
             type: string
             format: uuid
-
-
-    ClassificationCreate:
-      type: object
-      required:
-        - code
-        - name
-      properties:
-        code:
-          type: string
-
-        name:
-          type: string
-
-        description:
-          type: string
-          nullable: true
-
-        parent_id:
-          type: string
-          format: uuid
-          nullable: true
-
-        sort_order:
-          type: integer
-          default: 0
-
-
-    ClassificationUpdate:
-      type: object
-      properties:
-        name:
-          type: string
-
-        description:
-          type: string
-          nullable: true
-
-        parent_id:
-          type: string
-          format: uuid
-          nullable: true
-
-        sort_order:
-          type: integer
-
-        is_active:
-          type: boolean
 
 
     ToolSummary:

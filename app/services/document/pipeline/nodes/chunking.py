@@ -24,6 +24,7 @@ UNIQUE(document_version_id, chunker_key, chunker_config, chunk_index)。
 from __future__ import annotations
 
 from typing import Any
+from uuid import UUID
 
 from langgraph.runtime import Runtime
 
@@ -137,7 +138,11 @@ async def chunking_node(
         # 更新，否则下一个读 context.py 的人会以为这里越界了。
         # ----------------------------------------------------
 
-        if chunks and context.session_factory is not None:
+        #: 上一次同身份的行数（重跑时非 0）。定义在 if 之外 ——
+        #: 下面的埋点在两种情况下都要能读到它。
+        removed = 0
+
+        if context.session_factory is not None:
             # 每个分支从工厂取**自己的**会话，不共享 —— 扇出的 N 路是
             # 并发执行的，共享一个 session 会踩 asyncpg 的并发使用限制。
             #
@@ -147,9 +152,38 @@ async def chunking_node(
             )
 
             async with repositories.scope() as repos:
-                await repos.create(
-                    DocumentChunkRepository
-                ).add_many(chunks)
+
+                chunk_repo = repos.create(DocumentChunkRepository)
+
+                # --------------------------------------------------
+                # 3a. 清掉上一次同身份的行（重跑路径）
+                # --------------------------------------------------
+                #
+                # 重跑时这一步是**必需**的，不是保险：新 chunk 的
+                # document_chunk_id 是新的 uuid，而 chunk_index 从 0
+                # 重来，唯一约束
+                # uq_document_chunk_version_chunker_index 会直接拒绝
+                # 插入。删与插在同一个事务里 —— 中间不留"这个版本没有
+                # chunk"的可见窗口（另一个请求读到空表会以为没切过）。
+                #
+                # 身份取**调用方给的那份配置**（branch 里这份在计划阶段
+                # 已归一化，chunker 会把它原样存进 chunker_config，
+                # 见 chunker/text.py 的 chunk()）—— 而不是从 chunks[0]
+                # 里取，那样切出 0 条时就拿不到身份了，而"这次切出 0 条"
+                # 恰恰是旧行**最该**被清掉的场景：留着它们，检索会继续
+                # 命中一批这次运行已经不存在的 chunk。
+                removed = await chunk_repo.delete_by_identity(
+                    document_version_id=UUID(
+                        state["document_version_id"]
+                    ),
+                    chunker_key=chunker.get_key(),
+                    chunker_config=dict(
+                        branch.get("chunker_config") or {}
+                    ),
+                )
+
+                if chunks:
+                    await chunk_repo.add_many(chunks)
 
         # ----------------------------------------------------
         # 4. 产物写出去，供阶段 8 取回（省一次回查）
@@ -197,6 +231,9 @@ async def chunking_node(
                 c.char_count or 0 for c in chunks
             ),
             "chunker_key": chunker.get_key(),
+            # 重跑的可见证据：> 0 说明这次是覆盖上一次的产出。
+            # 第一次跑恒为 0，所以它也是一个"这个版本被重跑过"的信号。
+            "replaced_chunk_count": removed,
         })
 
         span.set_output_summary({

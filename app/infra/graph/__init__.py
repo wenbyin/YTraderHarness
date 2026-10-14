@@ -42,10 +42,29 @@ callbacks 与 checkpointer 各自只在 runner / main 里用一次，
 
 from .ids import (
     branch_key,
+    branch_scope_id,
+    new_session_thread_id,
     new_thread_id,
     normalize_edges,
     to_node_slug,
     topology_fingerprint,
+)
+from .cancellation import (
+    RunCancellationRegistry,
+    get_run_cancellation_registry,
+    reset_run_cancellation_registry,
+)
+from .dispatcher_impl import (
+    InProcessGraphDispatcher,
+    build_graph_dispatcher,
+    get_graph_dispatcher,
+    reset_graph_dispatcher,
+)
+from .thread_lock import (
+    InProcessThreadRunLock,
+    ThreadLockHolder,
+    get_thread_run_lock,
+    reset_thread_run_lock,
 )
 from .dispatcher import (
     DispatchEnvelope,
@@ -95,6 +114,8 @@ __all__ = [
     "GraphRunContext",
     "GraphRunRecorder",
     "GraphRunner",
+    "InProcessThreadRunLock",
+    "RunCancellationRegistry",
     "NodeRunSnapshot",
     "NodeRunStatus",
     "NodeRunUpdate",
@@ -106,13 +127,24 @@ __all__ = [
     "RunSnapshot",
     "RunStatus",
     "RunSummary",
+    "ThreadLockHolder",
     "assert_checkpoint_safe",
     "branch_key",
+    "branch_scope_id",
     "build_topology_snapshot",
     "execution_ids",
+    "get_thread_run_lock",
+    "new_session_thread_id",
     "new_thread_id",
     "node_span",
+    "InProcessGraphDispatcher",
+    "build_graph_dispatcher",
+    "get_graph_dispatcher",
+    "get_run_cancellation_registry",
+    "reset_graph_dispatcher",
     "normalize_edges",
+    "reset_run_cancellation_registry",
+    "reset_thread_run_lock",
     "to_node_slug",
     "topology_fingerprint",
     "truncate_preview",

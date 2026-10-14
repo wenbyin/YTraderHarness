@@ -31,6 +31,37 @@ class DocumentChunkRepository(BaseRepository):
         raise NotImplementedError
 
     @abstractmethod
+    async def delete_by_identity(
+            self,
+            document_version_id: UUID,
+            chunker_key: str,
+            chunker_config: dict[str, Any],
+    ) -> int:
+        """
+        删掉该版本下**这一份切分产出**的全部 Chunk，返回删除行数。
+
+        只给**重跑**用
+        --------------
+        重跑会重新生成 document_chunk_id（chunker 里是 uuid4），而
+        chunk_index 从 0 重来，于是
+        `(document_version_id, chunker_key, chunker_config, chunk_index)`
+        这一组键必然与上一次留下的行重复 —— 表上的唯一约束
+        uq_document_chunk_version_chunker_index 会**直接拒绝插入**。
+        所以重跑要先清场。
+
+        过滤条件就是那个唯一约束去掉 chunk_index，因此删掉的恰好是
+        "这次插入会撞上"的那些行，不多不少。
+
+        ⚠️ 刻意**不**提供"按版本全删"
+        ----------------------------
+        同一版本下可能有多份切分产出（不同 chunker / 不同配置，见
+        chunker/text.py 开头）。按版本删会让**并发的另一个分支**刚写
+        进去的行被这里抹掉 —— 而扇出的 N 路是并发跑的，那种丢失不会
+        报错，只表现为"某一类 chunk 少了一批"。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     async def get(
             self,
             document_chunk_id: UUID,

@@ -96,6 +96,8 @@ def synthesize_schema(func: Callable[..., Any]) -> dict[str, Any]:
 
     properties: dict[str, Any] = {}
     required: list[str] = []
+    #: 从嵌套模型上提到**根**的 `$defs`。见 `_hoist_defs`。
+    defs: dict[str, Any] = {}
 
     for parameter in inspect.signature(func).parameters.values():
 
@@ -121,7 +123,21 @@ def synthesize_schema(func: Callable[..., Any]) -> dict[str, Any]:
         elif isinstance(annotation, type) and issubclass(
                 annotation, BaseModel
         ):
-            schema.update(annotation.model_json_schema())
+            # ⚠️ 嵌套模型的 `$defs` 必须**提到根上**
+            # ------------------------------------
+            # `model_json_schema()` 里那些 `$ref` 是**相对根**写的
+            # （`#/$defs/MemorySearchScope`），而 `$defs` 本身也在它自己的
+            # 根部。直接 update 到属性里，`$defs` 就落到了属性内部，引用
+            # 于是指向一个不存在的位置 —— 上游解析这份 schema 时抛
+            #
+            #     KeyError: Reference '#/$defs/MemorySearchScope' not found.
+            #
+            # 而它发生在**把工具清单发给模型**那一刻，所以症状不是"这个工具
+            # 用不了"，而是**整轮运行失败**（每个候选模型都炸，最后
+            # ModelCandidatesExhaustedError）。见 `_hoist_defs`。
+            nested = annotation.model_json_schema()
+            _hoist_defs(nested, defs)
+            schema.update(nested)
         else:
             # 认不出来就别猜类型，留空比猜错好。
             schema["type"] = "string"
@@ -139,10 +155,106 @@ def synthesize_schema(func: Callable[..., Any]) -> dict[str, Any]:
         "properties": properties,
     }
 
+    if defs:
+        result["$defs"] = defs
+
     if required:
         result["required"] = required
 
     return result
+
+
+def _hoist_defs(
+        nested: dict[str, Any],
+        defs: dict[str, Any],
+) -> None:
+    """
+    把嵌套模型 schema 里的 `$defs` 就地提到根级的 `defs` 上。
+
+    `nested` 会被**就地修改**（`$defs` 被摘掉），因为它接下来要作为一个
+    属性被塞进外层 schema。
+
+    ⚠️ 同名冲突要改名，不能"保留先来的"
+    -------------------------------
+    两个扁平参数各带一个模型时，它们的 `$defs` 是两个**独立的命名空间**
+    （pydantic 只在自己的那份里保证名字唯一）。所以 `Mode` 这种通用名
+    完全可能出现在两边、而且是**不同的枚举**。
+
+    保留先来的那个会让后一支的 `$ref` 静默解析到**错误的定义** —— 模型
+    据此填参数，而 schema 看起来完全正常。所以冲突时给后来者换个名字，
+    并把**那一支内部**的引用一起改掉（包括那份 `$defs` 里定义之间的
+    互相引用）。
+
+    内容相同的重名直接合并：那是同一个类被两个参数用到，改名只会让
+    schema 里出现两份一样的定义。
+    """
+
+    inner = nested.pop("$defs", None)
+
+    if not inner:
+        return
+
+    renames: dict[str, str] = {}
+
+    for name, definition in inner.items():
+
+        existing = defs.get(name)
+
+        if existing is None or existing == definition:
+            continue
+
+        renames[name] = _free_name(defs, inner, name)
+
+    if renames:
+        # 先把整支的引用改完再搬 —— 搬完再改就够不着了。
+        _rewrite_refs(inner, renames)
+        _rewrite_refs(nested, renames)
+
+    for name, definition in inner.items():
+        defs.setdefault(renames.get(name, name), definition)
+
+
+def _free_name(
+        defs: dict[str, Any],
+        inner: dict[str, Any],
+        name: str,
+) -> str:
+    """给一个已被占用的名字找一个没人用的变体（`Mode` -> `Mode2`）。"""
+
+    index = 2
+
+    while f"{name}{index}" in defs or f"{name}{index}" in inner:
+        index += 1
+
+    return f"{name}{index}"
+
+
+def _rewrite_refs(
+        node: Any,
+        renames: dict[str, str],
+) -> None:
+    """
+    就地把 `{"$ref": "#/$defs/旧名"}` 改成新名。
+
+    只认 `#/$defs/` 开头这一种形状 —— 那是 pydantic 生成 `$ref` 的唯一
+    形式，其余（外部文件引用、JSON Pointer 到别处）本函数不该猜。
+    """
+
+    if isinstance(node, dict):
+
+        ref = node.get("$ref")
+
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            target = ref[len("#/$defs/"):]
+            if target in renames:
+                node["$ref"] = f"#/$defs/{renames[target]}"
+
+        for value in node.values():
+            _rewrite_refs(value, renames)
+
+    elif isinstance(node, list):
+        for item in node:
+            _rewrite_refs(item, renames)
 
 
 def output_schema_of(

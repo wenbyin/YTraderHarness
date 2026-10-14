@@ -42,6 +42,25 @@ class File(Base):
         - 后续物理清理
 
     DocumentService 不直接管理物理文件。
+
+    ⚠️ uploaded_by 换过类型，已有库要手动改
+    ------------------------------------
+    它原本是 `UUID`，而且**从来没被写过** —— 上传接口不填它
+    （见 api/v1/files.py）。改成字符串是因为值换成了 Casdoor 的 sub
+    （app/common/auth 的 AuthenticatedUser.subject）：那是**字符串**，
+    形如 UUID 但没有任何保证。
+
+    仓库没有迁移工具，initialize_database 用的是
+    `Base.metadata.create_all`，它只建缺失的表、**不改已存在的表**。
+    本模块没有 models.sql，DDL 就写在这里 —— 已有库要执行：
+
+        ALTER TABLE file
+            ALTER COLUMN uploaded_by TYPE VARCHAR(255)
+            USING uploaded_by::text;
+
+    现存值全是 NULL，USING 是空操作。**先跑它、再上新代码**：列还是
+    uuid 时写入 dev-bypass 这类非 UUID 值会直接报 invalid input
+    syntax，症状是"上传 500、其余接口正常"。
     """
 
     __tablename__ = "file"
@@ -173,10 +192,15 @@ class File(Base):
     # Audit
     # ========================================================
 
-    uploaded_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+    uploaded_by: Mapped[str | None] = mapped_column(
+        String(255),
         nullable=True,
-        comment="上传用户 ID。",
+        comment=(
+            "上传用户 ID —— Casdoor 的 sub（见 app/common/auth），字符串。"
+            "原为 UUID，换类型的原因见类 docstring。\n\n"
+            "只有用户上传（origin=user_upload）会写它；流水线产物"
+            "（pipeline_artifact）恒为 NULL —— 产物不属于任何用户。"
+        ),
     )
 
     created_at: Mapped[datetime] = mapped_column(

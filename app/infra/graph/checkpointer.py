@@ -33,6 +33,35 @@ checkpointer 走 **psycopg**，业务侧走 **asyncpg/SQLAlchemy**：
 因此 DSN 也不同：checkpointer 要裸 postgresql://。
 配置里用 `derive_from: postgresql` 从业务数据源推导，
 避免密码写两处（见 datasource/factory.py）。
+
+它现在还持有 **store**（LangGraph 的跨轮存储）
+--------------------------------------------
+同一个池上还建了一个 `AsyncPostgresStore`，两者一起 open、一起 close。
+目前 store 唯一的消费者是审批拦截器的批准账本
+（app/agent/tools/processor/interceptor/approval.py）—— 那张账本必须
+跨重启，否则重启后停在 `waiting_input` 的运行 resume 时，之前批过的
+会**再问一遍**，而 warning 整个进程只喊一次。
+
+⚠️ 为什么不另开一个数据源
+------------------------
+`AsyncPostgresStore` 需要的连接参数与 checkpointer **逐字相同** ——
+autocommit=True、prepare_threshold=0、row_factory=dict_row，正是它自己的
+`from_conn_string` 建池时用的那三个（见 `_ensure_open` 里的注释）。
+再开一个池只是多占一份连接额度，而 store 一次只借出一条连接。
+
+代价说清楚：本类的名字因此比它的职责**窄了**。改名的成本落在
+`DataSourceType` 与配置里的 `type:` 字符串上（那是对外配置契约），
+所以留着 —— 但读到这个名字时要知道它管两样东西。
+
+⚠️ store 的 TTL 有两个开关必须显式打开
+------------------------------------
+`aput(ttl=…)` 只负责写 `expires_at`，**不代表读的时候会过滤**：
+
+    omit_expired          默认 False —— 过期但未清扫的行照样被 aget 读回来
+    start_ttl_sweeper()   不会自动启动；ttl_config 为空时它直接返回一个
+                          `asyncio.sleep(0)` 空任务，看起来像启动了
+
+两个都缺，"有效期"就只是个装饰。见 `_ensure_open`。
 """
 
 from __future__ import annotations
@@ -41,6 +70,8 @@ import logging
 from typing import Any
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.base import TTLConfig
+from langgraph.store.postgres.aio import AsyncPostgresStore
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
@@ -73,6 +104,8 @@ class GraphCheckpointerProvider(DataSource):
             dsn: str,
             pool_min_size: int = 1,
             pool_max_size: int = 5,
+            store_default_ttl_minutes: int | None = 10_080,
+            store_sweep_interval_minutes: int = 60,
     ) -> None:
 
         super().__init__(name)
@@ -91,8 +124,19 @@ class GraphCheckpointerProvider(DataSource):
         self._min_size = pool_min_size
         self._max_size = pool_max_size
 
+        # ⚠️ 单位是**分钟** —— langgraph 的 BaseStore 就按分钟收
+        # （见 `_ensure_open` 里 TTLConfig 那段的说明）。配置侧
+        # 已经按分钟写，这里不再折算。
+        self._store_default_ttl = (
+            None
+            if store_default_ttl_minutes is None
+            else float(store_default_ttl_minutes)
+        )
+        self._store_sweep_interval = store_sweep_interval_minutes
+
         self._pool: AsyncConnectionPool | None = None
         self._saver: AsyncPostgresSaver | None = None
+        self._store: AsyncPostgresStore | None = None
 
     # ========================================================
     # DataSource
@@ -123,15 +167,34 @@ class GraphCheckpointerProvider(DataSource):
         return True
 
     async def close(self) -> None:
-        """关闭连接池。由 DataSourceManager.close_all() 调用。"""
+        """
+        停掉 store 的清扫任务，再关闭连接池。
+
+        由 DataSourceManager.close_all() 调用 —— 那是**按注册逆序**，
+        而本数据源在 DataSourceStartup 里被排到最后注册，因此是第一个
+        被关的。共用同一个池的好处在这里：一个对象、一个池，不存在
+        "谁先把池关了"的问题。
+        """
 
         pool = self._pool
 
         if pool is None:
             return
 
+        store = self._store
+
         self._pool = None
         self._saver = None
+        self._store = None
+
+        # ⚠️ 顺序不能反：sweeper 每一轮都要从池里借连接，先关池会让它
+        # 下一轮以一个"池已关闭"的异常收场。那个异常被它自己的循环吞掉，
+        # 只留一条没人看的 log —— 不值得为它留个隐患。
+        #
+        # timeout 给有限值而不是 None：它可能正卡在一次 sweep_ttl() 的
+        # 查询上，无上限地等下去会让整个应用的关停挂在这里。
+        if store is not None:
+            await store.stop_ttl_sweeper(timeout=5)
 
         await pool.close()
 
@@ -140,7 +203,16 @@ class GraphCheckpointerProvider(DataSource):
         )
 
     def resource(self) -> Any:
-        """返回 saver，便于统一按 resource() 取用。"""
+        """
+        返回 saver，便于统一按 resource() 取用。
+
+        ⚠️ 只有 saver —— 本数据源现在也持有 store，但两者不是"同一个资源
+        的两种说法"：`compile(checkpointer=…, store=…)` 要的是两个具名
+        参数，所以 store 走 `store` 属性，不在这里捏成一个返回值。
+
+        （`resource()` 目前的唯一调用点是 main.py 的索引后端那条泛化路径，
+        它按名字取 ES / Milvus / Neo4j —— checkpointer 不在其中。）
+        """
         return self.saver
 
     # ========================================================
@@ -185,11 +257,56 @@ class GraphCheckpointerProvider(DataSource):
         # setup() 的签名看着像同步方法，实际是协程，必须 await。
         await self._saver.setup()
 
+        # ---- 同一个池上的 store（跨轮存储）------------------------
+        #
+        # 共用这个池是**可以**的，不是凑合：store 要求的连接参数与 saver
+        # 逐字相同（autocommit / prepare_threshold=0 / row_factory=dict_row
+        # —— 正是 AsyncPostgresStore.from_conn_string 自己建池时写的那三个），
+        # 而且 pool 版的 store 每次操作都自己从池里 checkout 一条连接，
+        # 不与 saver 抢同一条。
+        #
+        # ⚠️ TTLConfig 里没有一个是"顺手配的"
+        # -----------------------------------
+        #   omit_expired=True       读路径才会过滤掉"已过期但还没被清扫"的行。
+        #                           默认是 False —— 那时 `aget` 照样把过期
+        #                           记录还给你，有效期形同虚设。
+        #   default_ttl             让**没显式传 ttl** 的写入也有 expires_at。
+        #                           没有它，那些行的 expires_at 是 NULL，而
+        #                           sweep_ttl() 的 SQL 是
+        #                           `WHERE expires_at IS NOT NULL AND
+        #                            expires_at < NOW()` —— 永远清不掉，
+        #                           表只增不减。审批账本里"单次批准"那一笔
+        #                           正是这种写入（approval.py 刻意不给它 ttl）。
+        #   sweep_interval_minutes  后台清扫的间隔。
+        store = AsyncPostgresStore(
+            pool,
+            ttl=TTLConfig(
+                omit_expired=True,
+                default_ttl=self._store_default_ttl,
+                sweep_interval_minutes=self._store_sweep_interval,
+            ),
+        )
+
+        # 与 saver 的 setup() 同理：签名看着同步，实际是协程。它建的是
+        # store / store_migrations（+ 索引时才有的 vector_migrations），
+        # 与 checkpointer 那几张表互不相干。幂等，重复调用安全。
+        await store.setup()
+
+        self._store = store
+
+        # ⚠️ 清扫任务**不会自动启动**，必须显式拉起 —— ttl_config 为空时
+        # 它直接返回一个 `asyncio.sleep(0)` 空任务，看起来像启动了。这也是
+        # 上面那个 TTLConfig 不能省的另一半理由。
+        await store.start_ttl_sweeper()
+
         logger.info(
-            "LangGraph checkpointer ready: %s (pool %d-%d).",
+            "LangGraph checkpointer ready: %s (pool %d-%d, "
+            "store default_ttl=%s min, sweep every %s min).",
             self.name,
             self._min_size,
             self._max_size,
+            self._store_default_ttl,
+            self._store_sweep_interval,
         )
 
     @property
@@ -210,6 +327,27 @@ class GraphCheckpointerProvider(DataSource):
             )
 
         return self._saver
+
+    @property
+    def store(self) -> AsyncPostgresStore:
+        """
+        编译图时传给 `graph.compile(store=...)`。
+
+        目前唯一的消费者是审批拦截器的批准账本（见模块 docstring）。
+        与 `saver` 同一条立场：未 open 就取用会抛错，而不是返回 None
+        让问题推迟到图运行时 —— 那时它会静默退化成"进程内账本"，
+        只有一条 warning 提示（approval.py 的 `_ledger`）。
+        """
+
+        if self._store is None:
+            raise RuntimeError(
+                "GraphCheckpointerProvider is not open. "
+                "DataSourceStartup opens it during health_check(); "
+                "if you constructed it manually, "
+                "await provider.health_check() first."
+            )
+
+        return self._store
 
     @property
     def is_open(self) -> bool:

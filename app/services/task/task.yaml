@@ -1,0 +1,536 @@
+openapi: 3.1.0
+
+info:
+  title: Async Task Management API
+  version: 1.0.0
+  description: |
+    Unified asynchronous task infrastructure: query, trace, cancel, retry.
+
+    Responsibilities:
+      - Report what background tasks exist and what state they are in.
+      - Trace a whole Task -> Task execution chain by its root.
+      - Cancel a task, and manually re-run one that has given up.
+
+    Non-responsibilities:
+      - **Submitting a task.** There is deliberately no POST /tasks. Tasks are
+        created by server-side business code through `TaskService.submit()`
+        (see app/services/task/application/task_service.py). A public submit
+        endpoint would let any authenticated caller enqueue an arbitrary
+        registered handler — a way to trigger internal work (model calls,
+        document ingestion) that the caller has no business triggering, and
+        one that bypasses the load-shedding the callers themselves apply.
+        Business endpoints that legitimately produce background work stay
+        responsible for their own authorization.
+      - Task execution semantics. This API only observes and steers; what a
+        task actually does belongs to the module that registered its handler.
+      - Dead-letter inspection beyond what `error` and `task_outbox` expose.
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Tasks
+    description: Async task inspection and control
+
+
+paths:
+
+  /tasks:
+    get:
+      tags:
+        - Tasks
+      summary: List tasks
+      operationId: listTasks
+      description: |
+        Newest first. `params` is not included — see `TaskSummary`. Fetch a
+        single task when you need the parameters or the failure reason.
+
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/TaskStatus'
+
+        - name: handler
+          in: query
+          schema:
+            type: string
+          description: Exact handler name, e.g. `run.execute`.
+
+        - name: root_task_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: All tasks in one execution chain.
+
+        - name: parent_task_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+          description: Direct children of one task.
+
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+
+      responses:
+        '200':
+          description: A page of tasks
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskPage'
+
+
+  /tasks/{task_id}:
+    get:
+      tags:
+        - Tasks
+      summary: Get task
+      operationId: getTask
+      description: |
+        Full view: parameters, failure reason, and lease information.
+
+        A task whose status is `running` while `lease_expires_at` is in the
+        past is a task whose worker died — the sweeper will reclaim it.
+
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+
+      responses:
+        '200':
+          description: Task detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskDetail'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+  /tasks/{task_id}/lineage:
+    get:
+      tags:
+        - Tasks
+      summary: Trace a task's execution chain
+      operationId: getTaskLineage
+      description: |
+        The whole chain this task belongs to, oldest first — one background
+        action and everything it went on to cause:
+
+            hitl.timeout -> run.resume -> memory.extract
+
+        Takes any task in the chain, not only the root: the root is resolved
+        from it (a task whose own `root_task_id` is null is treated as a root
+        itself). Returns an empty `tasks` array when nothing is found.
+
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+
+      responses:
+        '200':
+          description: The execution chain
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskLineage'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+  /tasks/{task_id}/cancel:
+    post:
+      tags:
+        - Tasks
+      summary: Cancel a task
+      operationId: cancelTask
+      description: |
+        Cancellation is **cooperative**, so this returns the state the task is
+        actually in afterwards rather than a bare success:
+
+          - not started yet    -> `cancelled`; it will never be claimed.
+          - already running    -> `cancelled`; the running handler is **not**
+                                  interrupted, but its result write-back is
+                                  refused, so the task stays cancelled.
+          - already finished   -> that terminal status; the cancel arrived too
+                                  late. This is **not** an error (409) — a
+                                  409 here would be inherently racy, since the
+                                  task can finish between any check and any
+                                  cancel.
+
+        Idempotent: calling it twice is harmless.
+
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+
+      responses:
+        '200':
+          description: Resulting state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskCancelResponse'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+  /tasks/{task_id}/retry:
+    post:
+      tags:
+        - Tasks
+      summary: Re-run a task that gave up
+      operationId: retryTask
+      description: |
+        Manual re-run of a `failed` or `cancelled` task. This starts a **new
+        run cycle**: `attempt` goes back to 0, execution is due immediately,
+        and the previous `error` is kept so you can still see why it failed.
+
+        `attempt` counting per cycle is deliberate — not resetting it would
+        make this endpoint useless in exactly the case it exists for: a task
+        that already used up `max_attempts`, where the next failure would be
+        terminal again immediately.
+
+        Refused (409) for tasks that are queued/running (would race with the
+        executor) and for **successful** ones (re-running a completed task
+        produces a second external side effect — notify twice, charge twice).
+        To genuinely redo that work, submit a new task instead.
+
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+
+      responses:
+        '200':
+          description: The re-queued task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskDetail'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+
+  /tasks/{task_id}/reschedule:
+    post:
+      tags:
+        - Tasks
+      summary: Move a delayed task's execution time (debounce)
+      operationId: rescheduleTask
+      description: |
+        Moves the execution time of a task that has **not started yet**, and
+        bumps its `generation`.
+
+        This is the debounce primitive. The pattern is "every new sign of
+        activity pushes the deadline back":
+
+            asyncio: approval expires in 30 min
+            new message arrives -> reschedule(+30 min)
+            new message arrives -> reschedule(+30 min)
+            ...                                              -> fires once
+
+        Calling it repeatedly does **not** pile up tasks: it moves the *same*
+        one, and each call invalidates the timer that was already armed
+        (`generation` +1), so the last time wins.
+
+        That is the difference from cancel-then-submit: the latter has a window
+        where the cancel has not taken effect yet and the old timer is already
+        due — in which case the old timer fires. This endpoint has no such
+        window.
+
+        Refused (409) while the task is running (it is about to write its result
+        back anyway) and once it has reached a terminal state (moving it would
+        turn "already finished" into "will run again").
+
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskReschedule'
+
+      responses:
+        '200':
+          description: The task after rescheduling
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskDetail'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+
+components:
+
+  parameters:
+
+    TaskId:
+      name: task_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+
+  schemas:
+
+    TaskStatus:
+      type: string
+      description: |
+        Lifecycle of one task.
+
+        `retryable` is kept separate from `pending` on purpose: "waiting to be
+        retried" and "never ran" are different things operationally, and
+        collapsing them forces every caller to reconstruct the distinction
+        from `attempt > 0`.
+      enum:
+        - pending
+        - running
+        - retryable
+        - success
+        - failed
+        - cancelled
+
+
+    TaskSummary:
+      type: object
+      required:
+        - task_id
+        - handler
+        - status
+        - attempt
+        - max_attempts
+        - created_at
+        - updated_at
+      description: |
+        One row in a list. Deliberately without `params` and without the
+        `error` body — a page can hold hundreds of tasks and neither is
+        needed to render it.
+      properties:
+        task_id:
+          type: string
+          format: uuid
+          readOnly: true
+
+        handler:
+          type: string
+          description: Logical handler name, e.g. `hitl.timeout`.
+
+        status:
+          $ref: '#/components/schemas/TaskStatus'
+
+        attempt:
+          type: integer
+          description: |
+            Attempts used in the **current** run cycle. A manual retry resets
+            it to 0.
+
+        max_attempts:
+          type: integer
+
+        generation:
+          type: integer
+          description: |
+            Timer generation. 1 when submitted, +1 on every reschedule.
+
+            This is what lets an already-armed timer notice that it has been
+            superseded: it compares the generation it was bound to against the
+            current one, and if they differ it re-arms for the new time instead
+            of firing. Anything above 1 means this delayed task's execution time
+            has been moved.
+
+            Comparing `execute_at` alone would not do: rescheduling to the *same*
+            instant is a legitimate reschedule, and only a counter can tell the
+            old timer from the new one then.
+
+        execute_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When it becomes eligible. Null means immediately.
+
+        parent_task_id:
+          type: string
+          format: uuid
+          nullable: true
+
+        root_task_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: The origin of this execution chain.
+
+        idempotency_key:
+          type: string
+          nullable: true
+
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+
+
+    TaskDetail:
+      allOf:
+        - $ref: '#/components/schemas/TaskSummary'
+        - type: object
+          properties:
+            params:
+              type: object
+              additionalProperties: true
+              description: |
+                The business parameters, as submitted. By convention only
+                business ids and the minimum needed to execute — large state
+                is reloaded by id at execution time.
+
+            causation_id:
+              type: string
+              format: uuid
+              nullable: true
+              description: |
+                What triggered this task: usually the parent task id, but it
+                may be a business event id — that is how "what did this HITL
+                end up triggering" is answered.
+
+            error:
+              type: string
+              nullable: true
+              description: |
+                Why the last attempt failed. Retained after a later success:
+                it answers "why did this retry", which success does not.
+
+            lease_expires_at:
+              type: string
+              format: date-time
+              nullable: true
+              description: |
+                Expiry of the current execution lease. Only meaningful while
+                `running`; cleared on any terminal state.
+
+            leased_by:
+              type: string
+              nullable: true
+              description: Worker holding the lease.
+
+
+    TaskLineage:
+      type: object
+      required:
+        - root_task_id
+        - tasks
+      properties:
+        root_task_id:
+          type: string
+          format: uuid
+
+        tasks:
+          type: array
+          description: The chain, in the order the tasks were created.
+          items:
+            $ref: '#/components/schemas/TaskSummary'
+
+
+    TaskPage:
+      type: object
+      required:
+        - items
+        - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TaskSummary'
+
+        total:
+          type: integer
+          description: Total matching the filters, not the size of this page.
+
+
+    TaskCancelResponse:
+      type: object
+      required:
+        - task_id
+        - status
+      properties:
+        task_id:
+          type: string
+          format: uuid
+
+        status:
+          allOf:
+            - $ref: '#/components/schemas/TaskStatus'
+          description: |
+            The status the task is in **after** the cancel. `cancelled` means
+            it has stopped; still `running` means it is winding down; a
+            terminal success/failed means the cancel arrived too late.
+
+
+    TaskReschedule:
+      type: object
+      description: |
+        New execution time for a delayed task. Calling this repeatedly is the
+        debounce pattern — see the /reschedule operation.
+      properties:
+        execute_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            New execution time. `null` means "run immediately".
+
+            Must carry a timezone offset: the column is TIMESTAMPTZ, and a
+            naive value would be interpreted as local time — which for a
+            debounced deadline means firing hours early or late.
+
+
+  responses:
+
+    NotFound:
+      description: Resource not found
+
+    Conflict:
+      description: >-
+        The task is queued or running (retry would race with the executor),
+        or it already succeeded (re-running it would produce a second
+        external side effect).

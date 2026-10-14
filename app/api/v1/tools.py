@@ -4,8 +4,13 @@
 对应 tool.yaml 的 tags：
     Tools                工具定义的查询
     Tool Documentation   说明文字的读写
-    Tool Classifications 工具与分类的关联
+    Tool Classifications 工具与能力的关联
     Discovery            发现与同步
+
+⚠️ 能力（capability）本体的接口**不在这里** —— 它是能力树自己的
+模块 app/services/capability/（路由也在那个模块里，对应
+capability.yaml）。本文件只有"工具 ↔ 能力"的关联这两个端点：
+路径的主语是工具，所以它们留在这里。
 
 ⚠️ 路由顺序：/tools/discovery/sync 必须注册在 /tools/{tool_id} **之前**。
 虽然一个是 POST、一个是 GET，看似不冲突，但保留这个顺序是因为
@@ -22,9 +27,10 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 
 from app.common.utils import to_http_error
+from app.services.capability.domain.schemas import Capability
 from app.services.dependencies import Service
-from app.services.tool.application.classification_service import (
-    ClassificationService,
+from app.services.tool.application.tool_classification_service import (
+    ToolClassificationService,
 )
 from app.services.tool.application.tool_discovery_service import (
     ToolDiscoveryService,
@@ -36,7 +42,6 @@ from app.services.tool.application.tool_query_service import (
     ToolQueryService,
 )
 from app.services.tool.domain.schemas import (
-    Classification,
     PagedToolSummaryResponse,
     SourceState,
     SourceType,
@@ -219,16 +224,22 @@ async def replace_tool_documentation(
 
 @router.get(
     "/tools/{tool_id}/classifications",
-    response_model=list[Classification],
+    response_model=list[Capability],
     tags=["Tool Classifications"],
 )
 async def get_tool_classifications(
         tool_id: UUID,
-        service: ClassificationService = Service[
-            ClassificationService
+        service: ToolClassificationService = Service[
+            ToolClassificationService
         ],
 ):
-    """取某个工具已关联的分类。"""
+    """
+    取某个工具已关联的能力。
+
+    返回的是能力对象（Capability），定义见 capability.yaml ——
+    但路径与名字保持 classifications：主语是工具，这一侧的术语不跟着
+    能力改名走。
+    """
 
     try:
         return await service.get_tool_classifications(tool_id)
@@ -239,20 +250,20 @@ async def get_tool_classifications(
 
 @router.put(
     "/tools/{tool_id}/classifications",
-    response_model=list[Classification],
+    response_model=list[Capability],
     tags=["Tool Classifications"],
 )
 async def replace_tool_classifications(
         tool_id: UUID,
         request: ToolClassificationUpdate,
-        service: ClassificationService = Service[
-            ClassificationService
+        service: ToolClassificationService = Service[
+            ToolClassificationService
         ],
 ):
     """
-    整体替换某个工具的分类关联。
+    整体替换某个工具的能力关联。
 
-    **替换**语义：没列出的分类会被解除关联。传空数组即全部解除。
+    **替换**语义：没列出的能力会被解除关联。传空数组即全部解除。
     """
 
     try:

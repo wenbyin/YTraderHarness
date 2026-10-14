@@ -14,6 +14,7 @@ from uuid import UUID
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 
+from app.common.utils import to_uuid, to_uuid_or_none
 from app.infra.graph.recorder import (
     NodeRunStatus,
     NodeRunUpdate,
@@ -54,15 +55,10 @@ def _uuid_from(ref: dict, key: str) -> UUID:
             f"{key!r}. Got keys: {sorted(ref)}."
         )
 
-    return value if isinstance(value, UUID) else UUID(str(value))
+    return to_uuid(value)
 
 def _uuid_or_none(ref: dict, key: str) -> UUID | None:
-    value = ref.get(key)
-
-    if value is None:
-        return None
-
-    return value if isinstance(value, UUID) else UUID(str(value))
+    return to_uuid_or_none(ref.get(key))
 
 class PipelineRunRepositoryImpl(PipelineRunRepository):
     """

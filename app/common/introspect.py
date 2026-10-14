@@ -38,7 +38,7 @@ def concrete_subclasses(cls: type) -> list[type]:
     -> TextDocumentParser -> CommonTxtDocumentParser），
     中间那几层带 ABC 且不完整，实例化必然失败。
 
-    与 pipeline/registry.py 的 _leaf_subclasses 同一套思路，
+    与 app/common/utils/reflection.py 的 leaf_subclasses 同一套思路，
     但这里不要求"叶子"（没有子类），只要求"非抽象"。
     """
 

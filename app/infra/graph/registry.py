@@ -157,6 +157,45 @@ class RunContext:
 
     recorder: Any
 
+    #: 这条 thread 属于哪个**业务会话**（agent_session 的主键）。
+    #:
+    #: ⚠️ 与 thread_id 是两件事，虽然本仓里它们一对一
+    #: --------------------------------------------------
+    #: thread_id 是 **langgraph 的内部键**（形如 `dev:react:<uuid>`），
+    #: 它按会话稳定是业务侧的安排，不是 infra 的契约。而会话详情页、
+    #: 消息、运行列表这些**给人看的东西**全按 session_id 关联。
+    #:
+    #: 工具执行账本（tool_execution）用后者做判重键的第一段：存
+    #: thread_id 的话，每次查账本都要先反查一次会话，而那个映射就在
+    #: 业务侧手边（`run.session_id`）。
+    #:
+    #: 默认 None：只有 document 那条流水线不经过会话，它不关心这个。
+    #: agent 那条路必须填（见 agent_run_dispatch）。
+    session_id: Any = None
+
+    #: 发起这次运行的调用者的**身份快照**（groups / roles 之类）。
+    #:
+    #: 为什么由 runner 交进来而不是运行时去查：这条链路是**异步派发**的
+    #: （请求提交后才跑），跑起来时手里已经没有 token 了，而身份的唯一
+    #: 真相（Casdoor）不在本地。所以业务侧必须在建运行/派发时把快照带
+    #: 下来，infra 只负责转交，不解释它的形状。
+    #:
+    #: 形状由业务侧定义（agent 那边是 build_caller_context 那份 dict）；
+    #: 不关心它的图传 None 即可。
+    caller_identity: Any = None
+
+    #: 这一轮用哪份**职责**（`agent_run.duty_key`）。
+    #:
+    #: 为什么它也得由 runner 交进来：图 state 里有一份同名的（`duty_key`，
+    #: 建运行那一刻定下、负责注入职责提示词），但**工具分支读不到父状态**
+    #: —— `Send` 的 payload 取代 state（见 react/state.py 的
+    #: ToolBranchPayload）。而记忆的 scope 是 (agent_id, user|org)，工具要按
+    #: 同一个 agent_id 定位，否则"注入里列出的场景"与"工具能取到的场景"
+    #: 会是两份不同的数据。
+    #:
+    #: 与 caller_identity 同一条取法：infra 只负责转交，不解释它的形状。
+    duty_key: Any = None
+
 
 @runtime_checkable
 class _Compiled(Protocol):

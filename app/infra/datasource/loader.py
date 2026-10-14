@@ -23,9 +23,10 @@ class DataSourceConfigLoader:
 
     配置目录：
 
-        config/datasources/*.yaml
+        app/config/datasource/*.yaml
 
-    每一个 yaml 文件代表一个 DataSource。
+    目录里**只有带顶层 `type` 的那些**才是数据源定义，其余
+    （部署参数、密钥、集成配置）原样跳过 —— 判据与理由见 load_all。
     """
 
     def __init__(
@@ -59,12 +60,35 @@ class DataSourceConfigLoader:
         ):
             raw = self._load_yaml(path)
 
-            datasource_type = raw.get("type")
-
-            if not datasource_type:
-                raise ValueError(
-                    f"Datasource type is missing: {path}"
+            # ========================================================
+            # 本目录**不只**放数据源配置
+            # ========================================================
+            #
+            # 判定规则只有一条：**顶层有没有 `type` 键**。有 = 数据源，
+            # 没有 = 别的配置（如 casdoor.yaml），跳过即可。
+            #
+            # 以前这里是 `raise ValueError`，那等于宣布"这个目录只许
+            # 放数据源" —— 于是 llm.yaml / event_stream.yaml /
+            # model.yaml 为了躲开它，全被挪到了各自的模块目录下
+            # （见 app/common/llm.py 开头的说明）。而 app/config/ 恰恰
+            # 是"部署时要改的东西"最该待的地方，不该因为一个加载器的
+            # 假设把配置打散到三处。
+            #
+            # 跳过时**打 warning 列出文件名**，因为宽松化的代价是：
+            # `tpye: postgresql` 这种键名拼错也会被跳过，之后就只在
+            # 取 `postgresql` 时报一句更差的错。日志是这里唯一的线索。
+            #
+            # 注意这个判断在 try **之外** —— 它聊的不是"配置写得对不对"，
+            # 而是"这个文件归不归我管"。归我管的，下面照旧校验。
+            if not isinstance(raw, dict) or "type" not in raw:
+                logger.warning(
+                    "[Datasource] Ignore non-datasource config "
+                    "(no top-level `type`): %s",
+                    path,
                 )
+                continue
+
+            datasource_type = raw["type"]
 
             try:
                 expanded = self._expand_env(raw)
@@ -104,26 +128,22 @@ class DataSourceConfigLoader:
     @staticmethod
     def _load_yaml(
             path: Path,
-    ) -> dict[str, Any]:
+    ) -> Any:
+        """
+        读一个 yaml 文件，**只负责读，不判断形态**。
+
+        以前这里对"不是 mapping"直接抛错，而调用点在 try 之外，
+        因此一个**空文件**（safe_load 得 None）就能让整个应用起不来。
+        而"这个文件不是数据源"并不是错误 —— 形态判断因此上移到
+        load_all，与"缺 type"共用同一条跳过路径，`isinstance(raw, dict)`
+        也顺带挡掉了 None。
+        """
 
         with path.open(
                 "r",
                 encoding="utf-8",
         ) as file:
-            data = yaml.safe_load(
-                file
-            )
-
-        if not isinstance(
-                data,
-                dict,
-        ):
-            raise ValueError(
-                f"Datasource config must be "
-                f"a mapping: {path}"
-            )
-
-        return data
+            return yaml.safe_load(file)
 
     @classmethod
     def _expand_env(

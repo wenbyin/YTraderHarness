@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS tool_processor (
                         ON DELETE CASCADE,
 
     -- Stable key of a processor implementation registered in code.
-    -- Example: hitl_processor, cache_interceptor, metrics_observer
+    -- Example: approval_interceptor, cache_interceptor, metrics_observer
     processor_key       VARCHAR(255) NOT NULL,
 
     -- Zero-based or one-based is an application convention; this design uses 1..N.

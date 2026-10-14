@@ -219,7 +219,7 @@ class FileServiceImpl(FileService):
             content_type: str | None,
             tenant_id: UUID | None,
             metadata: dict,
-            uploaded_by: UUID | None,
+            uploaded_by: str | None,
             origin: FileOrigin = FileOrigin.USER_UPLOAD,
             dedupe: bool = False,
     ) -> FileResponse | None:

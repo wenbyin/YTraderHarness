@@ -24,10 +24,12 @@ fusioner_type，不必改本文件。
 
 from __future__ import annotations
 
-import importlib
-import inspect
-import pkgutil
 from functools import lru_cache
+
+from app.common.utils import (
+    import_package_modules,
+    leaf_subclasses,
+)
 
 from ..domain.schemas.enum import FusionerType, RerankerType
 from .base import Cutter, Fusioner, Reranker, ResultFilter
@@ -49,48 +51,6 @@ class RetrieveStageNotFound(LookupError):
     """
 
 
-def _leaf_subclasses(cls: type) -> list[type]:
-    """
-    递归收集所有叶子子类。
-
-    与 pipeline/registry.py 的同名函数一致：中间抽象基类
-    （例如将来可能出现的 "BaseCrossEncoderReranker"）不注册，
-    只注册真正能实例化的叶子。
-    """
-
-    leaves: list[type] = []
-
-    for subclass in cls.__subclasses__():
-
-        if inspect.isabstract(subclass):
-            continue
-
-        grandchildren = _leaf_subclasses(subclass)
-
-        if grandchildren:
-            leaves.extend(grandchildren)
-        else:
-            leaves.append(subclass)
-
-    return leaves
-
-
-def _import_stage_modules() -> None:
-    """
-    先 import 本包下所有模块，否则子类还没被定义，
-    __subclasses__() 是空的。
-    """
-
-    package = importlib.import_module(__package__)
-
-    for module in pkgutil.iter_modules(package.__path__):
-
-        if module.name.startswith("_"):
-            continue
-
-        importlib.import_module(f"{__package__}.{module.name}")
-
-
 class RetrieveProcessorRegistry:
     """
     查询期四阶段的实现表。
@@ -101,7 +61,12 @@ class RetrieveProcessorRegistry:
 
     def __init__(self) -> None:
 
-        _import_stage_modules()
+        # 非递归 + 跳过 _ 开头的模块：本包的实现都在这一层
+        # （fusion.py / rerank.py / filter.py / cut.py），子包留给
+        # 将来按类型拆，那时改成 recursive=True 即可。
+        import_package_modules(
+            __package__, recursive=False, skip_private=True
+        )
 
         self._fusioners = self._collect_fusioners()
         self._rerankers = self._collect_rerankers()
@@ -151,7 +116,7 @@ class RetrieveProcessorRegistry:
 
         collected: dict[FusionerType, Fusioner] = {}
 
-        for fusioner_cls in _leaf_subclasses(Fusioner):
+        for fusioner_cls in leaf_subclasses(Fusioner, skip_abstract=True):
 
             fusioner_type = getattr(
                 fusioner_cls, "fusioner_type", None
@@ -169,7 +134,7 @@ class RetrieveProcessorRegistry:
 
         collected: dict[RerankerType, Reranker] = {}
 
-        for reranker_cls in _leaf_subclasses(Reranker):
+        for reranker_cls in leaf_subclasses(Reranker, skip_abstract=True):
 
             reranker_types = getattr(
                 reranker_cls, "reranker_types", ()
@@ -191,7 +156,7 @@ class RetrieveProcessorRegistry:
                 existing = collected.get(reranker_type)
 
                 if existing is not None:
-                    raise QueryStageNotFound(
+                    raise RetrieveStageNotFound(
                         f"RerankerType.{reranker_type.name} 同时被 "
                         f"{type(existing).__name__} 与 "
                         f"{reranker_cls.__name__} 声明。"
@@ -212,7 +177,7 @@ class RetrieveProcessorRegistry:
         过滤与裁剪各自只有一个实现，多了就是设计出了问题。
         """
 
-        leaves = _leaf_subclasses(base)
+        leaves = leaf_subclasses(base, skip_abstract=True)
 
         if not leaves:
             raise RetrieveStageNotFound(
