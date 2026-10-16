@@ -19,6 +19,12 @@ __all__ = [
     "DocumentVersionRetrievalBindingRepositoryImpl",
     "PipelineRunRepository",
     "PipelineRunRepositoryImpl",
+    "RetrievalEvalBundleRepository",
+    "RetrievalEvalBundleRepositoryImpl",
+    "RetrievalEvalCaseRepository",
+    "RetrievalEvalCaseRepositoryImpl",
+    "RetrievalEvalRunRepository",
+    "RetrievalEvalRunRepositoryImpl",
 ]
 
 from .document import DocumentRepository
@@ -43,6 +49,18 @@ from .document_version_retrieval_binding_impl import (
 )
 from .pipeline_run import PipelineRunRepository
 from .pipeline_run_impl import PipelineRunRepositoryImpl
+from .retrieval_eval_bundle import RetrievalEvalBundleRepository
+from .retrieval_eval_bundle_impl import (
+    RetrievalEvalBundleRepositoryImpl,
+)
+from .retrieval_eval_case import RetrievalEvalCaseRepository
+from .retrieval_eval_case_impl import (
+    RetrievalEvalCaseRepositoryImpl,
+)
+from .retrieval_eval_run import RetrievalEvalRunRepository
+from .retrieval_eval_run_impl import (
+    RetrievalEvalRunRepositoryImpl,
+)
 from .processor_definition import (
     DocumentProcessorDefinitionRepository,
 )

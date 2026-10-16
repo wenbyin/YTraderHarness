@@ -147,12 +147,17 @@ async def chunk_enrichment_node(
         # 除 metadata 外还要带上 **locator** —— chunking 的载荷里没有
         # 它，不在这里补上就永远流不到 indexing（见 index/es.py 的
         # _MAPPING：locator 是 ES 文档的字段之一）。
+        #
+        # ⚠️ embed_text 同理，必须**显式**写出来：`**item` 展开的是
+        # chunking 那份原始载荷，里面没有这个键 —— 增强算出来的值会因为
+        # "忘了加一行"而静默消失，下游只表现为向量里没有上下文。
         text = json.dumps(
             [
                 {
                     **item,
                     "metadata": dict(chunk.metadata or {}),
                     "locator": dict(chunk.locator or {}),
+                    "embed_text": chunk.embed_text,
                 }
                 for item, chunk in zip(items, enriched)
             ],
@@ -242,4 +247,7 @@ def _to_chunk(item: dict[str, Any]):
         char_count=item.get("char_count"),
         locator=item.get("locator") or {},
         metadata=item.get("metadata") or {},
+        # 上一轮的产物里可能已经带了（重跑时），原样带回去让增强重算 ——
+        # 不可选、不可省：漏掉这一行的话，增强算出来的值写不回产物。
+        embed_text=item.get("embed_text"),
     )

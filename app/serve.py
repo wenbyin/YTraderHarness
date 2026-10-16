@@ -39,11 +39,76 @@ asyncio.set_event_loop_policy()**：
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import sys
 
 import uvicorn
 
 __all__ = ["loop_factory", "serve"]
+
+
+#: 日志级别。默认 INFO —— 见 `_configure_logging` 的说明。
+LOG_LEVEL_ENV = "YTRADER_LOG_LEVEL"
+
+#: 日志格式。用不着花哨：时间、级别、logger 名、正文。
+LOG_FORMAT = (
+    "%(asctime)s %(levelname)-8s %(name)s | %(message)s"
+)
+
+
+def _configure_logging() -> None:
+    """
+    配置日志 —— **在此之前整个应用没有日志配置**。
+
+    ⚠️ 这件事值得单独说，因为它一直静默失效
+    --------------------------------------
+    此前全仓库没有任何 `basicConfig` / `dictConfig` / `setLevel`。于是：
+
+        root logger  level = WARNING，handlers = 0
+
+    在这个状态下，Python 只会通过那条 `lastResort` 兜底把 **WARNING 及
+    以上**打到 stderr（实测确认）。也就是说：
+
+        logger.warning(...)   ✅ 出得来
+        logger.info(...)      ❌ **全部被丢掉**
+
+    后果是**全仓库写好的 `logger.info` 一句都没打印过** —— 包括那些
+    "开始/进度/收尾/为什么跳过"的关键行。而它们恰恰是排查问题时最需要的：
+    一个任务跑了几百秒，控制台却一个字都没有，只能靠猜。
+
+    （实测踩过：一个评测任务跑了 527 秒，我让人去看日志，而实际上那里
+    什么都不会有 —— 不是没写，是级别不对。）
+
+    默认给 INFO
+    -----------
+    给 INFO 是因为那些 `logger.info` 本来就是**为了被看见**才写的。级别
+    可以通过 `YTRADER_LOG_LEVEL` 调（`WARNING` 能回到从前的安静状态，
+    `DEBUG` 更吵）。
+
+    措辞上刻意**不设 `force=True`**：那会把 uvicorn 或调用方（PyCharm、
+    测试）已经装好的 handler 拆掉。这里只补一个新的，谁先装谁生效不了
+    就按 `basicConfig` 的既有语义来。
+    """
+
+    level_name = os.environ.get(LOG_LEVEL_ENV, "INFO").upper()
+
+    level = getattr(logging, level_name, None)
+
+    if not isinstance(level, int):
+        # 拼错了不该让服务起不来 —— 回落到 INFO 并说出来。
+        level = logging.INFO
+        print(
+            f"⚠️ {LOG_LEVEL_ENV}={level_name!r} 不是合法级别，"
+            "回落到 INFO",
+            file=sys.stderr,
+        )
+
+    logging.basicConfig(
+        level=level,
+        format=LOG_FORMAT,
+        stream=sys.stderr,
+    )
 
 
 def loop_factory() -> type[asyncio.AbstractEventLoop]:
@@ -63,6 +128,11 @@ def serve(
         port: int = 8080,
         reload: bool = False,
 ) -> None:
+
+    # ⚠️ 必须在建 uvicorn 之前 —— 见 `_configure_logging` 的说明。
+    # 放在 `serve()` 里而不是模块级：测试与冒烟脚本 import `app.main`
+    # 不该顺带把它们的日志level改掉。
+    _configure_logging()
 
     config = uvicorn.Config(
         "app.main:app",

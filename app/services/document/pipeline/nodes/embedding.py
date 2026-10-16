@@ -172,7 +172,23 @@ async def embedding_node(
         # 顺序即正确性：先按 chunk_index 排序再抽正文。
         chunks.sort(key=lambda chunk: chunk["chunk_index"])
 
-        texts = [chunk["content"] for chunk in chunks]
+        # 向量输入优先用阶段 8 派生的 embed_text（前缀 + 空格 + 正文），
+        # 拿不到才退回裸正文。
+        #
+        # 前缀解决的是"纯数据 chunk 正文里不重复公司名/文件名，向量那两路
+        # 在 chunk 层面看不见这个条件"——所以退回是一条**静默失效**的路径：
+        # 向量照常产出、维度照常正确，只是又看不见上下文了，不报任何错。
+        #
+        # 因此下面把它记进 span 指标（见本函数末尾的 set_metrics）：
+        # missing 等于总数 = 阶段 8 根本没生效（例如没有注册增强实现而
+        # 原样透传，见 chunk_enrichment 的 skipped 分支）。
+        embed_texts = [chunk.get("embed_text") for chunk in chunks]
+        embedded_count = sum(1 for value in embed_texts if value)
+
+        texts = [
+            value or chunk["content"]
+            for value, chunk in zip(embed_texts, chunks)
+        ]
 
         # ----------------------------------------------------
         # 3. 按形态取 embedder
@@ -240,10 +256,25 @@ async def embedding_node(
         #
         # 代价是正文多存一份（产物是 File，不是 state）。对 1200 token
         # 的块，正文约占这份产物的 20%，可接受。
+        #
+        # embed_text **在这里被丢掉**，不进产物。两个理由：
+        #   1. 它是"前缀 + 全文"，跟着走会让这份产物再翻一倍；
+        #   2. version_chunk_service 的投影会把产物里所有非向量键透出到
+        #      对外 API（见其 _fields_of）—— 那是内部实现细节，不该外泄。
+        # 本阶段已经用过它了，往下没有任何消费方。
+        base_items = [
+            {
+                key: value
+                for key, value in chunk.items()
+                if key != "embed_text"
+            }
+            for chunk in chunks
+        ]
+
         if required is EmbeddingOutput.DENSE:
             items = [
-                {**chunk, "vector": vector}
-                for chunk, vector in zip(chunks, vectors)
+                {**item, "vector": vector}
+                for item, vector in zip(base_items, vectors)
             ]
 
         elif required is EmbeddingOutput.GRAPH:
@@ -252,10 +283,10 @@ async def embedding_node(
             # 本阶段产出的东西**不保证**跨段连得上。
             items = [
                 {
-                    **chunk,
+                    **item,
                     "graph": fragment.model_dump(mode="json"),
                 }
-                for chunk, fragment in zip(chunks, vectors)
+                for item, fragment in zip(base_items, vectors)
             ]
 
         else:
@@ -263,13 +294,13 @@ async def embedding_node(
             # 读的一方负责转回 int。
             items = [
                 {
-                    **chunk,
+                    **item,
                     "sparse": {
                         str(dim): weight
                         for dim, weight in vector.items()
                     },
                 }
-                for chunk, vector in zip(chunks, vectors)
+                for item, vector in zip(base_items, vectors)
             ]
 
         ref = await context.artifact_store.put_text(
@@ -289,6 +320,11 @@ async def embedding_node(
             "embedding_dimensions": expected_dim,
             "embedding_kind": required.value,
             "embedder_key": embedder.get_key(),
+            # 阶段 8 有没有真的把上下文拼进来。missing == vector_count
+            # 说明那一步没生效（透传 / 没注册增强实现），而这**不会**
+            # 让任何请求失败 —— 它只让向量悄悄失去上下文。
+            "embed_text_used": embedded_count,
+            "embed_text_missing": len(chunks) - embedded_count,
             "skipped": False,
         })
 

@@ -144,5 +144,11 @@ class DocumentChunkEnricher(TextDocumentProcessor):
         Returns:
             与入参**等长且等序**的列表。原地修改后返回同一个列表也可以，
             但调用方按位置对齐，所以顺序不能变。
+
+        可选产出 `chunk.embed_text`：
+            喂给阶段 9 向量化的文本（`前缀 + 空格 + 正文`）。不产出也不会
+            报错 —— 阶段 9 会退回 content —— 但那等于这条分支的向量看不见
+            "这块属于谁"，正是这个字段要解决的问题。所以要么老老实实产，
+            要么让"没产"在观测里看得见（阶段 9 会记 embed_text_missing）。
         """
         raise NotImplementedError

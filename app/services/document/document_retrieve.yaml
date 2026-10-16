@@ -355,6 +355,171 @@ components:
         retrieve_processor:
           $ref: '#/components/schemas/RetrieveProcessorOverride'
 
+        query_rewriter:
+          $ref: '#/components/schemas/QueryRewriterConfig'
+
+        query_rewrite:
+          $ref: '#/components/schemas/QueryRewriteInput'
+
+        include_stage_trace:
+          type: boolean
+          default: false
+          description: |
+            Collect a per-stage trace of this retrieval round.
+
+            **Default off.** While off, the pipeline behaves byte-for-byte
+            as before: no collector is constructed and no set arithmetic is
+            performed. Turning it on records, for every stage (each recall
+            route, fusion, filter, rerank, cut): the input/output counts,
+            the top-N candidates entering and leaving with their scores,
+            and — for any chunk listed in `target_chunk_ids` — its rank,
+            score, and whether it survived.
+
+            The trace is **read-only**: it never changes `results`, not by
+            a single field. It is a diagnostic side-channel, not a
+            reranking input.
+
+            Not supported together with more than one
+            `document_type_definition_ids` entry: a multi-DTD request runs
+            the processor N+1 times, so every stage would appear N+1 times
+            under the same key with no way to tell which run a row belongs
+            to. Requesting both is rejected rather than answered with an
+            ambiguous trace.
+
+        target_chunk_ids:
+          type: array
+          maxItems: 50
+          uniqueItems: true
+          description: |
+            Additional chunks to **watch** — the "target" chunks.
+
+            Each one is guaranteed a row at every stage it was present in,
+            even if its rank is far outside the top-N, so the trace can
+            answer "where was this chunk dropped?".
+
+            The evaluation service fills this with a QA case's gold chunk
+            set (all of them — not just the originating chunk, because a
+            question may be answerable from several chunks).
+
+            Supplying it requires `include_stage_trace: true`; the
+            combination is rejected otherwise rather than silently
+            enabling tracing, so a caller never believes it configured
+            something that had no effect.
+
+            Capped at 50 because these ids are scanned at every stage: an
+            unbounded list would let one caller turn each retrieval into a
+            full comparison.
+          items:
+            type: string
+            format: uuid
+
+    QueryRewriterConfig:
+      type: object
+      additionalProperties: false
+      description: |
+        Optional query rewriting, **applied before recall**.
+
+        Omitted = no rewriting. There is deliberately no fallback to a
+        DTD-level default: rewriting changes the query itself, so it has to
+        be the caller's explicit choice (the eval ladder passes it per
+        round, and "not passed" means "this round does not rewrite").
+
+        It is a sibling of `retrieve_processor`, not a member of it — that
+        override covers the four stages running *after* recall, this one
+        runs *before* it. The rewritten text feeds both recall routes
+        (dense vectorisation and BM25) and the four stages.
+
+        The text actually sent is echoed back as `query_text`, so a caller
+        can record what was really queried.
+      properties:
+        enabled:
+          type: boolean
+          default: true
+          description: Set false to skip rewriting while keeping the object.
+
+        kind:
+          type: [string, 'null']
+          enum: [common, llm, null]
+          description: |
+            `common` — no model call. It expands **both written forms of a
+            date**: Chinese `2007年4月12日` and dash `2007-04-12`. The corpus
+            body writes the first form while its `#### 2007-04-12 ｜ ...`
+            section headings write the second, and BM25 treats them as
+            different terms, so only one form means half the chunks cannot
+            match. (The dash form is zero-padded because the index-side date
+            filter matches exactly two digits per field.)
+
+            `llm` — one model call, prompt in
+            `agent/prompt/prompts/query_rewrite.py`, model role
+            `query.rewrite`.
+
+            Null = no rewriting.
+          nullable: true
+
+        model:
+          type: [string, 'null']
+          description: |
+            Model identifier for the `llm` kind. Null = whatever the
+            `query.rewrite` model binding resolves to.
+          nullable: true
+
+        timeout_ms:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 60000
+          description: |
+            Wall-clock limit for the rewrite step.
+
+            Null = no extra limit: the timeout/retry policy of the
+            `query.rewrite` model binding's profile applies. Setting a value
+            adds a tighter cap that **overrides** that policy (including its
+            retry budget).
+
+            A timeout is **not** a failure: the original text is used and
+            reported as `query_rewrite.degraded = true`, so callers can tell
+            "no rewriting" apart from "tried and failed".
+          nullable: true
+
+    QueryRewriteInput:
+      type: object
+      additionalProperties: false
+      required: [text]
+      description: |
+        A rewriting result the **caller has already computed**.
+
+        Why it exists: rewriting may call a model, and one eval round holds
+        dozens of cases — one call per case means dozens of calls, each
+        re-paying the same ~500-token system prompt. The eval layer is the
+        only layer that knows "these cases belong together", so it rewrites
+        the whole round once and hands each result back to that case's
+        retrieval (retrieval itself only ever sees one query).
+
+        Mutually exclusive with `query_rewriter`: when this is present the
+        service does **not** call a rewriter. Sending both would leave one of
+        them silently inert — the same rule as `attempts` vs
+        `query_processor_override`.
+
+        ⚠️ All three fields belong together: passing `text` alone drops the
+        phrase boosts and date keys, and losing those only makes ranking
+        worse — it raises no error.
+      properties:
+        text:
+          type: string
+          description: The rewritten query text — what actually gets sent.
+        boost_phrases:
+          type: array
+          items: {type: string}
+          default: []
+          description: Phrases to phrase-boost (see `RewriteResult.boost_phrases`).
+        date_keys:
+          type: array
+          items: {type: string}
+          default: []
+          description: |
+            Date keys (zero-padded `YYYYMMDD`) matching the indexed
+            `content_dates` field — they only match if the shape is the same
+            as what the indexer wrote.
+
     RetrieveProcessorOverride:
       type: object
       additionalProperties: false
@@ -455,29 +620,58 @@ components:
 
         type:
           type: string
+          description: |
+            `cross_encoder` — local in-process cross-encoder (BGE via
+            FlagEmbedding). ~0.3 s per candidate.
+            `llm` — the model bound to `retrieve.rerank` scores each
+            candidate 0-10 in one call (thinking disabled per call). Its
+            window is much narrower (20 candidates, 400 chars each) because
+            one call has to read every candidate.
+            `api` — a third-party HTTP rerank service. The model id goes in
+            `model` (the default ladder uses Alibaba DashScope
+            `qwen3.7-text-rerank`); endpoint, credentials and timeout come
+            from `app/config/rerank.yaml`, never from the request.
+            `custom` — still a placeholder: it logs a warning and returns
+            the candidates unchanged.
+
+            **All rerankers only reorder what they can see**: candidates
+            beyond `top_n` are returned untouched in fusion order, and the
+            final count is `cutter.top_k`'s decision. On failure a reranker
+            degrades (fusion order kept, stage reported as not-executed)
+            rather than failing the request.
           enum:
             - cross_encoder
             - llm
             - custom
+            - api
 
         model:
           type: string
           description: |
             Optional reranker model identifier.
 
-            Either a local directory (e.g. G:\models\bge-reranker-v2-m3)
-            or a fully qualified Hub repo id (e.g. BAAI/bge-reranker-v2-m3).
-            When omitted, use the selected RetrieveProcessor's configured model.
+            For `cross_encoder`: either a local directory (e.g.
+            G:\models\bge-reranker-v2-m3) or a fully qualified Hub repo id
+            (e.g. BAAI/bge-reranker-v2-m3). When omitted, use the selected
+            RetrieveProcessor's configured model.
 
             A bare name such as "bge-reranker-v2-m3" is NOT valid - the Hub
             reads it as an org/user name, builds a URL missing the "BAAI/"
             segment, and goes to the network instead of using the local copy.
 
+            For `api`: the service-side model id.
+
         top_n:
           type: integer
           minimum: 1
           maximum: 5000
-          description: Number of candidates passed into the reranker.
+          description: |
+            Number of candidates passed into the reranker.
+
+            ⚠️ It is **not** the number of results returned: reranking only
+            reorders. The final count is `cutter.top_k`'s decision. (Older
+            builds truncated the output to `top_n`, which turned reranking
+            into a second cutoff.)
 
     CutterConfig:
       type: object
@@ -584,6 +778,23 @@ components:
           type: string
           format: uuid
 
+        query_text:
+          type: [string, 'null']
+          description: |
+            The text **actually sent** to retrieval this round (after
+            rewriting).
+
+            Equals the request's `input_text` when no rewriting happened. It
+            is echoed back because the caller cannot otherwise see it: the
+            rewriting (including a possibly non-reproducible LLM rewrite)
+            happens inside the service, and callers that need to record what
+            was queried — the eval layer writes it into
+            `retrieval_eval_case_result.query_text` — have no other source.
+          nullable: true
+
+        query_rewrite:
+          $ref: '#/components/schemas/QueryRewriteSummary'
+
         retrieve_scope:
           type: string
           enum:
@@ -629,6 +840,231 @@ components:
 
         retrieve_processor:
           $ref: '#/components/schemas/EffectiveRetrieveProcessor'
+
+        trace:
+          $ref: '#/components/schemas/RetrieveTrace'
+
+    QueryRewriteSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - changed
+        - degraded
+      description: |
+        What this round's rewriting did.
+
+        Present only when the request carried a `query_rewriter`; null means
+        no rewriting was attempted at all, which is different from
+        `degraded = true` (attempted and failed, original text used).
+      properties:
+        kind:
+          type: [string, 'null']
+          enum: [common, llm, null]
+          description: The strategy actually applied. Null = no rewriting.
+          nullable: true
+
+        changed:
+          type: boolean
+          description: Whether the rewritten text differs from the original.
+
+        degraded:
+          type: boolean
+          description: |
+            Rewriting failed and the original text was used instead. Not a
+            retrieval failure — this is how a caller distinguishes "no
+            rewriting" from "tried and failed".
+
+        detail:
+          type: object
+          additionalProperties: true
+          default: {}
+          description: |
+            Rewriter-specific detail (dates found, error reason, ...). Its
+            shape varies by `kind`; do not branch on it.
+
+    RetrieveTrace:
+      type: object
+      additionalProperties: false
+      description: |
+        Per-stage trace of one retrieval round.
+
+        Answers two questions and only these two:
+
+          1. Where was a watched (target) chunk dropped?
+          2. What came back at each stage, and with what scores?
+
+        (1) is what the benchmark needs — a gold chunk dying during recall
+        and one dying at the final cutoff call for completely different
+        fixes. (2) is the material for judging whether another chunk could
+        have answered the same question, and for telling "cut by a
+        threshold" apart from "ranked badly to begin with".
+
+        **Null unless the request set `include_stage_trace: true`.**
+      required:
+        - target_chunk_ids
+        - stages
+        - notes
+      properties:
+        target_chunk_ids:
+          type: array
+          description: |
+            The chunks this round watched. Empty means the funnel was
+            collected without naming any target.
+          items:
+            type: string
+            format: uuid
+
+        stages:
+          type: array
+          items:
+            $ref: '#/components/schemas/RetrieveStageTrace'
+
+        notes:
+          type: array
+          description: |
+            Known limits of the collection, stated in the response rather
+            than only in a comment — otherwise a reader takes "this chunk
+            does not appear anywhere" to mean "nothing was filtered",
+            when the real reason is that the index layer never handed it
+            over.
+
+            Currently one entry: candidates cut by
+            `retrieval_config.min_score` (pushed down into the index —
+            Elasticsearch's `min_score`, Milvus' `radius`) are never seen
+            by this service, so they are indistinguishable here from "not
+            recalled at all". Attributing those precisely would require
+            the index backend to return the filtered candidates.
+          items:
+            type: string
+
+    RetrieveStageTrace:
+      type: object
+      additionalProperties: false
+      description: |
+        One stage boundary: what entered, what left, and who died here.
+      required:
+        - stage_key
+        - source_key
+        - executed
+        - input_count
+        - output_count
+        - candidates
+      properties:
+        stage_key:
+          type: string
+          description: |
+            Real stage name, not a parallel vocabulary:
+            `recall.<retrieval_type>` (one per route), `fusioner`,
+            `filter`, `reranker`, `cutter`.
+          examples:
+            - recall.dense_vector
+            - fusioner
+            - cutter
+
+        source_key:
+          type: string
+          description: |
+            The parallel branch (which recall route). Empty string for
+            non-branch stages — an empty string participates in a unique
+            constraint, NULL does not.
+
+        executed:
+          type: boolean
+          description: |
+            Whether this stage actually ran.
+
+            False means "turned off in config / not wired" (a DTD with no
+            reranker configured, a filter skipped via `enabled: false`).
+            That is a **capability gap**, not the same thing as "it ran and
+            found nothing", which is a **quality** result. Conflating them
+            makes a DTD without a reranker look like "the reranker threw
+            away the good results".
+
+        input_count:
+          type: integer
+          minimum: 0
+
+        output_count:
+          type: integer
+          minimum: 0
+
+        candidates:
+          type: array
+          description: |
+            **top-N surviving ∪ top-N dropped ∪ every watched chunk**,
+            in the stage's own order.
+
+            This is the only place where "cut by a threshold" can be told
+            apart from "ranked badly": seeing `rank: 11, score: 0.29`
+            against a threshold of 0.3 makes it immediately obvious.
+          items:
+            $ref: '#/components/schemas/TracedChunkCandidate'
+
+    TracedChunkCandidate:
+      type: object
+      additionalProperties: false
+      description: |
+        One candidate's state at one stage boundary.
+      required:
+        - chunk_id
+        - rank
+        - selected
+        - is_target
+      properties:
+        chunk_id:
+          type: string
+          format: uuid
+
+        rank:
+          type: integer
+          minimum: 1
+          description: |
+            1-based rank. Order in the list **is** the ranking — candidates
+            carry no rank field of their own.
+
+        score:
+          type: number
+          nullable: true
+          description: |
+            The stage's score, **normalized to [0, 1]**, higher is better.
+            Every score flowing through the pipeline has that shape
+            (per-route normalization after recall, then after fusion, then
+            after rerank).
+
+            Do not compare across stages even so: normalization divides by
+            that stage's maximum, so a 0.9 in one stage and a 0.9 in
+            another do not share a base.
+
+        source_key:
+          type: string
+          nullable: true
+          description: Which recall route this came from; empty after fusion.
+
+        selected:
+          type: boolean
+          description: Whether this stage kept it. false means it died here.
+
+        drop_reason:
+          type: string
+          nullable: true
+          description: |
+            Why it was dropped — a controlled vocabulary (see
+            domain/schemas/enum.py, EvalDropReason): not_recalled,
+            top_k_cutoff, score_threshold, ownership_filter,
+            metadata_filter, rerank_cutoff, final_top_k_cutoff, and so on.
+
+            Null when `selected` is true. Never null when it is false —
+            an unattributable drop is reported as `unknown` rather than
+            omitted, because null means "not dropped" in this model and
+            using it would disguise "we don't know why".
+
+        is_target:
+          type: boolean
+          description: |
+            Whether this chunk was named in the request's
+            `target_chunk_ids`. A target chunk always gets a row, even
+            well outside the top-N.
 
     DegradedRoute:
       type: object

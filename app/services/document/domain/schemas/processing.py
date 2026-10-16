@@ -332,6 +332,24 @@ class CanonicalChunk(APIModel):
         ),
     )
 
+    dates: list[str] = Field(
+        default_factory=list,
+        description=(
+            "这条 chunk 的正文里出现的**日期键**（补零的 `YYYYMMDD`，见 "
+            "`services/document/dates.py` 的 `canonical_key`）。"
+            "阶段 10 从 content 算出来。"
+            "\n\n"
+            "为什么要预计算成字段：关键词召回里「日期」是**唯一的判别词**"
+            "（公司名与模板词满语料都是），但把它当普通词项时会被 "
+            "`minimum_should_match` 按比例摊薄。有了这个字段，查询侧就能"
+            "按「块里到底有没有这一天的记录」精确筛/加权 —— 而且它把两种"
+            "写法（中文 / 短横线）在**写入期**就归一了，查询端怎么写都能"
+            "对上。"
+            "\n\n"
+            "空列表 = 这条正文里没有可识别的日期（很常见，不必特殊对待）。"
+        ),
+    )
+
     context_text: str | None = Field(
         default=None,
         description=(
@@ -557,6 +575,37 @@ class IndexSearchRequest(APIModel):
     """
 
     query: str
+
+    boost_phrases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "应当按**位置相邻**加权（`match_phrase`）的片段，来自查询改写器"
+            "（见 `RewriteResult.boost_phrases`）。空列表 = 不做短语加权。"
+            "\n\n"
+            "为什么需要它：把判别词（如日期）拼进 `query` 只是多几个词项，"
+            "而它们会和其余词项一起被 `minimum_should_match` 摊薄；"
+            "短语匹配不受那条比例约束。"
+            "\n\n"
+            "⚠️ 它是**可选能力**：后端认不了就忽略（向量那一路本来就没有"
+            "「短语」这个概念；当前只有 ES 实现它）。所以它不该被当成"
+            "「一定生效的过滤条件」——它只影响排序。"
+        ),
+    )
+
+    date_keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "判别性的**日期键**（补零的 `YYYYMMDD`，与索引期 `content_dates` 同形态），"
+            "来自查询改写器（见 `RewriteResult.date_keys`）。"
+            "\n\n"
+            "与 `boost_phrases` 是两条互补的通道：短语那一条在**正文**里找"
+            "字符串（查询写什么就得匹配什么写法），这一条打的是写入期就算好"
+            "的字段 —— 「查询写中文、正文写短横线」也能对上。"
+            "\n\n"
+            "⚠️ 同样只影响排序。**不要**拿它做硬筛：日期必然出现在金标块里"
+            "是出题方式决定的，硬筛等于把答案漏进检索。"
+        ),
+    )
 
     query_vector: list[float] | None = Field(
         default=None,

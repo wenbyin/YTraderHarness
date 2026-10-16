@@ -27,8 +27,8 @@ LangGraph 对空 Send 列表不报错，而是让运行静默结束，
 ----
 只有**瞬时性**失败值得重试（索引抖动、连接超时）。
 NotImplementedError / ValueError 这类是配置或实现问题，
-重试只会把同样的错误重复三遍。因此重试策略按异常类型白名单，
-而不是"失败就重试"。
+重试只会把同样的错误重复三遍。因此重试策略是一张**判据**
+（见 is_retryable），而不是"失败就重试"。
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy
+from pymilvus.exceptions import MilvusException
 
 from .catalog import (
     EDGES,
@@ -96,10 +97,43 @@ RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
 )
 
 
+def is_retryable(error: BaseException) -> bool:
+    """
+    这条异常值不值得重试。
+
+    除了上面那三个内置的网络类异常，还要认 Milvus 的服务端抖动 ——
+    本机这个实例的 delegator 会反复在"可服务/不可服务"之间跳，写入正好
+    撞进窗口时返回：
+
+        code=503 channel distribution is not serviceable:
+        channel not available
+
+    pymilvus 内部重试约 9 秒后放弃并抛出，而它不属于上面三类，于是**整条
+    写入链直接失败**。这条错误重试一次往往就好了，是这里唯一真正的缺口。
+
+    ⚠️ 不能把 MilvusException 整类收进来：同一个类也盖着"过滤表达式解析
+    失败"这类重试毫无意义的错误，那正是上面那句注释要排除的东西。
+
+    ⚠️ 也不能用 `MilvusException.retriable`。那本该是服务端给的判定，实测
+    在本机这个版本里**根本没填** —— 连 101 collection not loaded 这种板上
+    钉钉的瞬时错误都是 False。唯一被正确填充的是 `is_input_error`：参数
+    非法、表达式解析失败那类才是 True，与要排除的类别正好对上。所以判据
+    是"是 Milvus 错误、且服务端没把它标成输入错误"。
+    """
+
+    if isinstance(error, RETRYABLE_EXCEPTIONS):
+        return True
+
+    if isinstance(error, MilvusException):
+        return not error.is_input_error
+
+    return False
+
+
 def build_retry_policy() -> RetryPolicy:
     return RetryPolicy(
         max_attempts=3,
-        retry_on=RETRYABLE_EXCEPTIONS,
+        retry_on=is_retryable,
     )
 
 

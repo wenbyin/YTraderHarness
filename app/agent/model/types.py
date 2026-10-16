@@ -147,6 +147,53 @@ class ModelRole:
     #: "尚未实现时为 null"）。见那一份文件的说明。
     MEMORY_RETRIEVAL = "memory.retrieval"
 
+    # ---- 检索评测（document eval）：同样是后台任务里的一次调用 ----
+    #
+    # 与上面几条 memory role 是同一类：**不在任何图里**，由
+    # `retrieval_eval.generate` 那条后台任务发起。走 Model Runtime 而不是
+    # 直接拿 provider 客户端，是为了白拿它那套 timeout / retry / fallback
+    # 与异常归一化 —— 造题是几百次调用的一批活，逐次自己写重试必然漏掉
+    # 某些分支，而漏掉的表现是"这批数据集少了一部分题"，不报错。
+
+    #: 出题：从一段 chunk 正文里产出「问题 + 逐字答案」。
+    #:
+    #: ⚠️ 值取动作名 `eval.qa_generation` 而不是任务名（任务叫
+    #: `retrieval_eval.generate`）—— 与 memory 那几条同一口径：任务里可能
+    #: 还有别的模型调用，role 描述的是**这一次调用干什么**。
+    EVAL_QA_GENERATION = "eval.qa_generation"
+
+    #: 跨 chunk 判金标：这道题别的 chunk 是不是也能独立回答。
+    #:
+    #: 与上一条分两个 role，因为两者取舍不同：出题要"读得细、问得准"，
+    #: 裁定要"判得保守"（宁漏勿滥 —— 错误地多标一个金标会让召回率虚高，
+    #: 且虚高的部分无法察觉）。挤一个 role 就没法只调其中一个的模型。
+    EVAL_CROSS_CHUNK_JUDGE = "eval.cross_chunk.judge"
+
+    # ---- 检索侧：召回之前改写 query ----
+    #
+    # ⚠️ 值**不带 `eval.` 前缀**，与上面两条不一样：改写在**线上**检索
+    # 路径上也能用（`DocumentRetrieveRequest.query_rewriter`），不是评测
+    # 专属。评测只是它的第一个调用方（阶梯的逐轮参数）。
+    #
+    # 与 memory 那几条同类：一次调用、不在任何图里；走 Model Runtime
+    # 白拿 timeout / retry / fallback。
+
+    #: 查询改写：把用户那句话改写成更适合检索的形式。
+    #:
+    #: 改不动的必须**原样返回**并标 `changed=false` —— 硬改会改变问题的
+    #: 语义，而语义一变，"这条 case 为什么没命中"就再也归因不到检索上了。
+    QUERY_REWRITE = "query.rewrite"
+
+    #: 精排：给一批候选正文打相关性分（`RerankerType.LLM`）。
+    #:
+    #: 与改写同属检索侧（线上也会走，所以不带 `eval.` 前缀），但**每次
+    #: 调用的输入大得多**：它要读 N 条候选正文，所以窗口（送几条进来）
+    #: 由实现自己封顶 —— 那是成本的主要变量。
+    #:
+    #: 与 cross-encoder 那条本地精排是**并列的两条实现**，不是替代关系：
+    #: 前者便宜、稳定；这条能带上领域约定（"这批语料里什么算相关"）。
+    RERANK = "retrieve.rerank"
+
 
 # ============================================================
 # 能力

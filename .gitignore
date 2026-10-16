@@ -6,8 +6,8 @@ __pycache__/
 *.pyc
 /.pytest_cache/
 /app/config/llm.yaml
+/app/config/rerank.yaml
 /app/config/casdoor.yaml
 /app/config/cert.pem
-/pytest.ini
 /milvus_flush_probe.py
 /todolist

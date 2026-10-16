@@ -509,6 +509,38 @@ async def lifespan(
             "第一次模型调用会自己付这份成本。"
         )
 
+    # ---- OpenAPI schema 预热 ----------------------------------
+    #
+    # `/openapi.json` 与 `/docs` 的 schema 是**首次请求时才生成**的 ——
+    # 见本文件里覆盖 `app.openapi` 那段（那里写着"文档要等第一次请求
+    # /openapi.json 才生成"）。而生成是**同步**的：它要遍历全部路由与
+    # 全部 Pydantic 模型，再给每个组件重命名一次。
+    #
+    # 实测这一下把事件循环卡了 2.4 秒（watchdog 阈值 2.0）。那段时间里
+    # 所有请求、SSE 心跳、以及 Redis 的**读超时定时器**全部停摆 —— 而
+    # 后者会伪装成一条网络故障报错（`TimeoutError: Timeout reading from
+    # localhost:6379`），与真正的原因隔了十万八千里。这与上面那段注释里
+    # 描述的 LLM 预热是同一个坑。
+    #
+    # ⚠️ 同一取舍，逐条适用：**必须 await 在 yield 之前**（留到第一次
+    #    请求再算，就是把这份成本转嫁给某个不幸的调用方），且**丢线程
+    #    池**（它本来就是同步阻塞的，而 watchdog 此刻已经在数秒）。
+    #
+    # 幂等：生成完会缓存进 `app.openapi_schema`，之后每次请求只走一遍
+    # `pin_contract_component_names`（它自己会早退）。
+    #
+    # 顺带一提：加了新端点与新 DTO 之后这个成本会涨 —— 它不是凭空变慢的，
+    # 所以更不该留在请求路径上。
+    try:
+        await asyncio.to_thread(app.openapi)
+        logger.info("OpenAPI schema 预热完成（首个请求不必再付这份成本）")
+
+    except Exception:
+        logger.exception(
+            "OpenAPI schema 预热失败（忽略，不影响启动）："
+            "第一次请求 /openapi.json 会自己付这份成本。"
+        )
+
     # ========================================================
 
     try:

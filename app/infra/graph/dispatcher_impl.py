@@ -57,7 +57,7 @@ __all__ = [
 
 #: 队列容量（**在等**的信封数）。满了就拒绝并明确告知，而不是无限
 #: 堆积把内存吃光。在跑的那些不算在里面 —— 见 DEFAULT_MAX_CONCURRENCY。
-DEFAULT_QUEUE_SIZE: Final[int] = 256
+DEFAULT_QUEUE_SIZE: Final[int] = 1024
 
 #: 同时**在跑**的图数量上限。超出的留在队列里等，不拒绝。
 #:

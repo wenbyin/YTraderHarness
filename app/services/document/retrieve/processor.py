@@ -59,8 +59,56 @@ from ..domain.schemas.enum import (
 )
 from .base import RetrieveCandidate, normalize_scores
 from .registry import RetrieveProcessorRegistry, get_registry
+from .trace import RetrievalTraceCollector
 
 __all__ = ["RetrieveProcessor"]
+
+
+def _stage_log(stage_key: str, note: str = "") -> float:
+    """
+    一个阶段**开始**了 —— 返回起始时刻。
+
+    ⚠️ 只打"开始"、不打"结束"，是刻意的：这样**没有出现的那一行**
+    就是卡住的那一段。打"结束"的话，卡住时你看到的是最后一条"结束"
+    日志，还得自己推下一个是谁；只打"开始"则直接指向它。
+    """
+    import time
+
+    logger.info("[retrieve] 阶段 %-16s 开始%s", stage_key, note)
+    return time.monotonic()
+
+
+def _stage_done(stage_key: str, started: float, count: int) -> None:
+    """阶段结束了。与上面的"开始"配对 —— 有开始没结束 = 它卡住了。"""
+    import time
+
+    logger.info(
+        "[retrieve] 阶段 %-16s 结束 %.0fms  -> %d 条",
+        stage_key,
+        (time.monotonic() - started) * 1000,
+        count,
+    )
+
+
+def _flatten_by_score(
+        result_sets: list[list[RetrieveCandidate]],
+) -> list[RetrieveCandidate]:
+    """
+    多路候选拼成一列，按分数降序。
+
+    **只给痕迹用**（融合那一阶段的"进"长什么样），不参与任何计算 ——
+    所以它不需要与 RRF 的排序口径一致，见 `run()` 里的说明。
+    """
+
+    merged = [
+        candidate
+        for candidates in result_sets
+        for candidate in candidates
+    ]
+
+    merged.sort(key=lambda item: item.score, reverse=True)
+
+    return merged
 
 logger = logging.getLogger(__name__)
 
@@ -193,29 +241,151 @@ class RetrieveProcessor:
             *,
             query: str,
             result_sets: list[list[RetrieveCandidate]],
+            trace: RetrievalTraceCollector | None = None,
     ) -> list[RetrieveCandidate]:
         """
         跑一遍 融合 -> 过滤 -> 精排 -> 裁剪。
 
         result_sets 是"每路一个列表"（多 DTD 场景下是"每个 DTD
         一个列表"）。返回已按分数降序、已裁剪的最终结果。
+
+        `trace` —— 逐阶段痕迹的收集器，**可选**，默认 None
+        --------------------------------------------------
+        它是**纯观察者**：只读每一步已经算完的列表，不改、不去重、
+        不排序，返回值一律不用。传 None 时这条链路与从前逐字节相同
+        （一个 collector 都不建、一次集合运算都不做）。
+
+        ⚠️ 调用点全部在"这一步的结果已经产生之后"。**不要**为了少存一次
+        中间变量而把 observe 插到阶段中间，更不要在 collect 里顺手
+        `sorted()`/`set()` 之后拿返回值继续往下传 —— `run()` 是正在
+        工作的主链路，那样做会**静默改变检索结果**。
         """
 
+        # 融合的"进"：多路拼起来、按分数降序。
+        #
+        # ⚠️ 这个名次只是**报告口径**，不是 RRF 看到的东西 —— RRF 用的是
+        # **每一路内部**的排名（`Σ 1/(rrf_k + rank)`），跨路的分数本就
+        # 不可比（各自按最大值归一化，头名都是 1.0）。所以它回答的是
+        # "这一条在所有候选里大致处于什么位置"，而不是"融合按什么排的"。
+        fused_input = (
+            _flatten_by_score(result_sets)
+            if trace is not None
+            else None
+        )
+
+        _t = _stage_log("fusioner")
         candidates = await self._fuse(query, result_sets)
+        _stage_done("fusioner", _t, len(candidates))
+
+        if trace is not None:
+            trace.observe_stage(
+                stage_key="fusioner",
+                before=fused_input,
+                after=candidates,
+                reason="top_k_cutoff",
+            )
 
         if self.filter.enabled:
+
+            # 只在开着 trace 时才收集原因 —— 关了就不产生这个 dict，
+            # 过滤器的热循环里少一次哈希写入。
+            dropped: dict | None = {} if trace is not None else None
+
+            before_filter = candidates
+            _t = _stage_log("filter", f"（enabled={self.filter.enabled}）")
 
             candidates = await self._registry.filter.apply(
                 candidates=candidates,
                 config=self.filter,
+                dropped=dropped,
+            )
+            _stage_done("filter", _t, len(candidates))
+
+            if trace is not None:
+                trace.observe_stage(
+                    stage_key="filter",
+                    before=before_filter,
+                    after=candidates,
+                    # 逐个原因（过滤有四种），而不是按阶段写死一种。
+                    reasons=dropped,
+                )
+
+        elif trace is not None:
+            # 过滤被关掉了。仍然报一段 —— 但 `executed=False`。
+            # 不报的话，"候选怎么突然少了"会在痕迹里断档；而报成
+            # executed=True 又会让"没配过滤"看起来像"过滤没丢东西"。
+            trace.observe_stage(
+                stage_key="filter",
+                before=candidates,
+                after=candidates,
+                executed=False,
             )
 
-        candidates = await self._rerank(query, candidates)
+        before_rerank = candidates
+        _t = _stage_log("reranker", f"（type={self.reranker.type}）")
 
-        return await self._registry.cutter.cut(
+        # 实现往这里写"我没能真跑"的原因（第三方不可用、超时…）。
+        # 形制照 `ResultFilter.apply(dropped=...)` —— 原因必须由实现
+        # 回答，调用方分不清"本地模型挂了"与"远端 502"。
+        rerank_degraded: dict[str, str] = {}
+
+        candidates = await self._rerank(
+            query, candidates, degraded=rerank_degraded,
+        )
+        _stage_done("reranker", _t, len(candidates))
+
+        if rerank_degraded:
+            logger.warning(
+                "精排降级（type=%s）：%s —— 本轮按融合顺序返回。",
+                self.reranker.type,
+                rerank_degraded.get("reason", "未记录原因"),
+            )
+
+        if trace is not None:
+            trace.observe_stage(
+                stage_key="reranker",
+                before=before_rerank,
+                after=candidates,
+                reason="rerank_cutoff",
+                # 三种"没真跑"：enabled=false、type 为空（DTD 没配精排、
+                # 调用方也没指定）、以及**实现自己报告降级**。前两种不是
+                # "精排跑了但没改动结果"，第三种更不是 —— 它连模型都没
+                # 碰到。混进"跑了"会让宏观统计读成"精排没能改善排序"，
+                # 而真实原因是那次调用根本没成功。
+                executed=(
+                    self.reranker.enabled
+                    and self.reranker.type is not None
+                    and not rerank_degraded
+                ),
+            )
+
+        if rerank_degraded and trace is not None:
+            trace.note(
+                "精排未能执行（type="
+                f"{self.reranker.type}）："
+                f"{rerank_degraded.get('reason', '未记录原因')}"
+                " —— 本轮结果按融合顺序，与「精排跑了但没改善排序」"
+                "不是一回事。"
+            )
+
+        before_cut = candidates
+        _t = _stage_log("cutter", f"（top_k={self.cutter.top_k}）")
+
+        candidates = await self._registry.cutter.cut(
             candidates=candidates,
             config=self.cutter,
         )
+        _stage_done("cutter", _t, len(candidates))
+
+        if trace is not None:
+            trace.observe_stage(
+                stage_key="cutter",
+                before=before_cut,
+                after=candidates,
+                reason="final_top_k_cutoff",
+            )
+
+        return candidates
 
     async def _fuse(
             self,
@@ -261,6 +431,7 @@ class RetrieveProcessor:
             self,
             query: str,
             candidates: list[RetrieveCandidate],
+            degraded: dict[str, str] | None = None,
     ) -> list[RetrieveCandidate]:
 
         if not candidates:
@@ -288,6 +459,7 @@ class RetrieveProcessor:
             candidates=candidates,
             top_n=top_n,
             config=self.reranker,
+            degraded=degraded,
         )
 
     # ========================================================

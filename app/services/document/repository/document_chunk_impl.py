@@ -14,8 +14,15 @@ from uuid import UUID
 from sqlalchemy import delete, func, select
 
 from ..domain.entities import DocumentChunk
+from ..domain.schemas.enum import DocumentStatus, VersionStatus
+from ..models.sqlalchemy.document import (
+    Document as DocumentModel,
+)
 from ..models.sqlalchemy.document_chunk import (
     DocumentChunk as DocumentChunkModel,
+)
+from ..models.sqlalchemy.document_version import (
+    DocumentVersion as DocumentVersionModel,
 )
 from .document_chunk import DocumentChunkRepository
 
@@ -270,6 +277,97 @@ class DocumentChunkRepositoryImpl(DocumentChunkRepository):
         ).scalars().all()
 
         return [self._to_entity(model) for model in models]
+
+    # ============================================================
+    # Mapping
+    # ============================================================
+
+    # ============================================================
+    # 出题抽样池
+    # ============================================================
+
+    async def list_samplable_chunk_ids(
+            self,
+            *,
+            document_type_definition_ids: list[UUID],
+            chunker_keys: list[str],
+            max_pool: int,
+    ) -> list[dict]:
+
+        if not document_type_definition_ids or not chunker_keys:
+            return []
+
+        stmt = (
+            select(
+                DocumentChunkModel.document_chunk_id,
+                DocumentChunkModel.document_version_id,
+                DocumentModel.document_type_definition_id,
+                # 文档身份。这三列是**出题必需的**，不是附赠 —— 见
+                # sampling 与 eval_qa_generation 提示词里的说明：
+                # 正文常写「本公司」，模型必须从文档拿到主体名才能写出
+                # 可检索的问题。
+                #
+                # 它们**不要钱**：两级 join 本来就在做（DTD 在 document
+                # 上，绕不过去），只是原先没 select 出来。
+                DocumentModel.document_id,
+                DocumentModel.title,
+                DocumentModel.document_key,
+            )
+            # ⚠️ 两级 join 是必须的：DTD 不在 chunk 上，也不在版本上 ——
+            # 它在 **document** 上。chunk -> version -> document 这条链
+            # 是"这个 chunk 属于哪个 DTD"的唯一路径（chunk 与 retrieval
+            # 之间没有外键，见 document_chunk 模型的说明）。
+            .join(
+                DocumentVersionModel,
+                DocumentVersionModel.document_version_id
+                == DocumentChunkModel.document_version_id,
+            )
+            .join(
+                DocumentModel,
+                DocumentModel.document_id
+                == DocumentVersionModel.document_id,
+            )
+            .where(
+                DocumentModel.document_type_definition_id.in_(
+                    document_type_definition_ids
+                ),
+                # 逻辑删除的文档与版本不参与出题。用 `only_active` 那套
+                # 口径：数据集是对**当前可用语料**的断言，把历史版本也
+                # 抽进来会让同一份内容以不同的 chunk_id 出现两次。
+                DocumentModel.status == DocumentStatus.ACTIVE,
+                DocumentVersionModel.version_status == VersionStatus.ACTIVE,
+                DocumentChunkModel.chunker_key.in_(chunker_keys),
+                # 空正文没有可问的内容；抽中它只会产出一个失败的窗口。
+                DocumentChunkModel.content != "",
+            )
+            # ⚠️ 排序是**必需**的，见接口说明：没有它，LIMIT 返回的是
+            # 任意子集，"同种子可复现"直接失效。
+            .order_by(DocumentChunkModel.document_chunk_id)
+            .limit(max_pool)
+        )
+
+        rows = await self._session.execute(stmt)
+
+        return [
+            {
+                "chunk_id": chunk_id,
+                "document_version_id": document_version_id,
+                "document_type_definition_id": (
+                    document_type_definition_id
+                ),
+                "document_id": document_id,
+                "document_title": document_title,
+                "document_key": document_key,
+            }
+            for (
+                chunk_id,
+                document_version_id,
+                document_type_definition_id,
+                document_id,
+                document_title,
+                document_key,
+            ) in rows.all()
+        ]
 
     # ============================================================
     # Mapping

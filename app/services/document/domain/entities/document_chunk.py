@@ -117,6 +117,30 @@ class DocumentChunk(BaseModel):
         ),
     )
 
+    # 检索前缀（瞬态）
+    #
+    # 阶段 8 的增强产出：`前缀 + 空格 + content`，只喂阶段 9 的 dense 与
+    # sparse 向量化。前缀是"这条 chunk 属于谁"的几个元素（文件名 / section /
+    # DTD 名 / 业务主键 / 上传时间），正文里往往不重复它们。
+    #
+    # ⚠️ 它是**瞬态字段**，三条边界都要守住：
+    #   1. 不落 PG —— repository 的 add_many() 是逐列显式映射，天然带不过去。
+    #   2. 不落索引 —— 阶段 10 的 _to_canonical_chunks() 逐字段构造，读的是
+    #      content，embed_text 到不了 ES / Milvus。
+    #   3. 不参与 content_hash 与计数 —— 那些是 chunker 算的，这里不碰。
+    #
+    # 之所以不拼进 content：`content == 正文[start_index:end_index]` 是硬
+    # 不变式，qa/overlap.py 的区间求交与 eval 的 offset 切片都靠它，改了会
+    # **静默错位**。
+    embed_text: str | None = Field(
+        default=None,
+        description=(
+            "Text fed to stage 9 embedding (prefix + space + content)."
+            " Transient: not persisted to PostgreSQL, not projected to any"
+            " index, not part of content_hash or the counters."
+        ),
+    )
+
     # Audit
     created_at: datetime | None = Field(
         default=None,

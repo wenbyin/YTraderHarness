@@ -39,13 +39,23 @@
 12 条"这种定位光靠 chunk_index 是读不出来的，而 section 能让人和
 LLM 都立刻知道"这块讲的是什么"。
 
+产出什么
+--------
+    metadata     继承的文档级键 + section
+    locator      归属定位（chunk_index / section / document_title）
+    embed_text   前缀 + 空格 + 正文，专供阶段 9 的向量化
+
+前两者是对既有 chunk 的补全，第三个是**派生字段**。
+
 不改 content
 ------------
-本实现**只写 metadata 与 locator**，绝不碰 content / chunk_index ——
-理由见 base.py 的说明（唯一约束与 content_hash）。
+本实现**绝不碰 content 与 chunk_index** —— 理由见 base.py 的说明
+（唯一约束与 content_hash）。
 
-想把上下文拼进正文以改善**向量**召回的话，那是向量化那一步的事
-（拼给 embedder 的文本），与这里正交。
+`embed_text` 正是"为了向量召回补上下文"的落点，但它是独立字段而不是
+把前缀并进正文。这个区别不是洁癖：`content == 正文[start_index:end_index]`
+是硬不变式，qa/overlap.py 的区间求交与 eval 的 offset 切片都依赖它，
+并进去会**静默错位**。
 """
 
 from __future__ import annotations
@@ -87,6 +97,41 @@ _INHERITED_KEYS: tuple[str, ...] = (
     "document_key",
 )
 
+#: embed_text 前缀的元素，**顺序即输出顺序**。
+#:
+#: 五者都是"这条 chunk 属于谁"，而正文里往往不重复它们 —— 一份按公司
+#: 组织的长文档，中间那些纯数据 chunk（一长串股东户数）正文里没有公司名，
+#: 查询带上公司名时，向量那两路在 chunk 层面根本看不见这个条件。
+#:
+#: ⚠️ 与 indexing.py 的 _CONTEXT_KEYS（喂 BM25 的 context_text）、上面的
+#: _INHERITED_KEYS（继承白名单）是**三份独立的键表**，刻意不合并：
+#:
+#:     _INHERITED_KEYS   写：哪些文档级键要拷进 chunk.metadata   （无序，存在即可）
+#:     _CONTEXT_KEYS     读：拼给 ES 做 BM25 的上下文           （顺序 = 权重语义）
+#:     _EMBED_PREFIX_KEYS 读：拼给向量模型的输入                （顺序 = 输出顺序）
+#:
+#: 合并它们会让"往继承白名单加一个键"顺带改掉 BM25 的权重或前缀的顺序，
+#: 那种耦合不报错、只在检索质量上悄悄体现。
+_EMBED_PREFIX_KEYS: tuple[str, ...] = (
+    # 公司名/主体：**这条最要紧**，而且是后来补的。
+    #
+    # 此前前缀里只有 `file_name`（`07_风险、法律与上市状态.md`），而这家
+    # 语料的公司名住在 **title**（`荣安地产·风险、法律与上市状态`）——
+    # 于是向量里根本没有公司名，而问句里几乎必带公司名。实测后果：问
+    # 「荣安地产2007年4月12日…」时，那条正文里不写公司名的金标**连
+    # dense 的 top-200 都进不去**（只被 keyword 召回，于是在融合里吃单路
+    # 命中的亏）。
+    #
+    # BM25 那一侧一直看得见它（`_CONTEXT_KEYS` 里有 title）—— 也就是说
+    # 两条路此前**看到的上下文不是同一份**。
+    "company_name",  # 公司名（元数据里有则带上）
+    "title",         # 文档标题，通常含公司名
+    "file_name",     # 文件名
+    "section",       # 本阶段从正文标题推出来
+    "dtd_name",      # DTD 的 "名称(编码)"，见 metadata_extraction
+    "document_key",  # business_key
+)
+
 #: Markdown / HTML 里的标题行。
 _MD_HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
 _HTML_TAG = re.compile(r"<[^>]+>")
@@ -118,6 +163,10 @@ class TxtCommonChunkEnricher(DocumentChunkEnricher):
         一批 chunk 就地增强，返回同一个列表。
 
         顺序不变（按下标一一对应），content / chunk_index 不动。
+
+        产出三样东西，都挂在 metadata / locator / embed_text 上：
+            继承的文档级元数据、section（从正文标题推）、embed_text
+            （喂阶段 9 的向量输入，见 _EMBED_PREFIX_KEYS）。
         """
 
         if not chunks:
@@ -125,10 +174,13 @@ class TxtCommonChunkEnricher(DocumentChunkEnricher):
 
         inherited = _inherited(document_metadata)
 
-        if not inherited:
-            # 没有任何可继承的东西 —— 原样返回而不是硬塞一个空壳。
-            # 表现与占位实现一致，但这是**真的没料可加**，不是没实现。
-            return chunks
+        # ⚠️ 这里**不能**因为 inherited 为空就早退。
+        #
+        # section 与 embed_text 都是**内容派生**的 —— 前者只看正文里的
+        # 标题，后者只需要 section + 正文，两者都不依赖任何文档级元数据。
+        # 早退会让它们一起消失，而且不报错（实测 document_metadata={} 时
+        # markdown 的 section 也拿不到）。inherited 为空只意味着"没有东西
+        # 可继承"，不是"没事可做"。
 
         fmt = _detect_format(document_metadata, chunks)
 
@@ -139,18 +191,26 @@ class TxtCommonChunkEnricher(DocumentChunkEnricher):
             key=lambda i: getattr(chunks[i], "chunk_index", i),
         )
 
-        section: str | None = None
+        #: 游标：走到当前位置时"最近见到的那个标题"。
+        cursor: str | None = None
 
         for index in ordered:
 
             chunk = chunks[index]
 
-            section = _section_of(chunk, fmt, section)
+            # ⚠️ 两个值：本块的 section，与**游标**（走到块尾时处在哪个
+            # 小节）。此前是一个值兼两用，于是"这一块属于哪一节"与"下一块
+            # 从哪一节开始"只能取同一个答案 —— 而它们在这批文档上**就是
+            # 不同的**：事件按时间倒序排，一个块往往以某件事的正文开头，
+            # 那件事的标题被切在**上一块**。
+            section, cursor = _section_of(chunk, fmt, cursor)
 
-            chunk.metadata = {
-                **inherited,
-                **dict(chunk.metadata or {}),
-            }
+            # 没有可继承的东西就别白重建一次 dict。
+            chunk.metadata = (
+                {**inherited, **dict(chunk.metadata or {})}
+                if inherited
+                else dict(chunk.metadata or {})
+            )
 
             if section:
                 chunk.metadata["section"] = section
@@ -174,7 +234,65 @@ class TxtCommonChunkEnricher(DocumentChunkEnricher):
 
             chunk.locator = locator
 
+            # 向量输入。放在最后算：它要用到这一步才齐的 metadata 与
+            # section，还要用到只在 document_metadata 里的 dtd_name / update。
+            chunk.embed_text = _embed_text_of(
+                chunk,
+                section=section,
+                document_metadata=document_metadata,
+            )
+
         return chunks
+
+
+def _embed_text_of(
+        chunk,
+        *,
+        section: str | None,
+        document_metadata: dict[str, Any],
+) -> str:
+    """
+    组装喂给阶段 9 的向量输入：`前缀 + 空格 + 正文`。
+
+    前缀是 _EMBED_PREFIX_KEYS 那几个元素的**裸值**，空格相连 —— 与
+    indexing.py 拼 context_text 是同一套约定，不引入第二种拼法。
+
+    缺值的元素**跳过**：plain 文本没有 section，business_key 也可能为空，
+    给它们留空占位只会往向量里塞无意义的空白。
+
+    一个元素都凑不出来时退回**正文本身**而不是空串 —— 下游只看这个字段，
+    让"没有前缀"与"字段缺失"保持两件事，阶段 9 的观测才分得清。
+
+    前缀放在正文**之前**：查询往往先提"哪家公司/哪份文档"，再提"看什么
+    数据"，而这个顺序也是人读的时候的顺序。
+
+    注意这里**没有**把结果拼回 chunk.content —— content 是切分的产物，
+    `content == 正文[start_index:end_index]` 是硬不变式，qa/overlap.py 的
+    区间求交与 eval 的 offset 切片都靠它，改了会静默错位。
+    """
+
+    view = {
+        **dict(getattr(chunk, "metadata", None) or {}),
+        "section": section,
+        # 这两个键**刻意不进 _INHERITED_KEYS** —— 它们只为前缀存在，
+        # 没有理由跟着进 chunk.metadata（那会顺带改 ES 的 metadata 字段
+        # 与对外 API 的形状）。
+        "dtd_name": document_metadata.get("dtd_name"),
+        "update": document_metadata.get("update"),
+    }
+
+    parts = [
+        str(view[key]).strip()
+        for key in _EMBED_PREFIX_KEYS
+        if view.get(key) not in (None, "")
+    ]
+
+    content = str(getattr(chunk, "content", "") or "")
+
+    if not parts:
+        return content
+
+    return " ".join(parts) + " " + content
 
 
 # ============================================================
@@ -285,33 +403,75 @@ def _sniff(chunks: list) -> str:
 def _section_of(
         chunk,
         fmt: str,
-        previous: str | None,
-) -> str | None:
+        cursor: str | None,
+) -> tuple[str | None, str | None]:
     """
-    算出这条 chunk 所属的 section。
+    算出这条 chunk 所属的 section，并推进入参游标。
 
-    `previous` 是上一条的 section —— 大多数 chunk 里没有标题，它们
-    继承上一条的，所以必须顺序累积（调用方按 chunk_index 遍历）。
+    返回 `(本块的 section, 新的游标)` —— **两个值**，因为它们不是一回事：
+
+        本块的 section   **块首**那个位置处在哪一小节（检索要的就是它：
+                          问题是从块首那段正文生成的）
+        新的游标         **块尾**那个位置处在哪一小节（下一块要看它）
+
+    此前是一个值兼两用（取块内**最后**一个标题），于是"这一块属于哪一节"
+    只能等于"下一块从哪一节开始" —— 而在这批文档上它们是**不同的**：
+
+        #### 2007-04-04 ｜ 对外担保        <- 切在这条的**末尾**
+        2007年4月12日，公司披露「对外担保」…   <- 而这条以**正文**开头
+        #### 2007-04-06 ｜ 对外担保
+        …
+
+    事件按时间**倒序**排，所以块首那件事的标题常常落在上一块里。取块内
+    最后一个标题会让金标块的 section 写着**另一个日期**（实测四条深 case
+    全部取反：2006-08-29 对 2007-04-12、2014-10-16 对 2015-05-20、
+    2015-04-28 对 2015-05-22、2023-04-10 对 2022-02-17），而 section 会进
+    `embed_text` 前缀与 ES 的 `context_text` —— 等于往向量里塞一个矛盾日期。
     """
 
     content = str(getattr(chunk, "content", "") or "")
 
     if fmt == "markdown":
+
         found = _MD_HEADING.findall(content)
-        # 取**最后一个**标题：一条 chunk 可能跨几个小节，末尾那个才是
-        # 这条 chunk 收尾时所在的位置，对"这块讲什么"更有代表性。
-        return found[-1][1].strip() if found else previous
 
+        if not found:
+            # 块内没有标题：首尾都在上一条那个小节里。
+            return cursor, cursor
+
+        last = found[-1][1].strip()
+
+        first_match = _MD_HEADING.search(content)
+
+        starts_with_heading = (
+            first_match is not None
+            and not content[:first_match.start()].strip()
+        )
+
+        if starts_with_heading:
+            # 块首就是标题：它自己就说明了这一块属于哪一节。
+            return found[0][1].strip(), last
+
+        # 块首是正文 —— 覆盖它的小节标题在**上一块**里，就是游标指向的
+        # 那个。游标还是空的（文档第一块就以正文开头、且上一块不存在）
+        # 时退回块内第一个标题：没有更好的答案了。
+        return (cursor or found[0][1].strip()), last
+
+    # 其余格式没有"块内多个小节"这回事：整块一个 section，首尾相同 ——
+    # 所以两个返回值取同一个（游标也因此原样前进）。
     if fmt == "html":
-        return _html_section(content) or previous
+        section = _html_section(content) or cursor
 
-    if fmt in ("json", "yaml"):
-        return _structured_section(content) or previous
+    elif fmt in ("json", "yaml"):
+        section = _structured_section(content) or cursor
 
-    if fmt == "xml":
-        return _xml_section(content) or previous
+    elif fmt == "xml":
+        section = _xml_section(content) or cursor
 
-    return previous
+    else:
+        section = cursor
+
+    return section, section
 
 
 def _html_section(content: str) -> str | None:

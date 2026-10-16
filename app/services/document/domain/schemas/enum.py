@@ -435,8 +435,212 @@ class RerankerType(str, Enum):
     融合之后的精排算法。
 
     与 DTD 的 rerank_strategy 字符串取值一致。
+
+    `api` 例外：它是**第三方 HTTP 精排服务**（模型标识由
+    `RerankerConfig.model` 给，例如阿里云 `qwen3.7-text-rerank`），
+    目前没有对应的 DTD `rerank_strategy` 取值 —— 只在调用方
+    （评测阶梯、或显式传 override 的请求）里出现。
     """
 
     CROSS_ENCODER = "cross_encoder"
     LLM = "llm"
     CUSTOM = "custom"
+    API = "api"
+
+
+class QueryRewriterKind(str, Enum):
+    """
+    召回**之前**的查询改写策略。
+
+    与精排那几个类型不同，这里没有"沿用 DTD 配置"的回落：改写器只能由
+    调用方逐次指定（`DocumentRetrieveRequest.query_rewriter`），
+    **不传就不改写**。评测侧把它做成阶梯的逐轮参数。
+
+        common  非模型改写：目前只做日期归一化 + 两种写法展开
+        llm     大模型改写：按提示词重写，失败自动退回原文
+    """
+
+    COMMON = "common"
+    LLM = "llm"
+
+
+# ============================================================
+# 第一层检索评测（Retrieval Eval）
+# ============================================================
+#
+# 对应 rag_eval_design/retrieval_eval_schema.sql。
+#
+# 这一层只测**召回**：LLM 只在离线造题时出现，跑评测时纯 ID 比对，
+# 没有生成、没有 LLM 判分。因此下面这些枚举描述的是"数据集与一次
+# 评测轮次"的形态，与查询期的 RetrieveProcessor* 不共用。
+
+
+class EvalBundleStatus(str, Enum):
+    """
+    一个 QA 数据集 bundle 的生命周期。
+
+    draft:
+        已创建，还没开始造题。
+
+    generating:
+        造题中（LLM 正在逐窗口出题）。
+
+    ready:
+        全部窗口成功且校验通过 —— 只有这个状态可以拿去跑评测。
+
+    partial_failed:
+        部分窗口失败。**不是 ready** —— 拿它跑评测会得到偏低的
+        召回率，而那个偏低来自数据集不完整，不是检索的问题。
+
+    failed:
+        没有任何窗口成功。
+
+    archived:
+        归档，不再参与选择器展示。
+    """
+
+    DRAFT = "draft"
+    GENERATING = "generating"
+    READY = "ready"
+    PARTIAL_FAILED = "partial_failed"
+    FAILED = "failed"
+    ARCHIVED = "archived"
+
+
+class EvalJobStatus(str, Enum):
+    """
+    造题运行（generation run）与评测运行（eval run）共用的执行状态。
+
+    与写入链的 RunStatus 刻意分开：那边的取值里有一个 `partial`
+    （至少一路成功且至少一路失败），而这里的执行单位是"窗口"或
+    "case"，语义对不上，硬套会让两边都别扭。
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    PARTIAL_FAILED = "partial_failed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class EvalCaseValidationStatus(str, Enum):
+    """
+    单条 QA 的服务端校验结论。
+
+    只有 validated 的 case 会进导出、会被评测。
+
+    rejected 与 pending 分开：rejected 是**已经判定不要**（答案不是
+    源 chunk 的逐字子串、问题重复、chunk_id 不认识……），pending 是
+    **还没判**。混成一个"非 validated"会让"这批为什么少了这么多"
+    无从归因。
+    """
+
+    PENDING = "pending"
+    VALIDATED = "validated"
+    REJECTED = "rejected"
+
+
+class EvalCaseResultStatus(str, Enum):
+    """一条 case 在评测轮次里的执行结果。"""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class EvalSamplingStrategy(str, Enum):
+    """
+    从候选 chunk 池里怎么抽 N 个。
+
+    balanced_by_dtd:
+        多个 DTD 时按各自候选数尽量均摊 —— 否则样本多的那个 DTD
+        会吃掉绝大部分题目，而它在检索上的表现未必代表其余 DTD。
+
+    uniform_all:
+        不分 DTD，整体均匀抽。单 DTD 时两者等价。
+    """
+
+    BALANCED_BY_DTD = "balanced_by_dtd"
+    UNIFORM_ALL = "uniform_all"
+
+
+class EvalGoldValidationMethod(str, Enum):
+    """
+    一个 chunk 凭什么被认定为金标。
+
+    source_chunk:
+        它就是出题用的那个 chunk（永远是金标，必进集合）。
+
+    llm_cross_chunk_judge:
+        离线跨 chunk 裁定的结果 —— 另一个 chunk **独立地**含有足以
+        回答该问题的明确证据。
+
+    human_review:
+        人工复核加入。
+
+    这个字段的意义是让"金标有多可信"可分辨：source_chunk 是构造出来
+    的事实，llm_cross_chunk_judge 是模型判断，两者的强度不同。
+    """
+
+    SOURCE_CHUNK = "source_chunk"
+    LLM_CROSS_CHUNK_JUDGE = "llm_cross_chunk_judge"
+    HUMAN_REVIEW = "human_review"
+
+
+class EvalScoreDirection(str, Enum):
+    """
+    一个分数往哪个方向算"更好"。
+
+    ⚠️ 实测口径（初稿这里写错过）：本管线暴露出来的分数**始终是归一化到
+    [0, 1] 的**，方向恒为 `higher_is_better`。"BM25 是几十、余弦是
+    0..1"说的是**归一化之前**的原始量纲 —— 那些原始分只在**下推到索引
+    层**的过滤（`retrieval_config.min_score`）里出现，不在检索响应里。
+
+    所以这个枚举目前只有第一个取值会被用到。保留它是为了将来记录那种
+    原始分；`NOT_COMPARABLE` 也是给那种场景留的（不同 backend 的原始分
+    之间确实不可比）。
+    """
+
+    HIGHER_IS_BETTER = "higher_is_better"
+    LOWER_IS_BETTER = "lower_is_better"
+    NOT_COMPARABLE = "not_comparable"
+
+
+class EvalDropReason(str, Enum):
+    """
+    金标 chunk 在某一个阶段**消失**的原因。
+
+    只有"进这一阶段前还在、出这一阶段后没了"才能归因 —— 见
+    retrieval_eval_stage_observation 的说明。
+
+    这是一个**受控词表**而不是自由文本：宏观统计（"丢在哪一阶段"）
+    全靠它分组，自由文本会让同一原因分裂成几十种写法。
+    """
+
+    NOT_RECALLED = "not_recalled"
+    TOP_K_CUTOFF = "top_k_cutoff"
+    SCORE_THRESHOLD = "score_threshold"
+    METADATA_FILTER = "metadata_filter"
+
+    #: 归属过滤：`document_ids` / `document_version_ids` 把候选挡在外面。
+    #:
+    #: 与 `METADATA_FILTER` 分开是刻意的：两者都发生在 filter 那一段，
+    #: 但**原因不同**（"不属于这几份文档" vs "元数据键值对不上"），而宏观
+    #: 统计的全部意义就是按原因分组。合并成一个桶会让"阈值该调还是过滤
+    #: 条件配错了"这件事分不出来。
+    OWNERSHIP_FILTER = "ownership_filter"
+    RERANK_CUTOFF = "rerank_cutoff"
+    FINAL_TOP_K_CUTOFF = "final_top_k_cutoff"
+    DEDUPLICATED = "deduplicated"
+    PERMISSION_FILTER = "permission_filter"
+    PROCESSOR_ERROR = "processor_error"
+
+    #: 发生了丢弃，但归不出原因。**保留它是刻意的** —— 把它并进
+    #: 别的取值会让"我们其实不知道"伪装成"我们知道"。
+    UNKNOWN = "unknown"
+
+    #: 这一阶段对该 chunk 不适用（进阶段前它就已经不在了，或是并行
+    #: 分支里没跑的那一路）。与 unknown 分开，否则"不适用"会污染
+    #: 丢因统计。
+    NOT_APPLICABLE = "not_applicable"

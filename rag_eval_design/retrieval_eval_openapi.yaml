@@ -1,0 +1,1114 @@
+openapi: 3.1.0
+info:
+  title: Document Retrieval Evaluation API
+  version: 1.0.0
+  description: |
+    Layer-1 deterministic Retrieval Eval APIs.
+
+    Dataset generation may use the internal eval.qa_generation model role, but
+    benchmark execution itself does not generate answers or use an LLM judge.
+    Each QA case is run against exactly one DocumentTypeDefinition (DTD).
+    Cross-DTD routing and Agentic Search are out of scope.
+servers:
+  - url: /api/v1
+    description: Document Service API
+security:
+  - bearerAuth: []
+tags:
+  - name: Retrieval Eval Bundles
+  - name: Retrieval Eval Generation
+  - name: Retrieval Eval Runs
+paths:
+  /retrieval-eval/bundles:
+    post:
+      tags: [Retrieval Eval Bundles]
+      operationId: createRetrievalEvalBundle
+      summary: Create a QA bundle and start its generation run
+      description: |
+        Samples canonical text chunks from explicitly selected DTDs and starts
+        asynchronous QA generation. `chunks_per_window` means the maximum
+        number of chunks included in one LLM input window; token budget is an
+        additional limit. The selected DTDs are not combined during query-time
+        evaluation: each case is queried against its own DTD.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEvalBundleRequest'
+            example:
+              name: "company-announcement-retrieval-v1"
+              description: "Direct factual QA for deterministic chunk retrieval tests"
+              document_type_definition_ids:
+                - "1d2b1f04-f4d1-4587-8a0f-5fc1c7c51e15"
+                - "a3bcde91-7b0f-4c83-b921-e6e4c7ab9e12"
+              sampled_chunk_count: 100
+              questions_per_chunk: 3
+              chunks_per_window: 5
+              max_input_tokens: 12000
+              sampling_strategy: balanced_by_dtd
+              seed: 20261015
+      responses:
+        '202':
+          description: Bundle created; generation has been queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateEvalBundleAcceptedResponse'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+    get:
+      tags: [Retrieval Eval Bundles]
+      operationId: listRetrievalEvalBundles
+      summary: List bundles for the Eval selector
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/BundleStatus'
+        - name: document_type_definition_id
+          in: query
+          description: Return bundles containing cases from this DTD.
+          schema: {type: string, format: uuid}
+        - name: page
+          in: query
+          schema: {type: integer, minimum: 1, default: 1}
+        - name: page_size
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 20}
+      responses:
+        '200':
+          description: Paginated bundle list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvalBundleListResponse'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+  /retrieval-eval/bundles/{bundle_id}:
+    parameters:
+      - $ref: '#/components/parameters/bundle_id'
+    get:
+      tags: [Retrieval Eval Bundles]
+      operationId: getRetrievalEvalBundle
+      summary: Get bundle and generation summary
+      responses:
+        '200':
+          description: Bundle details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvalBundleDetail'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /retrieval-eval/bundles/{bundle_id}/cases:
+    parameters:
+      - $ref: '#/components/parameters/bundle_id'
+    get:
+      tags: [Retrieval Eval Bundles]
+      operationId: listRetrievalEvalCases
+      summary: Preview QA cases in a bundle
+      parameters:
+        - name: page
+          in: query
+          schema: {type: integer, minimum: 1, default: 1}
+        - name: page_size
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - name: document_type_definition_id
+          in: query
+          schema: {type: string, format: uuid}
+        - name: validation_status
+          in: query
+          schema: {type: string, enum: [pending, validated, rejected]}
+      responses:
+        '200':
+          description: Paginated QA cases.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvalCaseListResponse'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /retrieval-eval/bundles/{bundle_id}/export:
+    parameters:
+      - $ref: '#/components/parameters/bundle_id'
+    get:
+      tags: [Retrieval Eval Bundles]
+      operationId: exportRetrievalEvalBundle
+      summary: Export a ready bundle as deterministic JSON
+      responses:
+        '200':
+          description: Exported dataset. Only validated cases are included.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvalBundleExport'
+        '409':
+          description: Bundle is not ready for export.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /retrieval-eval/generation-runs/{generation_run_id}:
+    parameters:
+      - $ref: '#/components/parameters/generation_run_id'
+    get:
+      tags: [Retrieval Eval Generation]
+      operationId: getRetrievalEvalGenerationRun
+      summary: Get generation progress and window errors
+      responses:
+        '200':
+          description: Generation run detail.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerationRunDetail'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /retrieval-eval/generation-runs/{generation_run_id}/retry-failed-windows:
+    parameters:
+      - $ref: '#/components/parameters/generation_run_id'
+    post:
+      tags: [Retrieval Eval Generation]
+      operationId: retryRetrievalEvalGenerationWindows
+      summary: Retry failed or incomplete generation windows
+      description: Retry must be idempotent and must not duplicate validated cases.
+      responses:
+        '202':
+          description: Retry accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GenerationRetryAcceptedResponse'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: No retryable windows or the generation run is in an incompatible state.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+  /retrieval-eval/runs:
+    post:
+      tags: [Retrieval Eval Runs]
+      operationId: createRetrievalEvalRun
+      summary: Start a deterministic retrieval test over a bundle
+      description: |
+        Runs every validated QA case against its single associated DTD.
+        No answer-generation LLM or LLM judge is called. `max_k` must be
+        supported by the effective retrieval pipeline's final output size.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEvalRunRequest'
+            example:
+              bundle_id: "d23e3d88-4fe5-4e24-a65a-b53bc4208e4f"
+              max_k: 10
+              include_stage_trace: true
+              query_processor_override:
+                fusioner:
+                  enabled: true
+                  type: rrf
+                  top_k: 50
+                  rrf_k: 60
+                filter:
+                  enabled: true
+                  score_threshold: 0.3
+                reranker:
+                  enabled: true
+                  type: cross_encoder
+                  top_n: 50
+                cutter:
+                  top_k: 10
+      responses:
+        '202':
+          description: Evaluation run queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateEvalRunAcceptedResponse'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: Bundle is not ready or max_k exceeds the effective pipeline result limit.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErrorResponse'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /retrieval-eval/runs/{eval_run_id}:
+    parameters:
+      - $ref: '#/components/parameters/eval_run_id'
+    get:
+      tags: [Retrieval Eval Runs]
+      operationId: getRetrievalEvalRun
+      summary: Get run state and benchmark metrics
+      responses:
+        '200':
+          description: Evaluation run details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvalRunDetail'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /retrieval-eval/runs/{eval_run_id}/stage-stats:
+    parameters:
+      - $ref: '#/components/parameters/eval_run_id'
+    get:
+      tags: [Retrieval Eval Runs]
+      operationId: getRetrievalEvalStageStats
+      summary: Get macro statistics for where gold chunks are lost
+      responses:
+        '200':
+          description: Aggregated stage/source statistics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StageStatsResponse'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /retrieval-eval/runs/{eval_run_id}/cases/{eval_case_id}/trace:
+    parameters:
+      - $ref: '#/components/parameters/eval_run_id'
+      - name: eval_case_id
+        in: path
+        required: true
+        schema: {type: string, format: uuid}
+    get:
+      tags: [Retrieval Eval Runs]
+      operationId: getRetrievalEvalCaseTrace
+      summary: Get per-stage top candidates, scores and gold-chunk transitions for one case
+      description: |
+        Returns at most five ranked candidates per stage/branch, plus any gold
+        candidate explicitly needed to explain a score-based drop. Scores are
+        only comparable within their own stage/score type.
+
+        Read from the database — retrieval is not re-run. The response always
+        carries `attempt_no`: a case has **one row per round** (round N runs
+        only what round N-1 missed, and round 3 is the first one with rerank
+        on), so a trace without its round number reads as "how this case was
+        retrieved" when it is really "how this round retrieved it".
+      parameters:
+        - name: attempt_no
+          in: query
+          schema: {type: integer, minimum: 1}
+          description: |
+            Which round to show.
+
+            Omitted = the **representative round** (hit first, then best
+            rank) — the same row the case list and the run-level metrics
+            fold to, so "this case's result" is one answer across the three
+            pages.
+
+            The rounds that actually exist are in the response's
+            `available_attempts`: a case found in round 1 has `[1]`, one
+            never found has `[1, 2, 3]`. Asking for a round that does not
+            exist is a 404, not an empty trace.
+      responses:
+        '200':
+          description: Per-case stage trace.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EvalCaseTraceResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /retrieval-eval/runs/{eval_run_id}/cases:
+    parameters:
+      - $ref: '#/components/parameters/eval_run_id'
+    get:
+      tags: [Retrieval Eval Runs]
+      operationId: listRetrievalEvalRunCases
+      summary: Get per-question hit/miss results
+      description: |
+        **One row per case.** A case has one result row per round internally;
+        the list returns the representative row (hit first, then best rank),
+        so `total` counts cases and matches the run's `total_cases`. Which
+        round rescued a case is in `EvalRunDetail.metrics.by_attempt`; one
+        case's per-round stage trace is the `/trace` endpoint below.
+      parameters:
+        - name: page
+          in: query
+          schema: {type: integer, minimum: 1, default: 1}
+        - name: page_size
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - name: hit
+          in: query
+          schema: {type: boolean}
+          description: |
+            Filter on the **folded** verdict (did this case get found in any
+            round), not on a single round: a case that missed round 1 and hit
+            round 2 is `hit=true`. Omitted = include the not-run ones too
+            (`gold_hit` null) — an execution failure is not a miss.
+        - name: document_type_definition_id
+          in: query
+          schema: {type: string, format: uuid}
+      responses:
+        '200':
+          description: Paginated query-level results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvalRunCaseListResponse'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    bundle_id:
+      name: bundle_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    generation_run_id:
+      name: generation_run_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+    eval_run_id:
+      name: eval_run_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+  responses:
+    BadRequest:
+      description: Invalid request.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    Unauthorized:
+      description: Authentication required.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    Forbidden:
+      description: Permission denied.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    ValidationError:
+      description: Request validation failed.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+  schemas:
+    BundleStatus:
+      type: string
+      enum: [draft, generating, ready, partial_failed, failed, archived]
+    JobStatus:
+      type: string
+      enum: [queued, running, completed, partial_failed, failed, cancelled]
+    CreateEvalBundleRequest:
+      type: object
+      additionalProperties: false
+      required: [name, document_type_definition_ids, sampled_chunk_count]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255}
+        description: {type: [string, 'null'], maxLength: 10000}
+        document_type_definition_ids:
+          type: array
+          minItems: 1
+          maxItems: 50
+          uniqueItems: true
+          items: {type: string, format: uuid}
+        sampled_chunk_count:
+          type: integer
+          minimum: 1
+          maximum: 100000
+          description: Total chunk count sampled across the selected DTD set, not per DTD.
+        questions_per_chunk:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 3
+        chunks_per_window:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 5
+          description: Maximum source chunks in one LLM request. Token budget is an additional constraint.
+        max_input_tokens:
+          type: integer
+          minimum: 1000
+          maximum: 1000000
+          default: 12000
+        enable_cross_chunk_judge:
+          type: boolean
+          default: false
+          description: |
+            Whether to run cross-chunk gold adjudication (a second model call
+            per question, judging whether *another* chunk can also answer it).
+
+            **Off by default.** While off, the judge model role is not even
+            resolved — so a missing or broken judge binding cannot break
+            dataset generation, which is exactly what "not wired up yet"
+            should mean.
+
+            What you lose while it is off: every question's gold set is just
+            the originating chunk (`gold_chunk_ids == {source_chunk_id}`), so
+            a retrieval that returns a *different* chunk capable of answering
+            the same question counts as a miss. That is a false miss, and it
+            pushes recall down by an amount that is invisible in the results.
+
+            Candidates are restricted to other chunks **of the same
+            document** — another company's document cannot answer a question
+            about this company. With random cross-company sampling the
+            candidate pool is usually empty, so enabling it costs nothing and
+            gains nothing; it lights up when one document contributes several
+            chunks to the sample.
+
+            Recorded in the bundle's `generation_config`: this flag changes the
+            dataset's contents, so which mode produced a bundle must stay
+            answerable afterwards.
+
+        sampling_strategy:
+          type: string
+          enum: [balanced_by_dtd, uniform_all]
+          default: balanced_by_dtd
+        seed:
+          type: integer
+          minimum: 0
+          maximum: 9223372036854775807
+          description: Omit to have the server create and persist a reproducible seed.
+    CreateEvalBundleAcceptedResponse:
+      type: object
+      required: [bundle_id, generation_run_id, status]
+      properties:
+        bundle_id: {type: string, format: uuid}
+        generation_run_id: {type: string, format: uuid}
+        status: {$ref: '#/components/schemas/BundleStatus'}
+        message: {type: string}
+    EvalBundleSummary:
+      type: object
+      required: [bundle_id, name, status, source_chunk_count, case_count, created_at]
+      properties:
+        bundle_id: {type: string, format: uuid}
+        name: {type: string}
+        description: {type: [string, 'null']}
+        status: {$ref: '#/components/schemas/BundleStatus'}
+        document_type_definition_ids:
+          type: array
+          items: {type: string, format: uuid}
+        source_chunk_count: {type: integer, minimum: 0}
+        case_count: {type: integer, minimum: 0}
+        latest_generation_status: {$ref: '#/components/schemas/JobStatus'}
+        dataset_sha256: {type: [string, 'null'], pattern: '^[a-f0-9]{64}$'}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+    EvalBundleListResponse:
+      type: object
+      required: [items, page, page_size, total]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/EvalBundleSummary'}
+        page: {type: integer, minimum: 1}
+        page_size: {type: integer, minimum: 1}
+        total: {type: integer, minimum: 0}
+    EvalBundleDetail:
+      allOf:
+        - {$ref: '#/components/schemas/EvalBundleSummary'}
+        - type: object
+          properties:
+            schema_version: {type: string}
+            selection_config: {type: object, additionalProperties: true}
+            generation_config: {type: object, additionalProperties: true}
+            latest_generation_run_id: {type: [string, 'null'], format: uuid}
+            updated_at: {type: string, format: date-time}
+    EvalCase:
+      type: object
+      required: [eval_case_id, document_type_definition_id, chunk_id, gold_chunk_ids, question, answer_original, question_order, validation_status]
+      properties:
+        eval_case_id: {type: string, format: uuid}
+        document_type_definition_id: {type: string, format: uuid}
+        document_version_id: {type: [string, 'null'], format: uuid}
+        document_retrieval_definition_id: {type: [string, 'null'], format: uuid}
+        document_id:
+          type: [string, 'null']
+          format: uuid
+          description: |
+            Source Document. Recorded because the question's **subject** is
+            taken from the document (the chunk body usually says "本公司" /
+            "the Company"), and once the question names a company, the
+            ground truth is only correct because *this* chunk belongs to it.
+          nullable: true
+        document_title:
+          type: [string, 'null']
+          maxLength: 255
+          description: |
+            Source document title — the **subject name** (a company name in
+            this corpus). The subject written into the question should match it.
+        document_key:
+          type: [string, 'null']
+          maxLength: 255
+          description: Source document business key (a ticker in this corpus).
+        chunk_id: {type: string, format: uuid, description: Originating chunk used to create this question.}
+        gold_chunk_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: All chunks independently verified to answer this exact question; includes chunk_id.
+          items: {type: string, format: uuid}
+        question: {type: string}
+        answer_original: {type: string, description: Exact verbatim excerpt from the originating source chunk.}
+        question_order: {type: integer, minimum: 0}
+        validation_status: {type: string, enum: [pending, validated, rejected]}
+        validation_error: {type: [string, 'null']}
+    EvalCaseListResponse:
+      type: object
+      required: [items, page, page_size, total]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/EvalCase'}
+        page: {type: integer, minimum: 1}
+        page_size: {type: integer, minimum: 1}
+        total: {type: integer, minimum: 0}
+    EvalBundleExport:
+      type: object
+      required: [schema_version, bundle_id, bundle_name, dataset_sha256, items]
+      properties:
+        schema_version: {type: string}
+        bundle_id: {type: string, format: uuid}
+        bundle_name: {type: string}
+        dataset_sha256: {type: [string, 'null']}
+        generation_config: {type: object, additionalProperties: true}
+        document_type_definition_ids:
+          type: array
+          items: {type: string, format: uuid}
+        items:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [chunk_id, gold_chunk_ids, document_type_definition_id, question, answer_original]
+            properties:
+              document_id: {type: [string, 'null'], format: uuid, nullable: true}
+              document_title: {type: [string, 'null'], maxLength: 255}
+              document_key: {type: [string, 'null'], maxLength: 255}
+              chunk_id: {type: string, format: uuid, description: Originating chunk ID.}
+              gold_chunk_ids:
+                type: array
+                minItems: 1
+                uniqueItems: true
+                items: {type: string, format: uuid}
+              document_type_definition_id: {type: string, format: uuid}
+              document_version_id: {type: [string, 'null'], format: uuid}
+              question: {type: string}
+              answer_original: {type: string}
+    GenerationWindowSummary:
+      type: object
+      required: [window_index, status, input_chunk_count, attempt_count, valid_case_count]
+      properties:
+        generation_window_id: {type: string, format: uuid}
+        window_index: {type: integer, minimum: 0}
+        status: {$ref: '#/components/schemas/JobStatus'}
+        input_chunk_count: {type: integer, minimum: 0}
+        input_token_estimate: {type: [integer, 'null'], minimum: 0}
+        attempt_count: {type: integer, minimum: 0}
+        valid_case_count: {type: integer, minimum: 0}
+        error_code: {type: [string, 'null']}
+        error_message: {type: [string, 'null']}
+    GenerationRunDetail:
+      type: object
+      required: [generation_run_id, bundle_id, status, total_chunks, total_windows, completed_windows, failed_windows, generated_cases, windows]
+      properties:
+        generation_run_id: {type: string, format: uuid}
+        bundle_id: {type: string, format: uuid}
+        status: {$ref: '#/components/schemas/JobStatus'}
+        model_role: {type: string}
+        model_name: {type: [string, 'null']}
+        sample_seed: {type: integer}
+        total_chunks: {type: integer, minimum: 0}
+        total_windows: {type: integer, minimum: 0}
+        completed_windows: {type: integer, minimum: 0}
+        failed_windows: {type: integer, minimum: 0}
+        generated_cases: {type: integer, minimum: 0}
+        error_message: {type: [string, 'null']}
+        windows:
+          type: array
+          items: {$ref: '#/components/schemas/GenerationWindowSummary'}
+        started_at: {type: [string, 'null'], format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+    GenerationRetryAcceptedResponse:
+      type: object
+      required: [generation_run_id, status, retried_window_count]
+      properties:
+        generation_run_id: {type: string, format: uuid}
+        status: {$ref: '#/components/schemas/JobStatus'}
+        retried_window_count: {type: integer, minimum: 0}
+    CreateEvalRunRequest:
+      type: object
+      additionalProperties: false
+      required: [bundle_id]
+      properties:
+        bundle_id: {type: string, format: uuid}
+        max_k:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 10
+        include_stage_trace: {type: boolean, default: true}
+        top_candidates_per_stage: {type: integer, minimum: 1, maximum: 20, default: 5, description: Persist top N scored candidates per stage/branch; any gold candidate dropped by a score threshold is additionally retained.}
+        query_processor_override:
+          $ref: '#/components/schemas/QueryProcessorOverride'
+
+        attempts:
+          type: array
+          maxItems: 3
+          description: |
+            Per-round expansion parameters — send all rounds at once.
+
+            Omitted = the built-in three-tier ladder (`DEFAULT_ATTEMPT_LADDER`
+            in the service). **This is the convention the frontend should
+            send by default.**
+
+            Semantics: **round N runs only the cases round N-1 missed.** So
+            each round has a different denominator — report that denominator
+            with the rate, or it reads as a corpus-wide number and is off by
+            an order of magnitude.
+
+            This does retry driven by the gold label. That is legitimate
+            **because each round is reported separately** (you get "found in
+            1 round: 37%" and "found in 3 rounds: 52%", both true). Folding
+            the rounds into one number is what would be cheating.
+
+            When `attempts` is given, `query_processor_override` is ignored —
+            both say "what this round runs with", and honouring both would
+            silently drop one.
+          items:
+            $ref: '#/components/schemas/EvalAttemptSpec'
+
+    EvalAttemptSpec:
+      type: object
+      additionalProperties: false
+      description: |
+        One expansion round. Rounds widen progressively, cheapest lever first.
+      properties:
+        name:
+          type: [string, 'null']
+          maxLength: 64
+          description: Display name for reports. Null = use the index.
+        recall_top_k:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 500
+          description: |
+            How many candidates **each recall route** returns. Null = that
+            route's own default (200). 500 matches
+            `IndexSearchRequest.top_k`'s ceiling.
+          nullable: true
+        retrieval_config:
+          type: object
+          description: |
+            Per-route refinement, keyed by retrieval_type. Overrides
+            `recall_top_k` for the routes it names; routes it omits keep
+            their own defaults (including the per-route timeout).
+          additionalProperties:
+            type: object
+            additionalProperties: true
+        retrieve_processor:
+          $ref: '#/components/schemas/QueryProcessorOverride'
+          description: |
+            This round's four-stage override (fusion / filter / rerank / cut).
+
+            **Round 3 enabling the reranker goes here** — reranking is
+            expensive (a third-party API call per case), so only the cases
+            the first two rounds missed pay for it.
+        query_rewriter:
+          $ref: '#/components/schemas/QueryRewriterConfig'
+          description: |
+            This round's query rewriting. **Not passed = this round does not
+            rewrite.**
+
+            Division of labour: `recall_top_k` / `retrieval_config` decide
+            **how much** is recalled, `retrieve_processor` decides **what
+            happens after recall**, and this decides **what is queried** —
+            it runs before recall and both routes see the rewritten text.
+
+            ⚠️ Giving consecutive rounds different rewriters means the
+            round-over-round delta is no longer attributable to a single
+            variable. To read a clean "reranker net gain", give the two
+            rounds the same rewriter.
+    QueryProcessorOverride:
+      type: object
+      additionalProperties: false
+      description: Only stages allowed by the existing retrieval-query contract can be overridden. Recaller is internal.
+      properties:
+        fusioner: {$ref: '#/components/schemas/FusionerConfig'}
+        filter: {$ref: '#/components/schemas/FilterConfig'}
+        reranker: {$ref: '#/components/schemas/RerankerConfig'}
+        cutter: {$ref: '#/components/schemas/CutterConfig'}
+    FusionerConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled: {type: boolean, default: true}
+        type: {type: string, enum: [rrf, weighted_sum], default: rrf}
+        top_k: {type: integer, minimum: 1, maximum: 5000, default: 50}
+        rrf_k: {type: integer, minimum: 1, maximum: 1000, default: 60}
+        weights: {type: object, additionalProperties: {type: number, minimum: 0}}
+    FilterConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled: {type: boolean, default: true}
+        score_threshold: {type: number, minimum: 0, maximum: 1}
+        document_ids: {type: array, uniqueItems: true, items: {type: string, format: uuid}}
+        document_version_ids: {type: array, uniqueItems: true, items: {type: string, format: uuid}}
+        metadata: {type: object, additionalProperties: true}
+    RerankerConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled: {type: boolean, default: true}
+        type:
+          type: string
+          enum: [cross_encoder, llm, custom, api]
+          description: |
+            `api` = a third-party HTTP rerank service; the model id goes in
+            `model` (the default ladder's round 3 uses Alibaba DashScope
+            `qwen3.7-text-rerank`). Endpoint, credentials and timeout come
+            from `app/config/rerank.yaml` — never from the request. On API
+            failure the stage degrades (fusion order kept, reported as not
+            executed), and the round still produces a result.
+        model: {type: string}
+        top_n:
+          type: integer
+          minimum: 1
+          maximum: 5000
+          description: |
+            How many candidates are **passed into** the reranker — not how
+            many come out. Reranking only reorders; the final count is
+            `cutter.top_k`'s decision. (Older builds truncated the output to
+            `top_n`, turning reranking into a second cutoff.)
+    QueryRewriterConfig:
+      type: object
+      additionalProperties: false
+      description: |
+        Per-round query rewriting, applied **before recall**.
+
+        Omitted / `kind: null` = this round does not rewrite. There is no
+        fallback to a DTD-level default: rewriting changes the query itself,
+        so it must be the caller's explicit choice.
+
+        It is a sibling of `retrieve_processor`, not a member of it — that
+        override covers the four stages running *after* recall.
+
+        The default ladder sets round 1 to `common` and round 2 to `llm`;
+        round 3 deliberately carries none, so its delta stays attributable
+        (see the ladder description).
+      properties:
+        enabled: {type: boolean, default: true}
+        kind:
+          type: [string, 'null']
+          enum: [common, llm, null]
+          description: |
+            `common` — no model call: expands **both written forms of a
+            date** (Chinese `2007年4月12日` and dash `2007-04-12`), because
+            the corpus body writes one and its section headings the other,
+            and BM25 treats them as different terms.
+
+            `llm` — one model call, prompt in
+            `agent/prompt/prompts/query_rewrite.py`, model role
+            `query.rewrite`.
+
+            Null = no rewriting.
+          nullable: true
+        model: {type: [string, 'null'], nullable: true}
+        timeout_ms:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 60000
+          nullable: true
+          description: |
+            Wall-clock cap for this round's rewrite. Null = no extra cap; the
+            `query.rewrite` binding's profile policy applies. Setting a value
+            overrides that policy, including its retry budget.
+
+            A timeout is not a failure: the round falls back to the original
+            text and reports `degraded`.
+    CutterConfig:
+      type: object
+      additionalProperties: false
+      properties:
+        top_k: {type: integer, minimum: 1, maximum: 1000, default: 10}
+        max_content_chars: {type: integer, minimum: 1, maximum: 200000}
+    CreateEvalRunAcceptedResponse:
+      type: object
+      required: [eval_run_id, bundle_id, status]
+      properties:
+        eval_run_id: {type: string, format: uuid}
+        bundle_id: {type: string, format: uuid}
+        status: {$ref: '#/components/schemas/JobStatus'}
+        message: {type: string}
+    EvalMetrics:
+      type: object
+      description: Deterministic ID-membership and latency metrics; no LLM judge is involved.
+      properties:
+        total_cases: {type: integer, minimum: 0}
+        completed_cases: {type: integer, minimum: 0}
+        failed_cases: {type: integer, minimum: 0}
+        hit_count: {type: integer, minimum: 0}
+        miss_count: {type: integer, minimum: 0}
+        hit_rate_at_1: {type: [number, 'null'], minimum: 0, maximum: 1}
+        hit_rate_at_5: {type: [number, 'null'], minimum: 0, maximum: 1}
+        hit_rate_at_k: {type: [number, 'null'], minimum: 0, maximum: 1}
+        mrr_at_k: {type: [number, 'null'], minimum: 0, maximum: 1}
+        by_attempt:
+          type: object
+          description: |
+            Per-round metrics, keyed by round number ("1", "2", "3").
+
+            **Each round has a different denominator** — round N runs only
+            the cases round N-1 missed. Every entry therefore carries
+            `cases` (how many actually ran that round) and `input_share`
+            (its fraction of the whole bundle). Read the rate together with
+            the denominator, or it looks like a corpus-wide number.
+
+            This separation is what makes gold-driven retry legitimate: the
+            numbers "found in 1 round" and "found after 3" are both true and
+            both readable. Merging them would not be.
+          additionalProperties: {type: object, additionalProperties: true}
+        hit_rate_curve:
+          type: object
+          description: |
+            Recall curve: hit rate at k = 1/5/10/20/50, from a single run.
+
+            `max_k` only decides *whether* a hit is counted — the rank is
+            found in the full returned set, so this curve is readable
+            without re-running at a different `max_k`. That is what
+            "aligning the cutoff with production" should cost: reading
+            another point, not paying for another run.
+
+            Points above `retrieved_max` are meaningless (the numerator
+            cannot grow) — check that field before reading a 0.
+          additionalProperties: {type: [number, 'null']}
+        retrieved_max:
+          type: [integer, 'null']
+          minimum: 0
+          description: Largest number of results any single case got back.
+        p50_latency_ms: {type: [number, 'null'], minimum: 0}
+        p95_latency_ms: {type: [number, 'null'], minimum: 0}
+        max_k: {type: integer, minimum: 1}
+    EvalRunDetail:
+      type: object
+      required: [eval_run_id, bundle_id, status, max_k, include_stage_trace, total_cases, completed_cases, failed_cases, metrics, created_at]
+      properties:
+        eval_run_id: {type: string, format: uuid}
+        bundle_id: {type: string, format: uuid}
+        status: {$ref: '#/components/schemas/JobStatus'}
+        max_k: {type: integer, minimum: 1}
+        include_stage_trace: {type: boolean}
+        query_processor_override: {type: object, additionalProperties: true}
+        effective_config_snapshot: {type: object, additionalProperties: true}
+        total_cases: {type: integer, minimum: 0}
+        completed_cases: {type: integer, minimum: 0}
+        failed_cases: {type: integer, minimum: 0}
+        metrics: {$ref: '#/components/schemas/EvalMetrics'}
+        created_at: {type: string, format: date-time}
+        started_at: {type: [string, 'null'], format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+    StageStatsResponse:
+      type: object
+      required: [eval_run_id, stages]
+      properties:
+        eval_run_id: {type: string, format: uuid}
+        stages:
+          type: array
+          items:
+            type: object
+            required: [stage_key, source_key, observed_cases, gold_present_after_count, gold_drop_count, drop_reason_counts]
+            properties:
+              stage_key: {type: string}
+              source_key: {type: string}
+              observed_cases: {type: integer, minimum: 0}
+              executed_cases: {type: integer, minimum: 0}
+              average_input_count: {type: [number, 'null'], minimum: 0}
+              average_output_count: {type: [number, 'null'], minimum: 0}
+              gold_present_before_count: {type: integer, minimum: 0}
+              gold_present_after_count: {type: integer, minimum: 0}
+              gold_drop_count: {type: integer, minimum: 0}
+              gold_pass_rate: {type: [number, 'null'], minimum: 0, maximum: 1}
+              drop_reason_counts:
+                type: object
+                additionalProperties: {type: integer, minimum: 0}
+    ScoredChunkCandidate:
+      type: object
+      required: [chunk_id, rank]
+      properties:
+        chunk_id: {type: string, format: uuid}
+        rank: {type: integer, minimum: 1}
+        score: {type: [number, 'null']}
+        score_name: {type: [string, 'null'], description: e.g. cosine_similarity, bm25, rrf_score, reranker_score.}
+        score_direction:
+          type: [string, 'null']
+          enum: [higher_is_better, lower_is_better, not_comparable, null]
+        source_key: {type: [string, 'null'], description: Retriever branch or stage source.}
+        selected: {type: boolean}
+        drop_reason: {type: [string, 'null']}
+        metadata: {type: object, additionalProperties: true}
+    StageTraceCandidate:
+      allOf:
+        - {$ref: '#/components/schemas/ScoredChunkCandidate'}
+        - type: object
+          required: [stage_key]
+          properties:
+            stage_key: {type: string}
+            source_key: {type: string}
+    EvalCaseTraceResponse:
+      type: object
+      required: [eval_run_id, eval_case_id, attempt_no, available_attempts, gold_chunk_ids, stages]
+      properties:
+        eval_run_id: {type: string, format: uuid}
+        eval_case_id: {type: string, format: uuid}
+        query_text:
+          type: [string, 'null']
+          description: |
+            The text **actually sent** to retrieval in this round (after
+            rewriting). Differs from the case's `question` whenever this
+            round ran a rewriter — and an LLM rewrite is not reproducible,
+            so this is the only reliable record of what produced this trace.
+          nullable: true
+        attempt_no:
+          type: integer
+          minimum: 1
+          description: |
+            Which round this trace is from. Omitted on the request = the
+            representative round (hit first, then best rank) — the same row
+            the case list and the run metrics fold to.
+        available_attempts:
+          type: array
+          items: {type: integer, minimum: 1}
+          description: |
+            The rounds this case actually ran in this run, ascending. Round N
+            runs only the cases round N-1 missed, so it is `[1]` for a case
+            found straight away and `[1, 2, 3]` for one never found. Pass one
+            of these as `attempt_no` to walk the rounds.
+        gold_chunk_ids:
+          type: array
+          items: {type: string, format: uuid}
+        stages:
+          type: array
+          items:
+            type: object
+            required: [stage_key, source_key, input_count, output_count, top_candidates]
+            properties:
+              stage_key: {type: string}
+              source_key: {type: string}
+              input_count: {type: [integer, 'null'], minimum: 0}
+              output_count: {type: [integer, 'null'], minimum: 0}
+              gold_present_before: {type: [boolean, 'null']}
+              gold_present_after: {type: [boolean, 'null']}
+              gold_ranks_before:
+                type: object
+                additionalProperties: {type: [integer, 'null'], minimum: 1}
+              gold_scores_before:
+                type: object
+                additionalProperties: {type: [number, 'null']}
+              gold_ranks_after:
+                type: object
+                additionalProperties: {type: [integer, 'null'], minimum: 1}
+              gold_scores_after:
+                type: object
+                additionalProperties: {type: [number, 'null']}
+              drop_reason: {type: [string, 'null']}
+              top_candidates:
+                type: array
+                maxItems: 5
+                items: {$ref: '#/components/schemas/ScoredChunkCandidate'}
+    EvalRunCase:
+      type: object
+      required: [eval_case_id, question, chunk_id, document_type_definition_id, status, attempt_no]
+      properties:
+        eval_case_id: {type: string, format: uuid}
+        question: {type: string}
+        chunk_id: {type: string, format: uuid}
+        document_type_definition_id: {type: string, format: uuid}
+        status: {type: string, enum: [completed, failed, skipped]}
+        attempt_no:
+          type: integer
+          minimum: 1
+          description: |
+            Which round this row is from — 1 for a case found straight away,
+            3 for one that needed the whole ladder (among equally good rows
+            the later round wins). It doubles as the handle to fetch this
+            case's per-round trace.
+
+        gold_hit: {type: [boolean, 'null']}
+        query_text:
+          type: [string, 'null']
+          description: |
+            The text actually sent in the representative round (after
+            rewriting). Equals the case's `question` when nothing rewrote it.
+          nullable: true
+        gold_rank: {type: [integer, 'null'], minimum: 1}
+        gold_chunk_ids:
+          type: array
+          minItems: 1
+          items: {type: string, format: uuid}
+        retrieved_chunk_ids:
+          type: array
+          description: Ordered IDs returned by the final retrieval stage (compatibility field).
+          items: {type: string, format: uuid}
+        top_candidates:
+          type: array
+          maxItems: 5
+          description: Final top-5 candidates, preserving stage-native scores.
+          items: {$ref: '#/components/schemas/ScoredChunkCandidate'}
+        latency_ms: {type: [integer, 'null'], minimum: 0}
+        error_code: {type: [string, 'null']}
+        error_message: {type: [string, 'null']}
+    EvalRunCaseListResponse:
+      type: object
+      required: [items, page, page_size, total]
+      properties:
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/EvalRunCase'}
+        page: {type: integer, minimum: 1}
+        page_size: {type: integer, minimum: 1}
+        total:
+          type: integer
+          minimum: 0
+          description: |
+            **Case count**, not result-row count — same denominator as the
+            run's `total_cases`, and what paging walks. Counting rows would
+            inflate it by roughly the number of rounds per case (84 for a
+            40-case run at three rounds), so paging to the end would still
+            miss cases.
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code: {type: string}
+        message: {type: string}
+        details: {type: object, additionalProperties: true}
+        request_id: {type: string}

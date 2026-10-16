@@ -175,11 +175,35 @@ models:
       #: 所以端点接受这个量级是有依据的。max_tokens 是**上限不是目标**，
       #: 抬高它本身不增加成本/延迟 —— 只是不再把思考掐在半路。
       #:
-      #: ⚠️ 再往上（16384+）需要先确认端点接不接受。本仓库无法验证：
-      #: llm.yaml 里的 key 是 `${ENV}` 引用，而模型层的调用只在应用进程里
-      #: 拿得到那些环境变量。要加就先用一次真实调用试出来，别照猜填 ——
-      #: 端点拒绝时报的是一条与"额度不够"无关的 400。
-      max_tokens: 8192
+      #: ⚠️ 2026-10-16 又在 8192 上撞到同一件事（出题那条路）
+      #: -----------------------------------------------------
+      #: 症状一模一样，只是发生在 `eval.qa_generation`：窗口输出 456 字符
+      #: 就在字符串中间断了（`Unterminated string starting at …`）。一测推理
+      #: 占比就明白了 —— 同端点一条**简单得多**的抽取，`completion_tokens=51`
+      #: 里 `reasoning=41`（**约 92%**）。而出题一次要 5 chunk × 3 题、每条
+      #: 答案还是一段长引文（≈2200 token 可见输出）：8192 里推理吃掉七千多，
+      #: 正文自然写不完。
+      #:
+      #: 抬到 16384 —— **已实测**（2026-10-16，本机真实调用）：
+      #:
+      #:     16384 -> 200，`completion_tokens=16384`、可见正文 10164 字符
+      #:     32768 -> 200（未验证是否真被采纳，本次没用到）
+      #:
+      #: 原来那句"本仓库无法验证"是**当时**的事实（key 在 llm.yaml 里由
+      #: `${ENV}` 展开，静态看确实够不着）；现在用应用进程跑一次就验了，
+      #: 所以把那句删掉 —— 留着它会挡住下一个人做同一件事。
+      #:
+      #: ⚠️ 但这已经是**第二次**靠翻倍续命了（4096 → 8192 → 16384）
+      #: ------------------------------------------------------------
+      #: 推理占比约九成，所以"可见输出的额度"始终只有上限的十分之一 ——
+      #: 只要任务再重一点就还会撞。**更对症的做法是让这类调用别思考**：
+      #: 输出形状完全由提示词给定时（抽取 / 分类 / 出题），置
+      #: `ModelRequest.disable_thinking=True` 即可（本端点实测有效：
+      #: 同一提示词下 `reasoning` 从 41 变成 None、输出 51 → 9 token，
+      #: 答案一字不差）。注意它与下面那条模型级开关**不是一回事**：
+      #: 那个是一律关（会连主循环的思维链一起关掉，见 disable_thinking 的
+      #: 说明），这个只对当场那次调用生效。
+      max_tokens: 16384
     #: 单价（每 1000 token）。**不填就不估成本**（estimated_cost=None），
     #: 而不是编一个 0 出来 —— 那会让"这家没报价"与"这次真的免费"分不清。
     #: 价格随时在变，所以它写在配置里而不是硬编码在模块里。
@@ -492,3 +516,58 @@ bindings:
     model_role: memory.persona.extract
     profile: reasoning_default
     description: L3 画像生成（把该 scope 变化过的场景抽象成个人 / 团队画像）。
+
+  # ---- 检索评测（document eval）：不在任何图里，由后台任务发起 ----
+  #
+  # ⚠️ agent_type 取 `retrieval_eval_*` 而不是 `document`：与上面那几条同一
+  # 口径 —— agent_type 对的是**产物/服务**，model_role 对的是**动作**。
+  # `document` 会让这两条与写入链上将来可能有的模型调用混在一起。
+  #
+  # ⚠️ 两条都走 reasoning 那一档，但**理由不同**
+  # --------------------------------------------
+  # 出题（eval_qa_generation）：输出直接落库成为 ground truth，回读时没有
+  # 人在中间纠正它。而且它的核心要求是"不许推断"—— 那是一道需要照着
+  # 禁止清单逐条自查的活，指令遵循优先于"答得漂亮"。
+  #
+  # 裁定（eval_cross_chunk_judge）：判据是"这段正文**自己**有没有明说"，
+  # 而模型的默认倾向是"相关就算能答"（宽松）。压住这个倾向靠的是推理
+  # 而不是文采 —— 同样走 reasoning。
+  - agent_type: retrieval_eval_generate
+    model_role: eval.qa_generation
+    profile: reasoning_default
+    description: 第一层检索评测的出题（从 chunk 正文产出问题 + 逐字答案）。
+
+  - agent_type: retrieval_eval_adjudicate
+    model_role: eval.cross_chunk.judge
+    profile: reasoning_default
+    description: 第一层检索评测的跨 chunk 金标裁定（严格判"能否独立回答"）。
+
+  # ---- 检索侧：召回之前改写 query ----
+  #
+  # ⚠️ 走 fast 那一档，与上面两条**相反**，理由是它出现在**热路径**上：
+  # 线上每一次检索（调用方显式要改写时）与评测每一轮每一案都要先付它的
+  # 延迟。而它的活很窄 —— 展开日期写法、补同义说法、去掉客套，不需要
+  # 推理，出错也有兜底（改写失败退回原文，标 degraded，检索照常）。
+  #
+  # agent_type 取 `document_retrieve_*`（服务）而不是 `query_*`（动作）：
+  # 与上面几条同一口径 —— agent_type 对的是产物/服务，model_role 对的是
+  # 动作。这里两者恰好同名，但仍按口径取名。
+  - agent_type: document_retrieve_rewrite
+    model_role: query.rewrite
+    profile: fast_default
+    description: 检索前的查询改写（日期两种写法都展开、补别名、去客套）。
+
+  # ---- 检索侧：精排（给候选打分） ----
+  #
+  # ⚠️ 同样走 fast 那一档，而且那条调用会**显式关思考**
+  # （`ModelRequest.disable_thinking=True`，理由见 rerank_llm.py）：
+  # 输出形状由提示词给定，不需要"想"；而思考与正文共用 max_tokens，
+  # 20 条候选的输入下很容易推理写满、JSON 没写完。
+  #
+  # 也就是说这一档的"推理能力"位实际上没用上 —— 选它是因为另一个变量：
+  # 单次调用要读十几条候选正文，**便宜**才是这里的第一约束。
+  # 要更强（但更贵）的判断就把 profile 换成 reasoning_default。
+  - agent_type: document_retrieve_rerank
+    model_role: retrieve.rerank
+    profile: fast_default
+    description: 检索期精排（LLM 版：给每条候选打 0~10 的相关性分）。

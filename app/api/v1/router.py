@@ -31,6 +31,7 @@ from fastapi import APIRouter, Depends
 from app.common.auth import current_user
 
 from .capabilities import router as capabilities_router
+from .document_chunks import router as document_chunks_router
 from .document_definitions import (
     router as document_definitions_router,
 )
@@ -47,6 +48,7 @@ from .processor_capabilities import (
 )
 from .processors import router as processors_router
 from .qa_datasets import router as qa_datasets_router
+from .retrieval_eval import router as retrieval_eval_router
 from .sessions import router as sessions_router
 from .tasks import router as tasks_router
 from .tool_processors import router as tool_processors_router
@@ -102,6 +104,15 @@ protected_router.include_router(
     document_definitions_router,
 )
 
+# 单条 chunk（GET /document-chunks/{document_chunk_id}）。
+#
+# 与下面任何一个前缀都不重叠（/document-chunks 不是 /document-versions
+# 或 /documents 的前缀），段数也固定 —— 所以**注册顺序在这里不承载
+# 语义**，放在 document_definitions 旁边只是按名字归类，读起来顺。
+protected_router.include_router(
+    document_chunks_router,
+)
+
 # 能力目录必须排在 document_definitions 之后：
 # /document-processors 与 /document-processor-capabilities 前缀相近，
 # 先注册更具体的字面路径，避免被宽匹配抢先。
@@ -141,6 +152,16 @@ protected_router.include_router(
 # 放在最后注册即可。
 protected_router.include_router(
     qa_datasets_router,
+)
+
+# 第一层检索评测（数据集侧可用，执行侧是显式 501）。
+#
+# 前缀 /retrieval-eval/ 与上面任何一个都不重叠，而且它下面的三段
+# （bundles / generation-runs / runs）全是**字面量**路径 —— 没有
+# /documents/{document_id} 那种"宽匹配的 UUID 参数会吃掉字面量"的问题，
+# 所以注册顺序在这里不承载语义，排在哪儿都行。
+protected_router.include_router(
+    retrieval_eval_router,
 )
 
 # 工具定义管理。

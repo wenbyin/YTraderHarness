@@ -5,10 +5,15 @@
 
 一次调用 = 一轮检索
 -------------------
-本服务**不做**：查询改写、扩召回、重试、迭代检索、agent loop。
+本服务不**自动**做：查询改写、扩召回、重试、迭代检索、agent loop。
 调用方拿到结果后自己决定要不要换个说法再调一次 ——
 规格把这条写死了（"The service does not automatically expand recall,
 rewrite queries, retry retrieval, or start an agent loop."）。
+
+查询改写是唯一的例外，且是**显式**的：请求里传了
+`query_rewriter` 才改，改一次，改失败就退回原文（见
+`DocumentRetrieveResponse.query_rewrite` 的 `degraded`）。
+没传 = 与从前逐字节相同。
 
 因此本服务也不返回"还需要继续找"之类的信号，只回一轮的结果。
 

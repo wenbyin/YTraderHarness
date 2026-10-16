@@ -7,7 +7,7 @@
 
 默认是演练而不是真删
 --------------------
-这个脚本会 TRUNCATE 掉 27 张表和 195 个上传目录。写成"默认就干"的话，
+这个脚本会 TRUNCATE 掉 36 张表和 195 个上传目录。写成"默认就干"的话，
 一次手滑就是不可逆的；而演练模式不是摆设 —— 它会把外键图跑一遍
 （见 _check_truncate）。被删的表之间存在互相引用，TRUNCATE 一张却漏掉
 它的子表时，Postgres 会整条语句拒绝执行。演练用
@@ -35,6 +35,12 @@ index_identifier），是"哪个定义用哪个 ES 索引 / Milvus collection"�
 
 checkpoint_migrations / store_migrations 也留着：它们是迁移水位，清掉会让
 下次启动重跑迁移。清它们没有任何收益。
+
+评测数据（retrieval_eval_* 那 9 张）属于**清掉**那一侧，尽管 retrieval_eval
+的模型 docstring 主张"不该被级联删掉"。两者的场景不同：它说的是"reprocess
+或软删一份文档不该带走评测数据"，而这里是全量 reset —— 语料整个没了，一份
+针对已消失语料的断言留着只会让评测跑出接近 0 的召回率，而那个数字看起来
+像是检索出了问题。详见 CLEAR_TABLES 里那一组的注释。
 
 凭据从哪来
 ----------
@@ -142,6 +148,38 @@ CLEAR_TABLES: dict[str, tuple[str, ...]] = {
         "document_version_retrieval_binding",
         "document_pipeline_run",
         "document_pipeline_node_run",
+    ),
+
+    # ---- 检索评测 ----
+    #
+    # ⚠️ 这 9 张表**没有外键**指向 document_*（见 retrieval_eval 模型
+    # docstring 的第一条：跨模块 id 全是快照，故意不追源）。所以清
+    # document_chunk 不会连带清掉它们 —— 必须显式列出。
+    #
+    # 不列会怎样（上一次就是这么栽的）：reset 之后这 9 张表完好无损，
+    # 但里面的 source_chunk_id / chunk_id 指向的 chunk 已经不存在了。
+    # 引用悬空**不报错**，跑一轮评测得到的召回率接近 0 —— 而那个数字
+    # 会被当成"检索变差了"去查向量、查分词器，实际只是语料被清了。
+    #
+    # ⚠️ 这里与模型 docstring 的主张是**有意的分歧**。它论证的是
+    # "文档 reprocess / 软删不该动评测数据"，因为数据集是针对**当时那份
+    # 语料**的断言；而本脚本做的是**全量 reset** —— 语料整个没了，
+    # 一份针对已消失语料的断言留着只会误导。两者不矛盾，是不同场景。
+    #
+    # 代价要清楚：bundle 是**不可变**的（ready 之后只能新建），造一份
+    # 要跑 LLM 出题 + 校验，删掉就是重造。要留着就先自己导出。
+    # 顺序按依赖：bundle 是根；case 同时挂 bundle 与 generation_window，
+    # 所以排在 window 之后。
+    "检索评测": (
+        "retrieval_eval_bundle",
+        "retrieval_eval_generation_run",
+        "retrieval_eval_generation_window",
+        "retrieval_eval_case",
+        "retrieval_eval_case_gold_chunk",
+        "retrieval_eval_run",
+        "retrieval_eval_case_result",
+        "retrieval_eval_stage_observation",
+        "retrieval_eval_stage_candidate",
     ),
 
     # ---- 文件 ----

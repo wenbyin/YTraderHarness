@@ -131,3 +131,68 @@ class DocumentChunkRepository(BaseRepository):
         入参为空时返回空列表，不要退化成全表扫描。
         """
         raise NotImplementedError
+
+    @abstractmethod
+    async def list_samplable_chunk_ids(
+            self,
+            *,
+            document_type_definition_ids: list[UUID],
+            chunker_keys: list[str],
+            max_pool: int,
+    ) -> list[dict]:
+        """
+        取出这些 DTD 下**可以拿来出题**的 chunk 的**身份**（不带正文）。
+
+        返回元素的形状固定为：
+
+            {
+              "chunk_id":                    UUID,
+              "document_version_id":         UUID,
+              "document_type_definition_id": UUID,
+              # 源文档身份 —— 出题**必需**（正文常写「本公司」）
+              "document_id":                 UUID,
+              "document_title":              str | None,
+              "document_key":                str | None,
+            }
+
+        ⚠️ 文档身份三列不是附赠
+        --------------------
+        本语料是"一家公司一份文档"，而事件正文里公司名常常不出现 ——
+        它写的是「本公司」（实测 1477/39697 个 chunk 含这三个字）。出题
+        时必须把主体从**文档**取来写进问题；否则 100 家公司会出 100 条
+        逐字相同的题，而「本公司」在索引里毫无区分度。
+
+        它们不要额外的查询代价：DTD 在 `document` 上，两级 join 本来
+        绕不过去，只是原先没 select 出这几列。
+
+        返回这个形状而不是实体，是为了能直接喂给
+        `eval/sampling.py::sample_chunks`（它按 `chunk_id` 与
+        `document_type_definition_id` 分组抽名额）。
+
+        ⚠️ **只回身份，不回正文，是刻意的**
+        ---------------------------------
+        语料可能有几万块（实测某 DTD 下 39697 块）。抽样只需要"有哪些
+        候选"，而**正文只在抽中之后才需要** —— 那时用 `list_by_ids` 按
+        选出的那一小批取。一次把几万条正文拉进内存，只是为了从里面挑
+        100 条。
+
+        ⚠️ `max_pool` 是有意设的上界，但它会**被日志说出来**
+        --------------------------------------------------
+        池子被截断会让抽样只在"前 max_pool 个"里进行，而那是**按
+        chunk_id 排序**的前若干个、与内容质量无关。所以调用方看到
+        `len(result) == max_pool` 时必须记一条 warning（见
+        application/retrieval_eval_service_impl.py）—— 静默截断会让
+        "数据集只覆盖了语料的一小部分"这件事没有任何痕迹。
+
+        ⚠️ 排序是**必需**的，不是好看
+        ---------------------------
+        带 `LIMIT` 而不带 `ORDER BY` 时，PostgreSQL 返回的是**任意**子集
+        （取决于物理存储与计划）。那会让"同种子 + 同语料 = 同一批 chunk"
+        这条可断言的复现性彻底失效 —— 而且它每次跑都可能抽到不同的
+        样本，看起来像模型或检索不稳定。
+
+        过滤条件：文档与版本都未删除、`chunker_key` 在给定集合内、
+        正文非空。**正文为空与偏移缺失的块不参与出题** —— 前者没有可
+        问的内容，后者的区间对不上（求交会错位，且不报错）。
+        """
+        raise NotImplementedError

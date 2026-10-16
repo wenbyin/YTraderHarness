@@ -56,6 +56,7 @@ from ..repository.pipeline_run import PipelineRunRepository
 from ..repository.retrieval_definition import (
     DocumentRetrievalDefinitionRepository,
 )
+from .chunk_mapping import to_chunk_summary
 from .version_chunk_service import VersionChunkService
 
 __all__ = ["VersionChunkServiceImpl"]
@@ -670,29 +671,13 @@ class VersionChunkServiceImpl(VersionChunkService):
         preview_chars 只截 content，**不动 char_count** ——
         后者是截断前的真实长度，前端要靠它判断"这条到底有多大"。
         如果把 char_count 也改成截断后的长度，前端就看不出还有多少没展示。
+
+        实现已提到 `chunk_mapping.to_chunk_summary`：单条 chunk 的端点
+        （DocumentChunkService）也要同一份映射，而两个服务是并列的，
+        不该互相 import 实现。
         """
 
-        content = chunk.content
-        truncated = False
-
-        if preview_chars is not None and len(content) > preview_chars:
-            content = content[:preview_chars]
-            truncated = True
-
-        return DocumentChunkSummary(
-            document_chunk_id=chunk.document_chunk_id,
-            chunk_index=chunk.chunk_index,
-            content=content,
-            content_truncated=truncated,
-            char_count=chunk.char_count,
-            token_count=chunk.token_count,
-            start_index=chunk.start_index,
-            end_index=chunk.end_index,
-            content_hash=chunk.content_hash,
-            locator=chunk.locator,
-            metadata=dict(chunk.metadata or {}),
-            created_at=chunk.created_at,
-        )
+        return to_chunk_summary(chunk, preview_chars)
 
 
 # ============================================================

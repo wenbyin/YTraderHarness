@@ -77,6 +77,7 @@ from app.services.document.domain.schemas import (
     IndexUpsertRequest,
 )
 from app.services.document.domain.schemas.enum import StorageBackend
+from app.services.document.dates import canonical_keys
 
 from ..catalog import NODE_SPECS
 from ..context import DocumentPipelineContext
@@ -405,6 +406,10 @@ def _to_canonical_chunks(
                 vector=item.get("vector"),
                 sparse_vector=sparse,
                 context_text=_context_text_of(item),
+                # 日期键从**正文**算，不从 metadata 算：要回答的是"这块
+                # 正文里有没有这一天的记录"，而 metadata 里的日期是文档
+                # 级的（上传时间之类），与块内容无关。
+                dates=canonical_keys(content),
             )
         )
 

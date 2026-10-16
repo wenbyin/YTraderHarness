@@ -22,9 +22,14 @@ ProcessorRole 那套能力目录 —— 规格明确查询期能力不进
 
 一次调用 = 一轮
 ---------------
-本包不包含 Recaller，也不做查询改写、扩召回、重试或 agent loop。
+本包不包含 Recaller，也不**自动**做扩召回、重试或 agent loop。
 候选集由服务层内联调用 IndexBackend.search 得到后传进来
 （规格：Recaller 是内部细节，不通过公开 API 暴露）。
+
+查询改写是唯一例外：`QueryRewriter`（`rewrite.py`）会在召回**之前**
+跑一次 —— 但只在调用方显式传了 `query_rewriter` 时，且只跑一次。
+"调用方不说就不改"这条口径与"不自动扩召回"是同一条：改写会改变
+query 本身，不该由服务自己决定。
 """
 
 from .base import (

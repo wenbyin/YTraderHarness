@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 #: cross-encoder 是 **O(N) 次前向**（每条候选都要和 query 拼一次过模型），
 #: 不像向量那样一次编码就能比。融合后的候选池可能有几百条，全打分很慢。
 #: 只取前若干条 —— 融合已经给了粗排，精排是在它之上精修，不是重新召回。
-_MAX_CANDIDATES = 50
+_MAX_CANDIDATES = 200
 
 #: 每条候选截断到多少字。
 #:
@@ -100,22 +100,30 @@ class FlagEmbeddingReranker(Reranker):
             candidates: list[RetrieveCandidate],
             top_n: int,
             config: RerankerConfig,
+            degraded: dict[str, str] | None = None,
     ) -> list[RetrieveCandidate]:
 
         if not candidates:
             return []
 
-        selected = candidates[:_MAX_CANDIDATES]
+        # 打分窗口 = 调用方要多少（top_n 的语义就是"送进精排的条数"），
+        # 但仍受成本上限约束 —— 传一个大 top_n 不能把开销顶穿。
+        limit = min(top_n, _MAX_CANDIDATES)
+
+        selected = candidates[:limit]
 
         # 超出部分接在后面：它们没被精排过，但**不能丢** ——
         # 精排只该改变顺序，不该变成二次召回。截断在下游（cutter.top_k）。
-        rest = candidates[_MAX_CANDIDATES:]
+        rest = candidates[limit:]
 
         scores = await self._score(query, selected, config)
 
         if scores is None:
-            # 降级：原序返回。warning 已在 _score 里记过。
-            return list(candidates[:top_n])
+            # 降级：原序返回、**不变长也不变短**。warning 已在 _score 里记过。
+            if degraded is not None:
+                degraded["reason"] = "本地精排模型不可用（见 warning 日志）"
+
+            return list(candidates)
 
         # 没被打分的按 0 处理（排在有分的后面），而不是丢掉。
         scored = list(zip(selected, scores))
@@ -127,7 +135,12 @@ class FlagEmbeddingReranker(Reranker):
             for candidate, score in scored
         ]
 
-        return normalize_scores((ranked + list(rest))[:top_n])
+        # ⚠️ **不切片。** 这里原本是 `(ranked + rest)[:top_n]` —— 那让精排
+        # 变成了**第二次裁剪**：cutter.top_k=30 的一轮里 top_n=10 会把结果
+        # 压到 10 条，排在 11~30 的候选再也回不来。而"精排只改变顺序"是
+        # 本模块自己写下的规矩（见上面 rest 那段注释），最终条数归
+        # `cutter.top_k` 管。
+        return normalize_scores(ranked + list(rest))
 
     async def _score(
             self,
@@ -302,19 +315,22 @@ def _build_model(model_name: str):
 
 class PassthroughReranker(Reranker):
     """
-    占位精排：保持融合给出的顺序，只做 top_n 截断。
+    占位精排：保持融合给出的顺序、**原样返回**（不截断）。
 
-    只服务 llm / custom —— **cross_encoder 已经归 FlagEmbeddingReranker**
-    （见 _collect_rerankers 的冲突检查：一个类型两个实现会互相静默覆盖）。
+    现在只服务 **custom** —— `llm` 已经由 `rerank_llm.py` 的
+    `LlmReranker` 真正实现（一个类型只能有一个实现，两个都声明会互相
+    静默覆盖，注册表会在装配期抛错）。
 
     它**不改变分数**：分数已在融合阶段归一化，这里再排一次序没有信息
     增益，反而会掩盖"精排其实没跑"这件事。
+
+    ⚠️ 也**不截断**。原本这里返回 `candidates[:top_n]`，与
+    `FlagEmbeddingReranker` 的同一个毛病：精排不该顺手决定最终条数 ——
+    那由 `cutter.top_k` 定。一个没实现的精排偷偷把结果裁短，比它什么都不
+    做更难发现（页面上只是"结果变少了"）。
     """
 
-    reranker_types = (
-        RerankerType.LLM,
-        RerankerType.CUSTOM,
-    )
+    reranker_types = (RerankerType.CUSTOM,)
 
     async def rerank(
             self,
@@ -323,6 +339,7 @@ class PassthroughReranker(Reranker):
             candidates: list[RetrieveCandidate],
             top_n: int,
             config: RerankerConfig,
+            degraded: dict[str, str] | None = None,
     ) -> list[RetrieveCandidate]:
 
         logger.warning(
@@ -335,4 +352,10 @@ class PassthroughReranker(Reranker):
             top_n,
         )
 
-        return list(candidates[:top_n])
+        # 报降级而不是"跑过了"：这一段确实**没有**精排（配置点名了一个
+        # 没实现的类型）。不报的话，宏观统计会把它读成"精排跑了但没能
+        # 改善排序"，而真相是"这个类型根本没人实现"。
+        if degraded is not None:
+            degraded["reason"] = f"精排类型 {config.type} 未实现（占位实现）"
+
+        return list(candidates)

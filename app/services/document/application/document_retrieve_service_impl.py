@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from uuid import UUID, uuid4
 
 from app.common.exceptions import NotFoundError
@@ -50,6 +51,7 @@ from ..domain.schemas import (
     DocumentRetrieveResponse,
     DocumentRetrieveResult,
     IndexSearchRequest,
+    QueryRewriteSummary,
     RetrievalRecallConfig,
 )
 from ..domain.schemas.enum import (
@@ -62,6 +64,8 @@ from ..domain.schemas.enum import (
 from ..pipeline.containers import external_container
 from ..pipeline.registry import CapabilityNotFound, PipelineRegistry
 from ..retrieve import RetrieveCandidate, RetrieveProcessor, normalize_scores
+from ..retrieve.registry import get_registry
+from ..retrieve.trace import RetrievalTraceCollector
 from ..repository import (
     DocumentChunkRepository,
     DocumentRepository,
@@ -89,6 +93,62 @@ def _degraded(
         retrieval_type=retrieval.retrieval_type,
         reason=reason,
     )
+
+
+def _report_rerank_skipped(
+        override: Any | None,
+        processor: RetrieveProcessor,
+        collector: RetrievalTraceCollector | None,
+) -> None:
+    """
+    调用方**点名要精排**、生效配置却不会执行它时，说出来。
+
+    为什么需要这一条：`_apply_override` **只盖显式传入的字段**（刻意的，
+    否则"继承 DTD 配置"会变成"重置成类默认值"）。于是调用方只传
+    `reranker={"type": "api"}` 时，`enabled` 从 DTD 继承 —— DTD 若把它关着
+    （`rerank_config` 里有 `enabled: false`），这次精排就**静默不跑**：
+    响应 200、结果正常、没有任何报错，只是"看起来没重排"。
+
+    这与"精排跑了但没改善排序"是两件事，混在一起会让排查方向整个偏掉
+    （去查 API、查模型，而真实原因是配置继承）。
+
+    ⚠️ 当前那批 DTD 的 `rerank_config` 都是 `{}`、`rerank_strategy` 是
+    NULL → 继承下来 `enabled=True`，所以这条**不会**触发。它堵的是将来
+    把某个 DTD 的精排关掉、而调用方仍点名要精排的情形。
+    """
+
+    asked = getattr(override, "reranker", None)
+
+    if asked is None or asked.type is None:
+        return
+
+    if "type" not in asked.model_fields_set:
+        return
+
+    effective = processor.reranker
+
+    if effective.enabled and effective.type is not None:
+        return
+
+    reason = (
+        "生效配置里 enabled=False（从 DTD 继承而来，调用方没显式给 enabled）"
+        if not effective.enabled
+        else "生效配置里 type 为空（被 DTD 的 rerank_strategy 盖掉了）"
+    )
+
+    logger.warning(
+        "请求点名了精排（type=%s）但**它不会执行**：%s。"
+        "要它跑就显式传 enabled=true，或把该 DTD 的 rerank 打开 ——"
+        "否则这一轮的结果里没有任何重排。",
+        asked.type,
+        reason,
+    )
+
+    if collector is not None:
+        collector.note(
+            f"请求点名了精排（type={asked.type}）但未执行：{reason}。"
+            "结果里没有重排，与「精排跑了但没改善排序」不是一回事。"
+        )
 
 #: 单路召回的默认条数。
 #:
@@ -189,6 +249,20 @@ class DocumentRetrieveServiceImpl(DocumentRetrieveService):
 
         query = request.input_text
 
+        # 召回**之前**的改写。放在这里而不是别处：下面两路召回（dense 的
+        # 向量化、keyword 的 BM25）与之后那四段 processor 用的都是这一个
+        # `query`，所以一个插入点全覆盖。
+        #
+        # ⚠️ 不传 = 不改写。"服务不会自动改写查询"那条对外口径靠它成立
+        # （见 schemas/retrieve.py 的模块说明）—— 改写会改变 query 本身，
+        # 不该由服务自己决定。
+        (
+            query,
+            rewrite_summary,
+            boost_phrases,
+            date_keys,
+        ) = await self._rewrite_query(request, query)
+
         # 「只检索当前生效版本」的版本集合。一次算好，所有 DTD、所有路
         # 共用 —— 它只取决于请求里的 DTD，与具体哪一路无关。
         #
@@ -219,6 +293,20 @@ class DocumentRetrieveServiceImpl(DocumentRetrieveService):
             else None
         )
 
+        # 逐阶段痕迹的收集器。**关着开关时连对象都不建** —— 与"建一个
+        # 空转的"相比，前者在整条链路上少一个非 None 判断、也少一次
+        # 误传的机会。
+        #
+        # ⚠️ 它下面只被**读**：`observe_*` 拿到的是已经算完的列表。
+        # 见 retrieve/trace.py 的模块说明。
+        collector = (
+            RetrievalTraceCollector(
+                target_chunk_ids=request.target_chunk_ids,
+            )
+            if request.include_stage_trace
+            else None
+        )
+
         # {document_type_definition_id: [每路一个列表]}
         per_type_sets: dict[UUID, list[list[RetrieveCandidate]]] = {}
 
@@ -233,6 +321,23 @@ class DocumentRetrieveServiceImpl(DocumentRetrieveService):
                 degraded,
                 wanted_types,
                 request.retrieval_config,
+                boost_phrases,
+                date_keys,
+            )
+
+        if collector is not None:
+            # ⚠️ 必须**在所有路的输出都拿到之后**才 observe ——
+            # "被盯住的 chunk 一路都没碰到"只有在看完全部路之后才判得准。
+            # 按单路提前判会把"dense 漏了但 keyword 命中"误记成没召回到。
+            #
+            # 多 DTD 到不了这里：`include_stage_trace` 在 DTO 层就要求
+            # 只传一个 DTD（多 DTD 会让 run() 跑 N+1 次、stage_key 撞掉）。
+            collector.observe_recall(
+                [
+                    result_set
+                    for sets in per_type_sets.values()
+                    for result_set in sets
+                ]
             )
 
         await self._hydrate(
@@ -258,6 +363,9 @@ class DocumentRetrieveServiceImpl(DocumentRetrieveService):
                 result_sets=per_type_sets[
                     definition.document_type_definition_id
                 ],
+                # 只有单 DTD 这条路会收到非 None 的 collector（多 DTD 在
+                # DTO 层就被拒了，见 DocumentRetrieveRequest 的校验）。
+                trace=collector,
             )
 
             mode = RetrieveProcessorMode.DTD
@@ -298,8 +406,22 @@ class DocumentRetrieveServiceImpl(DocumentRetrieveService):
 
             mode = RetrieveProcessorMode.COMMON_CHAIN
 
+        _report_rerank_skipped(override, processor, collector)
+
+        # 改写降级要能看见：trace 只在开关打开时存在，所以主载体是响应
+        # 上的 `query_rewrite.degraded`；这里往 trace 的已知边界里补一条，
+        # 免得"开着 trace 排查"的人反而看不到它。
+        if collector is not None and rewrite_summary is not None:
+            if rewrite_summary.degraded:
+                collector.note(
+                    "查询改写失败，本轮用的是原文："
+                    f"{rewrite_summary.detail.get('error', '未记录原因')}"
+                )
+
         return DocumentRetrieveResponse(
             retrieve_id=uuid4(),
+            query_text=query,
+            query_rewrite=rewrite_summary,
             retrieve_scope=(
                 RetrieveScope.SINGLE
                 if mode is RetrieveProcessorMode.DTD
@@ -312,6 +434,109 @@ class DocumentRetrieveServiceImpl(DocumentRetrieveService):
             results=self._build_results(candidates),
             degraded_routes=degraded,
             retrieve_processor=processor.effective(),
+            # 关着开关时是 None（collector 根本没建）。
+            trace=None if collector is None else collector.trace,
+        )
+
+    async def _rewrite_query(
+            self,
+            request: DocumentRetrieveRequest,
+            query: str,
+    ) -> tuple[str, QueryRewriteSummary | None, tuple[str, ...], tuple[str, ...]]:
+        """
+        按请求里的配置改写 query。
+
+        返回 `(实际要用的文本, 摘要, 短语清单, 日期键)`。
+
+        后两条都是从改写器带下来的"判别词"（见 `RewriteResult.boost_phrases`
+        与 `date_keys`）：文本那一条喂两路召回，那两条分别让关键词那一路
+        按位置相邻加权、以及按写入期算好的日期字段加权。
+
+        没传 / 显式关掉 / kind 为 None -> 原样返回，摘要为 None、两条清单
+        都空（"没开改写"与"改写失败"是两件事，所以前者不给摘要）。
+
+        ⚠️ 这里再包一层 try —— 改写实现的契约是永不抛（见 base.py 的
+        QueryRewriter），但那层保险是为了"某天有人加了个不守规矩的实现"
+        时，代价是这一轮退回原文而不是整个检索 500。
+        """
+
+        # 调用方已经算好了（批量改写那条路）—— 直接用它，不再调模型。
+        #
+        # ⚠️ 摘要里的 `kind` 只能是 None（服务不知道调用方用的是哪种策略），
+        # 所以用 `detail["source"]="caller"` 把它与"压根没改写"分开 ——
+        # 两种情况的 kind 都是 None，光看 kind 分不出来。
+        supplied = request.query_rewrite
+
+        if supplied is not None:
+
+            text = supplied.text or query
+
+            return (
+                text,
+                QueryRewriteSummary(
+                    kind=None,
+                    changed=text != query,
+                    degraded=False,
+                    detail={
+                        "source": "caller",
+                        "boost_phrases": list(supplied.boost_phrases),
+                        "date_keys": list(supplied.date_keys),
+                    },
+                ),
+                tuple(supplied.boost_phrases),
+                tuple(supplied.date_keys),
+            )
+
+        config = request.query_rewriter
+
+        if config is None or not config.enabled or config.kind is None:
+            return query, None, (), ()
+
+        try:
+            rewriter = get_registry().rewriter(config.kind)
+            result = await rewriter.rewrite(query=query, config=config)
+
+        except Exception as exc:  # noqa: BLE001 —— 兜底，见 docstring
+
+            logger.warning(
+                "查询改写整体失败（kind=%s），本轮用原文：%s: %s",
+                config.kind.value,
+                type(exc).__name__,
+                exc,
+            )
+
+            return (
+                query,
+                QueryRewriteSummary(
+                    kind=config.kind,
+                    changed=False,
+                    degraded=True,
+                    detail={"error": f"{type(exc).__name__}: {exc}"},
+                ),
+                (),
+                (),
+            )
+
+        if result.degraded:
+            logger.warning(
+                "查询改写降级（kind=%s）：%s",
+                config.kind.value,
+                result.detail.get("error", "未记录原因"),
+            )
+
+        # 降级时**两条都不给**：那些判别词来自一次没跑成的改写，信不过。
+        usable = not result.degraded
+
+        return (
+            result.text,
+            QueryRewriteSummary(
+                kind=config.kind,
+                changed=result.changed,
+                degraded=result.degraded,
+                detail=dict(result.detail),
+            ),
+            result.boost_phrases if usable else (),
+            result.date_keys if usable else (),
         )
 
     # ========================================================
@@ -400,6 +625,8 @@ class DocumentRetrieveServiceImpl(DocumentRetrieveService):
                 RetrievalType,
                 RetrievalRecallConfig,
             ] | None = None,
+            boost_phrases: tuple[str, ...] = (),
+            date_keys: tuple[str, ...] = (),
     ) -> list[list[RetrieveCandidate]]:
         """
         对一个 DTD 逐路召回，返回"每路一个列表"。
@@ -439,12 +666,32 @@ class DocumentRetrieveServiceImpl(DocumentRetrieveService):
 
             # 该路的请求级参数。没给这一路就是 None —— 各字段再各自
             # 回落到默认（见 _recall_top_k 等）。
+            # 逐路打点：**卡住的那一路不会打出"结束"** —— 这正是
+            # "哪一路挂住"的唯一线索（挂住的路线不会出现在响应或痕迹里，
+            # 因为它从来没返回过）。
+            _route_t = time.monotonic()
+
+            logger.info(
+                "[retrieve] 召回 %-14s 开始（backend=%s）",
+                retrieval.retrieval_type,
+                retrieval.storage_backend,
+            )
+
             recalled = await self._recall_one(
                 retrieval,
                 query,
                 active_version_ids,
                 degraded,
                 (recall_config or {}).get(retrieval.retrieval_type),
+                boost_phrases,
+                date_keys,
+            )
+
+            logger.info(
+                "[retrieve] 召回 %-14s 结束 %.0fms  -> %d 条",
+                retrieval.retrieval_type,
+                (time.monotonic() - _route_t) * 1000,
+                len(recalled),
             )
 
             if recalled:
@@ -459,6 +706,8 @@ class DocumentRetrieveServiceImpl(DocumentRetrieveService):
             active_version_ids: list[UUID] | None,
             degraded: list[DegradedRoute],
             recall_config: RetrievalRecallConfig | None = None,
+            boost_phrases: tuple[str, ...] = (),
+            date_keys: tuple[str, ...] = (),
     ) -> list[RetrieveCandidate]:
 
         if active_version_ids == []:
@@ -531,6 +780,10 @@ class DocumentRetrieveServiceImpl(DocumentRetrieveService):
                 backend.search(
                     IndexSearchRequest(
                         query=query,
+                        # 判别词的短语加权（改写器给的）。认不了它的后端
+                        # 直接忽略 —— 它只影响排序，不是筛选条件。
+                        boost_phrases=list(boost_phrases),
+                        date_keys=list(date_keys),
                         query_vector=query_vector,
                         sparse_query=sparse_query,
                         # None = 不过滤（only_active=False）；非空集合 =

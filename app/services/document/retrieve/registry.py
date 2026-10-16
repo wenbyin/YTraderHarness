@@ -6,15 +6,17 @@
 写入链的能力目录（PipelineRegistry）由 main.py 在 lifespan 里构造
 一次并挂到 app.state —— 因为它要注入 ES / Milvus 的客户端。
 
-查询期这四个阶段**没有外部依赖**：融合、过滤、裁剪都是纯计算，
-精排将来会需要模型客户端，届时按同样的方式注入即可。因此这里
-不做 app.state 接线，用一个进程内单例（见 get_registry）。
+查询期这几段**没有外部依赖**：融合、过滤、裁剪都是纯计算；精排与
+改写确实要模型（本地 cross-encoder、或第三方 HTTP），但它们都在
+**调用时**自己去取（`ModelFactory` / `get_model_registry` / 配置），
+所以这里仍然不做 app.state 接线，用一个进程内单例（见 get_registry）。
 
 注册方式：反射发现
 ------------------
 与 PipelineRegistry 同一套思路 —— 遍历子类，按各自声明的类型键
 注册。新增一个融合算法只需在 fusion.py 里加一个类并给出
-fusioner_type，不必改本文件。
+fusioner_type，不必改本文件。改写走的是精排那套（复数）：一个实现
+可以声明多个 kind，见 `_collect_rewriters`。
 
 不在能力目录里
 --------------
@@ -31,8 +33,18 @@ from app.common.utils import (
     leaf_subclasses,
 )
 
-from ..domain.schemas.enum import FusionerType, RerankerType
-from .base import Cutter, Fusioner, Reranker, ResultFilter
+from ..domain.schemas.enum import (
+    FusionerType,
+    QueryRewriterKind,
+    RerankerType,
+)
+from .base import (
+    Cutter,
+    Fusioner,
+    QueryRewriter,
+    Reranker,
+    ResultFilter,
+)
 
 __all__ = [
     "RetrieveProcessorRegistry",
@@ -53,7 +65,7 @@ class RetrieveStageNotFound(LookupError):
 
 class RetrieveProcessorRegistry:
     """
-    查询期四阶段的实现表。
+    查询期各阶段的实现表。
 
     Filter 与 Cutter 不在这里按名字索引 —— 规格里它们的
     Config 没有 type 字段，各自只有一个实现，直接持有。
@@ -62,14 +74,15 @@ class RetrieveProcessorRegistry:
     def __init__(self) -> None:
 
         # 非递归 + 跳过 _ 开头的模块：本包的实现都在这一层
-        # （fusion.py / rerank.py / filter.py / cut.py），子包留给
-        # 将来按类型拆，那时改成 recursive=True 即可。
+        # （fusion.py / rerank.py / filter.py / cut.py / rewrite.py），
+        # 子包留给将来按类型拆，那时改成 recursive=True 即可。
         import_package_modules(
             __package__, recursive=False, skip_private=True
         )
 
         self._fusioners = self._collect_fusioners()
         self._rerankers = self._collect_rerankers()
+        self._rewriters = self._collect_rewriters()
         self._filter = self._collect_single(
             ResultFilter, "ResultFilter"
         )
@@ -97,6 +110,15 @@ class RetrieveProcessorRegistry:
 
         return self._require(
             self._rerankers, reranker_type, "Reranker"
+        )
+
+    def rewriter(
+            self,
+            kind: QueryRewriterKind,
+    ) -> QueryRewriter:
+
+        return self._require(
+            self._rewriters, kind, "QueryRewriter"
         )
 
     @property
@@ -165,6 +187,41 @@ class RetrieveProcessorRegistry:
                     )
 
                 collected[reranker_type] = instance
+
+        return collected
+
+    @staticmethod
+    def _collect_rewriters() -> dict[QueryRewriterKind, QueryRewriter]:
+        """
+        与 `_collect_rerankers` 逐行同构：一个实现可声明多个 kind，
+        一个 kind 只能有一个实现，冲突显式失败。
+        """
+
+        collected: dict[QueryRewriterKind, QueryRewriter] = {}
+
+        for rewriter_cls in leaf_subclasses(QueryRewriter, skip_abstract=True):
+
+            kinds = getattr(rewriter_cls, "rewriter_kinds", ())
+
+            if not kinds:
+                continue
+
+            instance = rewriter_cls()
+
+            for kind in kinds:
+
+                existing = collected.get(kind)
+
+                if existing is not None:
+                    raise RetrieveStageNotFound(
+                        f"QueryRewriterKind.{kind.name} 同时被 "
+                        f"{type(existing).__name__} 与 "
+                        f"{rewriter_cls.__name__} 声明。"
+                        "一个类型只能有一个实现，否则先注册的会被"
+                        "静默顶掉。"
+                    )
+
+                collected[kind] = instance
 
         return collected
 

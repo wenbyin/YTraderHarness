@@ -33,10 +33,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from typing import Any
 from uuid import UUID
 
 from pymilvus import LexicalHighlighter, MilvusClient
+from pymilvus.client.types import LoadState
 
 from app.services.document.domain.schemas import (
     CanonicalChunk,
@@ -66,6 +68,20 @@ _SCALAR_FIELDS: tuple[tuple[str, str, int | None], ...] = (
     ("chunk_index", "INT64", None),
     ("token_count", "INT64", None),
     ("char_count", "INT64", None),
+    # 正文里的日期键（补零的 `YYYYMMDD`），与 ES 的 `content_dates`
+    # 是同一份事实。
+    #
+    # ⚠️ 存成 `|2007412|2015520|` 这种**带首尾分隔符的串**，而不是 Milvus
+    # 的 ARRAY 类型：`_SCALAR_FIELDS` 这套声明只表达 VARCHAR / INT64，
+    # 而 ARRAY 还要考虑版本支持。首尾带 `|` 是为了 `like '%|2007412|%'`
+    # 能精确匹配整段（不带的话 `200741` 会命中 `2007412`）。
+    #
+    # ⚠️ 目前**只写不读**：Milvus 侧的标量字段只能当 filter 用（不能参与
+    # 打分），而"按日期硬筛"等于把答案漏进检索 —— 日期必然出现在金标块里
+    # 是出题方式决定的。ES 侧同理，那边用的是 `should` 加权而不是 `filter`
+    # （见 index/es.py 的 `_date_clauses`）。这一列先就位：要开筛选时它
+    # 是前提，而且这次重灌顺手就带上了，不额外付成本。
+    ("content_dates", "VARCHAR", 512),
 )
 
 #: content 的长度上限（与上面 VARCHAR(65535) 对齐）。
@@ -175,6 +191,24 @@ def _literal(value: Any) -> str:
     return json.dumps(str(value))
 
 
+def _encode_dates(dates: Sequence[str]) -> str:
+    """
+    日期键 -> `|2007412|2015520|`（带首尾分隔符）。
+
+    空列表回**空串**而不是 `"||"`：空串在 Milvus 里是合法值，而
+    `"||"` 会让 `like '%||%'` 这种写法有歧义（看起来像"含空键"）。
+    """
+
+    if not dates:
+        return ""
+
+    # ⚠️ 不是 `"".join(f"|{k}|")` —— 那会在两个键之间凑出 `||`（`|a||b|`），
+    # 而 `like '%|a|%'` 与 `like '%|b|%'` 都还能命中，唯独中间的键被 `||`
+    # 包住、`like '%|b|%'` 照样命中……看起来对，实际上只要有人按"每个键都
+    # 被 `|` 包住"去解析就会漏掉中间那些。分隔符只在键**之间**加一次。
+    return "|" + "|".join(dates) + "|"
+
+
 class MilvusIndexBackend(IndexBackend):
     """Milvus 实现。持有一个由外部注入的（同步）MilvusClient。"""
 
@@ -247,6 +281,11 @@ class MilvusIndexBackend(IndexBackend):
             # reprocess 第一次跑就会走到这里，不该报错。
             return
 
+        # ⚠️ 存在 ≠ 已加载。这条 delete 按 document_version_id 过滤 —— 那是
+        # 普通字段，Milvus 得走 query 才能定位到行，因此**要求先加载**。
+        # 少了这一句就是线上那条 code=101。
+        await self._ensure_loaded(request.index_identifier)
+
         await asyncio.to_thread(
             self._client.delete,
             request.index_identifier,
@@ -256,7 +295,22 @@ class MilvusIndexBackend(IndexBackend):
             ),
         )
 
-        await self._flush(request.index_identifier)
+        # 这里**刻意不 flush**。
+        #
+        # flush 是按 collection 刷的，而调用方（indexing 节点）紧接着就会
+        # upsert 同一个 collection 并 flush —— 那一次已经把这次删除一并刷
+        # 进去了，再刷一遍是纯粹重复的一次 RPC。
+        #
+        # 为什么值得省：Milvus 的风暴就是被 flush 推起来的。实测峰值一分钟
+        # receive flush request 67 次、新建 growing segment 32 个，密集的
+        # growing→sealed 交接窗口里 delegator 的 distribution 会被置成
+        # 不可服务 —— 一次停摆 158 秒，写入全挂。每次 ingest 省掉一次，
+        # 请求量直接减半。
+        #
+        # ⚠️ 代价与边界：删除的可见性现在**依赖紧随其后的那次 upsert**。
+        # 唯一边界情形是"删完之后新 chunk 集合为空"（upsert 会提前返回，
+        # 不 flush），那时删除要等 Milvus 自己推进才可见 —— 不影响正确性，
+        # 只是延迟。真要单独用 delete()，调用方得自己负责让它可见。
 
     # ========================================================
     # 召回
@@ -297,6 +351,9 @@ class MilvusIndexBackend(IndexBackend):
             # collection 还没建 = 这个后端从没写过数据。
             # 与 delete() 同样的处理：不是错误，就是"没有可召回的内容"。
             return IndexSearchResponse(results=[])
+
+        # ⚠️ 存在 ≠ 已加载。search 之前必须先 load，见 _ensure_loaded。
+        await self._ensure_loaded(request.index_identifier)
 
         # ---- search_params 合并 ----------------------------------
         #
@@ -378,7 +435,7 @@ class MilvusIndexBackend(IndexBackend):
 
     async def _flush(self, name: str) -> None:
         """
-        写入与删除之后都必须 flush，否则**下一次查询看不到这次改动**。
+        写入之后必须 flush，否则**下一次查询看不到这次改动**。
 
         Milvus 的变更先进 WAL，未 flush 的数据既不进查询结果、也不进
         索引。实测（两处都踩过）：
@@ -390,9 +447,19 @@ class MilvusIndexBackend(IndexBackend):
         这对"先删后写"的 reprocess 尤其危险：删不可见时，旧向量会与
         新向量**同时**留在索引里，检索结果里混进上一版的内容。
 
-        与 ES 那边的 refresh=True 是同一个理由与同一个代价：
-        刚跑完的版本必须立刻可检索。量级是"每版本每路一次"，
-        这个开销可以接受。
+        与 ES 那边的 refresh=True 是同一个理由：刚跑完的版本必须立刻
+        可检索。
+
+        ⚠️ 但它的**代价比原先估计的大得多**，这里改过一次口径：原先写的是
+        "量级是每版本每路一次，可以接受"，实测是 flush 会把 growing segment
+        封存并触发 compaction，峰值一分钟 67 次 flush 请求、32 个新 growing
+        segment、428 次 set compacting，密集的 growing→sealed 交接窗口里
+        delegator 会把 channel 置成不可服务 —— 一次停摆 158 秒，写入全挂。
+
+        所以现在**只在写入后刷**，delete 那次留给紧随其后的 upsert 覆盖
+        （见 delete 里的说明）。再往下要减就只能"按时间窗批量刷"或交给
+        Milvus 的 seal policy，而那会让"刚跑完就能召回"不再成立 ——
+        要减之前先想清楚谁依赖它。
         """
 
         await asyncio.to_thread(self._client.flush, name)
@@ -402,6 +469,46 @@ class MilvusIndexBackend(IndexBackend):
             await asyncio.to_thread(
                 self._client.has_collection, name
             )
+        )
+
+    async def _ensure_loaded(self, name: str) -> None:
+        """
+        确保 collection 已加载进内存。
+
+        ⚠️ Milvus 的 search / query 要求 collection **先 load**，否则直接报
+        code=101 collection not loaded。而"存在"与"已加载"是两件事：
+
+            create_collection   建完自动 load                → 全新环境碰不到
+            Milvus 重启          load 状态丢失、collection 还在 → 必然碰到
+
+        本机这个实例因为 WAL 棘轮会反复重启，所以这不是理论风险 —— 实测
+        release 之后 search 立刻报 101，load 之后恢复。
+
+        哪些路径需要它：**search 与 delete**。upsert / flush 不需要
+        （实测未加载时照常成功），所以那两条不加这道调用，省一次往返。
+
+        ⚠️ delete 这一条极易判错，实测口径记在这里：过滤条件落在**主键**
+        上时 Milvus 不需要加载就能删，落在**普通字段**上时走的是 query、
+        必须先加载。本后端的 delete 按 document_version_id 过滤 —— 普通
+        字段，所以需要。第一版探针只试了主键过滤，得出"delete 不需要
+        load"的错误结论，而线上正是这条 delete 报的 101。
+
+        load_collection 对已加载的 collection 是空操作（实测重复调用不抛
+        异常），但仍然先读一次状态：那是一次轻 RPC，比让服务端每次重新
+        过一遍加载流程便宜。Loading 是中间态，也走 load —— 它会等到加载完。
+        """
+
+        state = await asyncio.to_thread(
+            self._client.get_load_state,
+            collection_name=name,
+        )
+
+        if state.get("state") == LoadState.Loaded:
+            return
+
+        await asyncio.to_thread(
+            self._client.load_collection,
+            collection_name=name,
         )
 
     def _ensure_collection(self, name: str, dim: int) -> None:
@@ -623,6 +730,7 @@ class MilvusIndexBackend(IndexBackend):
             "content_hash": chunk.content_hash,
             "token_count": chunk.token_count or 0,
             "char_count": chunk.char_count,
+            "content_dates": _encode_dates(chunk.dates),
             "vector": list(chunk.vector or []),
         }
 

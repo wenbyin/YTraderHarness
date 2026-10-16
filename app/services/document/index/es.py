@@ -28,9 +28,10 @@ mapping 一律由本后端负责创建
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
-from elasticsearch import AsyncElasticsearch
+from elasticsearch import AsyncElasticsearch, BadRequestError
 
 from app.services.document.domain.schemas import (
     CanonicalChunk,
@@ -75,51 +76,23 @@ __all__ = ["ElasticsearchIndexBackend"]
 #:
 #: 也就是说它**被索引了、能检索**，只是不随 _source 返回。排查时别
 #: 因为 _source 里没有就以为没写进去。
-#: 索引级 settings：分析器定义。
+#: 索引级 settings。
 #:
-#: 为什么需要一个自定义分析器
-#: --------------------------
-#: cjk 分析器 = standard 分词 + cjk_bigram，而 **cjk_bigram 只对汉字
-#: 做 bigram**，连字符不在它的处理范围里。于是 standard 分词器在 `-`
-#: 处断开，日期被打成三段：
+#: **没有自定义分析器了** —— 这里曾经有一个 `cjk_date`，用 char_filter 把
+#: `YYYY-MM-DD` 与中文写法都压成原子词项供 `content.dates` 子字段精确匹配。
+#: 它被删掉了，两条理由：
 #:
-#:     查询 "2026-05-22"          -> ['2026', '05', '22']
-#:     正文 "#### 2026-04-25 ｜"  -> ['2026', '04', '25', ...]
+#:   1. `pattern_replace` **做不到条件补零**，所以它只能产出不补零的形式
+#:      （`2007-1-12` 与 `2007-11-2` 都变成 `2007112`）—— 两个不同的日子
+#:      撞成同一个词项，于是"A 日的题命中 B 日的块"，且不报错。
+#:   2. 它想解决的问题（"日期被切成三段，定位不到那一天"）现在由
+#:      `content_dates` 字段解决得更彻底：那个字段的值是**应用侧**用
+#:      `services/document/dates.py` 算的补零键，精确、无歧义，而且
+#:      "查询写中文、正文写短横线"也照样对得上（分析器只能归一它认得的
+#:      写法）。
 #:
-#: 结果是 match 查询退化成"命中 2026 **或** 05 **或** 22" —— 几乎每篇
-#: 都算命中，"2026-05-22"根本定位不到那一天。
-#:
-#: 对照：不带连字符的数字（`1024127`）本来就是**一个**词项，精确。
-#: 所以出问题的只有带连字符的日期这一个格式。
-#:
-#: 解法：用 pattern_replace **在分词之前**把 `YYYY-MM-DD` 压成
-#: `YYYYMMDD`，它就成了一个原子词项。查询侧走同一个分析器，因此
-#: "2026-05-22" 与正文里的 "2026-04-25" 各自变成单个词项，能精确对上。
-#:
-#: 这在 content.dates 子字段上生效，content 保持原样（理由见那里的注释）。
-_SETTINGS: dict[str, Any] = {
-    "analysis": {
-        "char_filter": {
-            "date_normalizer": {
-                "type": "pattern_replace",
-                "pattern": r"(\d{4})-(\d{2})-(\d{2})",
-                "replacement": "$1$2$3",
-            },
-        },
-        "analyzer": {
-            # 与内置 cjk 逐项对齐（standard + cjk_width + lowercase +
-            # cjk_bigram），只多一个 char_filter。刻意不写 "type": "cjk"
-            # 继承 —— 自定义分析器不能继承内置的过滤器列表，必须列全。
-            "cjk_date": {
-                "type": "custom",
-                "char_filter": ["date_normalizer"],
-                "tokenizer": "standard",
-                "filter": ["cjk_width", "lowercase", "cjk_bigram"],
-            },
-        },
-    },
-}
-
+#: content 因此保持内置 `cjk` 分析器（见 _MAPPING 里的说明）。
+_SETTINGS: dict[str, Any] = {}
 
 _MAPPING: dict[str, Any] = {
     "properties": {
@@ -152,27 +125,22 @@ _MAPPING: dict[str, Any] = {
             #
             # 代价是索引体积变大（存了 positions + offsets）。
             "term_vector": "with_positions_offsets",
-            # 日期精确匹配用的子字段 —— 见下面 _SETTINGS 的 date_normalizer。
-            #
-            # 为什么是**子字段**而不是直接改 content 的分析器：
-            # 把日期压成原子词项之后，索引里就不再存在 `2026` 这个词项，
-            # "只输入 2026"会匹配不到任何日期。保留 content 原样，两种
-            # 粒度就都有了 —— 大范围靠 content，精确定位靠 content.dates。
-            #
-            # 另外 content 挂着 fvh 的 term_vector，动它的分析器要重新
-            # 验证高亮偏移；子字段独立，风险为零。
-            #
-            # 不设 term_vector：高亮只从 content 出，这个字段只参与打分。
-            "fields": {
-                "dates": {
-                    "type": "text",
-                    "analyzer": "cjk_date",
-                },
-            },
         },
         "content_hash": {"type": "keyword"},
         "token_count": {"type": "integer"},
         "char_count": {"type": "integer"},
+        # 正文里出现的日期键（**补零**的 `YYYYMMDD`，如 `20070412`），由
+        # 应用侧在阶段 10 算好（`services/document/dates.py`）。
+        #
+        # 用 **keyword** 而不是分析器：值已经是规范化过的字面量，查询侧给的
+        # 是同一形态（改写器算的 `date_keys`），`terms` 精确匹配即可 ——
+        # 走分析器反而会把它切成 bigram，又回到模糊匹配。
+        #
+        # ⚠️ 它取代了此前的 `content.dates` 子字段 + `cjk_date` 分析器：
+        # 那个 char_filter 做不到条件补零，只能产出不补零的形态，于是
+        # `2007-1-12` 与 `2007-11-2` 变成同一个词项（撞键）。这个字段在
+        # Python 里算，补零是免费的。
+        "content_dates": {"type": "keyword"},
         # 文档级上下文，**可索引**，参与相关性排序。
         #
         # 解决的是这个具体问题：一份按公司维度组织的长文档，中间的纯数据
@@ -239,6 +207,82 @@ _POST_TAG = "</em>"
 #: 落在这个区间内。**改它之前先量一遍**，别凭感觉调：取错的表现是
 #: "某些查询莫名其妙没结果"，而不会报任何错。
 _MIN_SHOULD_MATCH = "50%"
+
+#: 短语加权（`boost_phrases`）每一段的 boost。
+#:
+#: 12 是**量出来的**：同一条 case（金标在 keyword 那一路排 140），把日期
+#: 加成 `match_phrase` 短语后名次到 **4**；另外三条 123→11、48→6、18→8。
+#:
+#: 调它之前先量：加大只会让"含该短语"压过别的信号，而短语本身可能是
+#: 改写器认错的（例如把"第 2 项议案"当成判别词）。它只影响**排序**，
+#: 不参与筛选（`should` 在有 `must` 时是可选的），所以调错不会让结果
+#: 变空 —— 只会让排序偏。
+_PHRASE_BOOST = 12
+
+
+#: `content_dates` 字段那一路的 boost。
+#:
+#: 比短语那一路（12）更高：字段是**归一化过**的精确匹配（两种写法在
+#: 写入期就压成了同一个键），比"在正文里找字符串"更可信 —— 短语匹配会
+#: 被"这个日期出现在块里的哪个位置/哪种句式"影响，而字段直接答
+#: "这块正文里有没有这一天的记录"。
+_DATE_BOOST = 24
+
+
+def _date_clauses(keys: Sequence[str]) -> list[dict[str, Any]]:
+    """
+    `date_keys` -> `terms` 子句（打 `content_dates` 字段）。
+
+    用 `should` 而不是 `filter`：见调用处的说明（日期必然出现在金标块里，
+    是出题方式决定的 —— 硬筛会把答案漏进检索）。
+
+    ⚠️ 键的形态必须与写入期一致（**补零**的 `YYYYMMDD`，见
+    `services/document/dates.py`）。
+    对不上的表现是**这条子句永远不加分**，而结果只是"排序没变好"，
+    不会报错。
+    """
+
+    wanted = [key for key in dict.fromkeys(keys) if key]
+
+    if not wanted:
+        return []
+
+    return [
+        {"terms": {"content_dates": wanted, "boost": _DATE_BOOST}}
+    ]
+
+
+def _phrase_clauses(phrases: Sequence[str]) -> list[dict[str, Any]]:
+    """
+    `boost_phrases` -> ES 的 `should` 子句列表。
+
+    只打 `content`（不打 `context_text`）：实测里加分的那些日期出现在
+    **正文**（散文与 `#### 2007-04-12 ｜ …` 小标题都在 content 里）；
+    `context_text` 是标题+section，里面那个日期是**块所属 section** 的，
+    不是这块正文讲的那件事 —— 拿它做短语加权会奖励"块前面的那个日期"，
+    而那正是我们判定为错锚的东西。
+
+    空片段与重复片段都过滤掉：空短语在 ES 里是语法错误，重复只是让同一
+    条子句加两次分（等价于偷偷调大 boost）。
+    """
+
+    seen: list[str] = []
+
+    for phrase in phrases:
+
+        text = (phrase or "").strip()
+
+        if text and text not in seen:
+            seen.append(text)
+
+    return [
+        {
+            "match_phrase": {
+                "content": {"query": text, "boost": _PHRASE_BOOST}
+            }
+        }
+        for text in seen
+    ]
 
 
 class ElasticsearchIndexBackend(IndexBackend):
@@ -377,17 +421,14 @@ class ElasticsearchIndexBackend(IndexBackend):
             must = {
                 "multi_match": {
                     "query": request.query,
-                    # content.dates 是**子字段**，与 content 索引同一段
-                    # 正文、只是分析方式不同。加进来是为了让
-                    # "2026-05-22" 这种日期能精确命中：content 把它切成
-                    # 三个词项（不可用），content.dates 把它压成一个
-                    # 原子词项（精确）。
+                    # 只有两块：正文与继承下来的上下文。
                     #
-                    # 两边的分数由 multi_match 取最优，所以日期精确匹配
-                    # 不会被 content 那边的模糊命中拉低。
+                    # 曾经还有 `content.dates`（把日期压成原子词项的子字段）。
+                    # 它删了：精确匹配日期现在由 `content_dates` 字段（下面
+                    # 的 should）负责，那条**无歧义**（键是应用侧补零算的），
+                    # 而子字段的 char_filter 做不到条件补零、会撞键。
                     "fields": [
                         "content",
-                        "content.dates",
                         "context_text",
                     ],
                     # 没有它，`match` 等价于"命中任一词项" —— 中文经 cjk
@@ -403,12 +444,32 @@ class ElasticsearchIndexBackend(IndexBackend):
                 }
             }
 
-        query: dict[str, Any] = {
-            "bool": {
-                "must": [must],
-                "filter": filters,
-            }
+        bool_query: dict[str, Any] = {
+            "must": [must],
+            "filter": filters,
         }
+
+        # 判别词的两条加权通道（都只加分、不筛选）。
+        #
+        # 为什么单列 should 而不是拼进 query 文本：拼进去只是多几个词项，
+        # 而 `minimum_should_match` 是**按比例**算的 —— 判别词在长问句里
+        # 占的份额很小，推不动排序。这两条都不受那条比例约束。
+        #
+        # ⚠️ 有 `must` 时 `should` 默认是**可选**的（分数加成，不参与
+        # 筛选），所以不会把任何候选挡在外面 —— 没命中的只是不加分。
+        #
+        # ⚠️ 而且这里刻意**不用 `filter`**：那会变成硬筛。日期确实是这批
+        # 语料里唯一的判别词，但它"必然出现在金标块里"是**出题方式决定
+        # 的**（问题就是从含该日期的块生成的）—— 拿它做硬筛等于把答案
+        # 漏进检索，命中率会虚高，而且虚高的部分看不出来。
+        should = _phrase_clauses(request.boost_phrases) + _date_clauses(
+            request.date_keys
+        )
+
+        if should:
+            bool_query["should"] = should
+
+        query: dict[str, Any] = {"bool": bool_query}
 
         # 高亮只对**词项匹配**那一路有意义。
         #
@@ -497,18 +558,38 @@ class ElasticsearchIndexBackend(IndexBackend):
         """
         索引不存在就按 _MAPPING 建。
 
-        用 exists + create 而不是"create 失败就算了"：后者会把
-        "mapping 冲突"这类真问题一起吞掉。
+        **不**用"create 失败就算了"：那会把 "mapping 冲突"这类真问题
+        一起吞掉。下面只吞**能确认是并发竞态**的那一种失败。
+
+        竞态为什么会发生：容器名是硬编码的全局名字（见 containers.py），
+        跨 DTD、跨文档共享，而扇出分支是并发的。两个文档同时开始写入时，
+        双方都可能在 exists 返回 False 之后、create 之前走到这里 ——
+        后到的那个收到 400 resource_already_exists_exception：
+
+            index [document_instance_keyword/rrBsRUK1QN61B6YR_gsf0g]
+            already exists
+
+        这不是异常情况，是**常态**（全量 reprocess 必然触发）。
         """
 
         if await self._index_exists(name):
             return
 
-        await self._client.indices.create(
-            index=name,
-            settings=_SETTINGS,
-            mappings=_MAPPING,
-        )
+        try:
+            await self._client.indices.create(
+                index=name,
+                settings=_SETTINGS,
+                mappings=_MAPPING,
+            )
+
+        except BadRequestError:
+            # 判据不是错误码字符串 —— `ApiError.error` 是 message 的
+            # 向后兼容别名（返回的是 reason 文本），按它匹配既脆又跟着
+            # ES 版本走。改成看**事实**：再查一次，索引在就说明是并发
+            # 建好了；不在就说明 create 真的失败了（mapping 冲突之类），
+            # 原样抛出去。
+            if not await self._index_exists(name):
+                raise
 
     @staticmethod
     def _to_document(chunk: CanonicalChunk) -> dict[str, Any]:
@@ -546,6 +627,11 @@ class ElasticsearchIndexBackend(IndexBackend):
         # 判断产生歧义。缺键最干净。
         if chunk.context_text:
             document["context_text"] = chunk.context_text
+
+        # 没有日期就不写这个键（与 context_text 同一口径）：空数组会占
+        # 一份索引空间，而且 `exists` 查询会把它当成"有值"。
+        if chunk.dates:
+            document["content_dates"] = list(chunk.dates)
 
         return document
 

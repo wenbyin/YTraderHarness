@@ -589,11 +589,16 @@ def test_real_clients_are_constructed_from_the_shipped_catalog() -> None:
 
     assert type(flash.client).__name__ == "ChatDeepSeek"
     assert flash.client.model_name == "deepseek-v4-flash"
-    # 8192 而不是原来的 4096（2026-10-13）：`max_tokens` 是**思考与正文
-    # 共用**的额度，4096 被思考吃光时正文一个字都写不出来（实测
-    # `finish_reason=length` + `output_token_details.reasoning=4096`，
-    # content 是空数组）——见 model.yaml 里那段说明。
-    assert getattr(flash.client, "max_tokens", None) == 8192
+    # 16384 而不是 4096 或 8192：`max_tokens` 是**思考与正文共用**的额度，
+    # 而这条端点的推理占比约九成 —— 4096 被思考吃光时正文一个字都写不出来
+    # （2026-10-13，content 是空数组），8192 在出题那条路上又被吃光
+    # （2026-10-16，输出 456 字符断在字符串中间）。两次的实测与推理占比
+    # 都记在 model.yaml 里 flash 的 `max_tokens` 那段说明里。
+    #
+    # ⚠️ 这个数**故意钉住**：它是"catalog 里的值真的透传到客户端"的证据，
+    # 改配置的人应该在这里被拦一下、去看那段说明（那是第二次为同一件事
+    # 翻倍了，说明更对症的做法是让这类调用别思考）。
+    assert getattr(flash.client, "max_tokens", None) == 16384
 
     # 同一个 provider 的**另一个模型**：定义里的 model 覆盖了 llm.yaml 的
     reasoner = registry.factory.get(

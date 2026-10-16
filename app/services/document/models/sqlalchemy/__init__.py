@@ -24,6 +24,15 @@ __all__ = [
     "DocumentTypeDefinition",
     "DocumentVersion",
     "DocumentVersionRetrievalBinding",
+    "RetrievalEvalBundle",
+    "RetrievalEvalCase",
+    "RetrievalEvalCaseGoldChunk",
+    "RetrievalEvalCaseResult",
+    "RetrievalEvalGenerationRun",
+    "RetrievalEvalGenerationWindow",
+    "RetrievalEvalRun",
+    "RetrievalEvalStageCandidate",
+    "RetrievalEvalStageObservation",
 ]
 
 from .document import Document
@@ -44,4 +53,15 @@ from .document_type_definition import DocumentTypeDefinition
 from .document_version import DocumentVersion
 from .document_version_retrieval_binding import (
     DocumentVersionRetrievalBinding,
+)
+from .retrieval_eval import (
+    RetrievalEvalBundle,
+    RetrievalEvalCase,
+    RetrievalEvalCaseGoldChunk,
+    RetrievalEvalCaseResult,
+    RetrievalEvalGenerationRun,
+    RetrievalEvalGenerationWindow,
+    RetrievalEvalRun,
+    RetrievalEvalStageCandidate,
+    RetrievalEvalStageObservation,
 )

@@ -170,9 +170,14 @@ async def _document_metadata(
 
         File（经 state["file_id"]）  源文件**本身**的事实 ——
                                     file_name / mime_type / file_size /
-                                    origin。这些是"这份数据是什么"。
+                                    origin / update。这些是"这份数据是什么"。
         Document / DTD               我们的**业务归属** ——
-                                    title / 业务标识。
+                                    title / document_key / source /
+                                    dtd_name / 业务标识。
+
+    其中两个键是**专为阶段 8 的检索前缀**产的（见 enricher/common.py 的
+    _EMBED_PREFIX_KEYS）：`update` 与 `dtd_name`。它们是复合/格式化过的
+    值，不是原始字段的直接拷贝。
 
     `file_name` 尤其关键：它是阶段 8 格式识别的**第一依据**（后缀名优先
     于内容嗅探）。拿不到它，markdown / json / yaml 的识别就只能靠猜。
@@ -242,6 +247,15 @@ async def _document_metadata(
         if file.origin:
             metadata["origin"] = file.origin.value
 
+        # 上传时间。**必须转成字符串** —— 这个 dict 会被 json.dumps
+        # 写进产物，datetime 对象进去就是 TypeError。
+        #
+        # 取日期粒度而不是 .isoformat()：它进的是检索前缀，
+        # "2026-04-25T14:30:00+08:00" 里的时分秒与 +08:00 只会给
+        # 稀疏那一路增加无意义的 token。
+        if file.created_at is not None:
+            metadata["update"] = file.created_at.strftime("%Y-%m-%d")
+
     # ---- 业务归属 ----
 
     # 标题优先用 Document 的（业务名），没有就退回文件名 ——
@@ -257,7 +271,15 @@ async def _document_metadata(
         metadata["document_key"] = document.document_key
 
     if definition is not None:
+        # source 保持原样 —— 检索侧与过滤条件还在用它，改名波及面
+        # 远大于收益。
         metadata["source"] = definition.type_key
+
+        # dtd_name 是给检索前缀用的**复合串**：中文名读得懂、也更容易
+        # 在用户查询的字面里出现，编码则保证唯一。
+        metadata["dtd_name"] = (
+            f"{definition.name}({definition.type_key})"
+        )
 
     # 业务标识：先看 Document（文档级事实），再看 File.metadata
     # （源系统自带的话优先信它 —— 它是外部系统给的原始标识）。

@@ -237,6 +237,54 @@ def _register_handlers(
         params_type=MemoryPersonaExtractParams,
     )
 
+    # 检索评测的造题（第一层：抽 chunk -> 出题 -> 落 QA）。
+    #
+    # ⚠️ 它是本仓库**第二条会调云端模型的后台任务**（第一条是 L1），
+    # 所以同样的 lease 约束适用：一次执行有窗口数上限
+    # （`MAX_WINDOWS_PER_TASK_RUN`，见那个常量的算式），上限就是按
+    # lease（900 秒、不续约）定的 —— 跑过头的任务会被 Sweeper 回收并
+    # 重跑，而模型是按次计费的。
+    #
+    # 失败语义与 memory 那几条**不同**：单个窗口失败不抛异常（那会让
+    # 已经成功的窗口再付一遍钱），失败记进窗口行、bundle 落
+    # partial_failed / failed。详情见 RetrievalEvalService.generate。
+    from app.services.document.application.retrieval_eval_service import (
+        RetrievalEvalService,
+    )
+    from app.services.document.domain.tasks import (
+        RETRIEVAL_EVAL_GENERATE_HANDLER,
+        RetrievalEvalGenerateParams,
+    )
+
+    registry.register(
+        handler=RETRIEVAL_EVAL_GENERATE_HANDLER,
+        service_contract=RetrievalEvalService,
+        method="generate",
+        params_type=RetrievalEvalGenerateParams,
+    )
+
+    # 检索评测的**执行**（第一层：逐 case 调检索、判金标命中）。
+    #
+    # ⚠️ 与造题是两条独立的任务，**这一条不调模型** —— 它只调检索、
+    # 做纯 ID 比对。混成一条的话，"只想重跑评测"会变成"重新出一遍题"，
+    # 那是完全不同的成本量级。
+    #
+    # 失败语义也与造题相反：这里**单条失败要吞**（记进 case_result 的
+    # status=failed、gold_hit=NULL），因为一条检索挂了不该让另外 999 条
+    # 白跑 —— 而这一层不用 LLM，重跑便宜，却没有理由让一次网络抖动把整轮
+    # 结果作废。见 `RetrievalEvalService.evaluate`。
+    from app.services.document.domain.tasks import (
+        RETRIEVAL_EVAL_EVALUATE_HANDLER,
+        RetrievalEvalEvaluateParams,
+    )
+
+    registry.register(
+        handler=RETRIEVAL_EVAL_EVALUATE_HANDLER,
+        service_contract=RetrievalEvalService,
+        method="evaluate",
+        params_type=RetrievalEvalEvaluateParams,
+    )
+
     logger.debug(
         "[Task] 已注册 %d 个 Handler：%s",
         len(registry),
