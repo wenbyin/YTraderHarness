@@ -45,6 +45,8 @@ __all__ = [
     "is_terminal",
     "load_stream_config",
     "publish_run_event",
+    "publish_trace_event",
+    "RedisTracePublisher",
     "reset_event_publisher",
     "reset_run_stream_registry",
     "sse_frame",
@@ -78,6 +80,7 @@ from .run_stream import (
     reset_run_stream_registry,
 )
 from .sse import HEARTBEAT, sse_frame
+from .trace_publisher import RedisTracePublisher, publish_trace_event
 
 # 事件名与事件形状是**契约**，从 app.common.event 来。这里再导出一次
 # 是为了让调用方（节点、派发 handler、路由）一个 import 就够 ——

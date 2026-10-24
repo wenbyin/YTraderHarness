@@ -39,21 +39,24 @@ Agent 运行时会话（session）与运行（run）。
 已经做：会话、运行、消息三张表，以及它们的完整读写入 ——
 
     ①② 建会话 / 查会话
+    ②b 会话列表（严格本人 + 分页筛选）与会话软删（归档）
     ③  建运行并**真的派发**：建出来的运行会跑 `agent_react` 图
        （application/agent_run_dispatch.py），状态从 queued 走到
        completed / failed
     ④  运行事件流（SSE）：`GET /runs/{run_id}/events`
     ⑤  会话消息：落库 + `GET /sessions/{id}/messages`（游标分页）
+    ⑥  中断恢复（resume）：`POST /runs/{run_id}/resume`
+    ⑦  取消（cancel）：`POST /runs/{run_id}/cancel`
+
+ⓘ 归档（DELETE /sessions/{id}）是软删：只改 status，不清理 checkpoint /
+记忆索引；归档时会先取消未终态运行。
 
 消息分两处写（时机不同，见 application/agent_run_service_impl.py 与
 message_recorder.py）：用户消息在**接收时**、与运行行同一事务；assistant
 消息在**运行终局确定时**、由派发 handler 从图终态里取本轮新增的那些。
 
-还没做：
-    ⑥ 中断恢复（resume）   要先在 react 图里加 interrupt 点
-    ⑦ 取消（cancel）       要扩 GraphDispatcher 的契约（登记在跑的任务）
-
-没做的部分在各自的位置都有注释说明，不留"看起来能跑其实空转"的假象。
+没做的部分（例如取消对跨进程运行无能为力、没有 unarchive）在各自的
+位置都有注释说明，不留"看起来能跑其实空转"的假象。
 
 ⚠️ 已知缺口（每一处都在代码里写了）
 --------------------------------

@@ -59,6 +59,7 @@ from .messages import (
     tool_name,
 )
 from .policy import ContextPolicy
+from .reference import wrap_reference
 from .values import ContextSection, SummarySnapshot
 
 if TYPE_CHECKING:  # pragma: no cover - 只为类型
@@ -459,13 +460,22 @@ class ContextBuildContext:
             *,
             source_ids: Sequence[str] = (),
             token_estimate: int = 0,
+            untrusted: bool = False,
     ) -> ContextSection:
-        """注入一段上下文。空文本**不**产生 section（不留空壳）。"""
+        """
+        注入一段上下文。空文本**不**产生 section（不留空壳）。
+
+        `untrusted=True` 表示这段是外部 / 用户可控的引用数据（检索、记忆、
+        摘要、画像）。渲染成 system 消息时会被 `<ref:...>` 包起来并附上
+        引用数据规则；工作集里的 section 仍保存**原文**，快照与来源 id 不受
+        包装影响。默认 False 是给"当前任务"这类受控分节留的。
+        """
 
         section = ContextSection(
             name=name,
             label=label,
             text=text,
+            untrusted=untrusted,
             source_ids=tuple(str(item) for item in source_ids),
             token_estimate=token_estimate,
         )
@@ -555,6 +565,10 @@ class ContextBuildContext:
         顺序。固定顺序让 context_hash 稳定（同样的输入 -> 同样的哈希），
         而哈希是 Replay / 去重的基础。
 
+        不可信的注入段（`section.untrusted`）渲染成 `<ref:...>` 块，块尾
+        自带引用数据规则；其余分节保持 `## 标题` 的旧形状。包装只发生
+        在这里，工作集与快照里仍是原文。
+
         没有内容时返回 None（不是一条空消息 —— 空 system 消息既浪费
         token，也会让某些 provider 报错）。
         """
@@ -567,7 +581,14 @@ class ContextBuildContext:
 
         for section in self.sections:
 
-            if section.text.strip():
+            if not section.text.strip():
+                continue
+
+            if section.untrusted:
+                blocks.append(
+                    wrap_reference(section.name, section.label, section.text)
+                )
+            else:
                 blocks.append(f"## {section.label}\n{section.text.strip()}")
 
         if not blocks:
@@ -654,7 +675,11 @@ class ContextBuildContext:
                 self.policy.system_prompt if self.policy else None
             ),
             "sections": [
-                {"name": section.name, "text": section.text}
+                {
+                    "name": section.name,
+                    "text": section.text,
+                    "untrusted": section.untrusted,
+                }
                 for section in self.sections
             ],
             "history": [

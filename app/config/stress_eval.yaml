@@ -1,0 +1,101 @@
+# ============================================================
+# Stress Driver 进程级配置
+# ============================================================
+#
+# 这里只放“Driver 怎么跑”的参数：线程、连接池、token、指标刷新、
+# 安全并发上限。
+#
+# 某一次压测的业务参数（session_rate / total_sessions / N 分布 /
+# think_time / duration 等）不在这里，它们由
+# `POST /api/v1/stress-runs` 的 StressRunCreate 传入，并固化到
+# `stress_runs.config`。
+#
+# 读取器：app/services/stress/application/config.py
+# 环境变量语法：${NAME:-default}
+
+driver:
+
+  #: 允许压测的目标 host。生产环境不要放行任意 host。
+  target_allowlist:
+    - localhost
+    - 127.0.0.1
+    - "::1"
+    - 0.0.0.0
+
+  #: 请求未指定 auth.token_env 时读取的环境变量名。
+  default_token_env: "${STRESS_RUNNER_TOKEN_ENV:-STRESS_RUNNER_TOKEN}"
+
+  #: 环境变量没有 token 时的本地文件兜底（仅开发）。
+  #: 只在启动后端的进程用户下读取；生产请使用环境变量/密钥管理。
+  token_file: "${STRESS_RUNNER_TOKEN_FILE:-~/.ytrader/stress_runner_token}"
+
+  #: Driver aiohttp 连接池上限。
+  http_max_connections: "${STRESS_HTTP_MAX_CONNECTIONS:-2000}"
+
+  #: 连接被测服务的超时（秒）。
+  connect_timeout_seconds: "${STRESS_CONNECT_TIMEOUT_SECONDS:-10}"
+
+  #: 同时发起 create session 的上限。
+  #:
+  #: 后端每个请求占用一条业务 DB 连接（默认 10 + 20 = 30）。会话并发
+  #: 可能远大于这个池；不限流会让建会话请求在连接池里排队 30 秒后
+  #: 返回 500（pool checkout timeout）。建会话只是准备动作，不需要
+  #: 跟正式轮次同并发。
+  session_create_concurrency: "${STRESS_SESSION_CREATE_CONCURRENCY:-16}"
+
+  #: create session 的可恢复错误重试次数（5xx / 429 / 网络错误）。
+  session_create_max_attempts: "${STRESS_SESSION_CREATE_MAX_ATTEMPTS:-4}"
+
+  #: create session 重试的初始退避（秒，指数退避 + 抖动）。
+  session_create_backoff_seconds: "${STRESS_SESSION_CREATE_BACKOFF_SECONDS:-0.5}"
+
+  #: 同时发起 run cancel 的上限。
+  #:
+  #: Campaign 结束时可能同时有数百个在途 run 要取消；全部并发会把后端
+  #: 业务 DB 池和 HTTP 连接打满，出现大量 500 / WinError 10054。
+  #: 取消是尽力而为的动作，低并发即可。
+  cancel_concurrency: "${STRESS_CANCEL_CONCURRENCY:-8}"
+
+  #: 运行中 collecting 快照刷新间隔（秒）。
+  metrics_flush_interval_seconds: "${STRESS_METRICS_FLUSH_SECONDS:-2}"
+
+  #: Campaign 结束后等待 Trace 写入 Redis 的时间（秒）。
+  trace_flush_delay_seconds: "${STRESS_TRACE_FLUSH_DELAY_SECONDS:-1}"
+
+  #: 每类延迟分布保留的精确样本上限。
+  sample_limit: "${STRESS_SAMPLE_LIMIT:-200000}"
+
+  #: 同一轮最多自动 resume 的次数。
+  max_hitl_resumes: "${STRESS_MAX_HITL_RESUMES:-3}"
+
+  #: Driver 允许的最大活跃会话/SSE 数。
+  #:
+  #: 实际生效值 = min(
+  #:     max_concurrency,
+  #:     event_stream.yaml 的 max_active_run_streams × safety_ratio
+  #: )
+  #:
+  #: Windows 的 SelectorEventLoop 受 select() 512 socket 限制，
+  #: 不能把后端 SSE 上限贴满；LinuX 上可以再把两个值一起调大。
+  max_concurrency: "${STRESS_MAX_CONCURRENCY:-360}"
+
+  #: 相对后端 max_active_run_streams 的安全余量。
+  concurrency_safety_ratio: "${STRESS_CONCURRENCY_SAFETY_RATIO:-0.8}"
+
+  #: Driver 从哪读运行事件：
+  #:
+  #:     sse     HTTP SSE，每条在途 run 占一条长连接
+  #:     redis   直接轮询 Redis Stream（每 1000ms XRANGE 一次，短查询）
+  #:
+  #: 高并发（尤其 Windows select() 512 上限）用 redis：它不再给服务端
+  #: 每个 run 压一条 SSE + 一条 Redis 长连接。
+  event_transport: "${STRESS_EVENT_TRANSPORT:-redis}"
+
+  #: redis 模式下的轮询间隔（毫秒）。
+  event_poll_interval_ms: "${STRESS_EVENT_POLL_INTERVAL_MS:-2500}"
+
+  #: redis 模式下 Driver 自己 Redis 客户端的连接池上限。
+  event_poll_max_connections: "${STRESS_EVENT_POLL_MAX_CONNECTIONS:-64}"
+
+  #: Campaign 结束后是否消费 Redis Trace 并聚合。
+  trace_aggregation_enabled: "${STRESS_TRACE_AGGREGATION_ENABLED:-true}"

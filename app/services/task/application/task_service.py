@@ -150,6 +150,35 @@ class TaskService(BaseService):
         raise NotImplementedError
 
     @abstractmethod
+    async def invoke(
+            self,
+            task_id: UUID,
+    ) -> Task:
+        """
+        让一条**还没开始跑**的定时任务立即执行（前端「直接触发」的落点）。
+
+        语义上是"把执行时间提前到现在"，不是重新提交：
+
+            - 不新建任务，改的是**同一条**（执行链、params、幂等键都不变）。
+            - attempt / error 一律不动 —— 它仍是同一轮执行，不是重试。
+            - execute_at 置为 null（立即），并让已生成的定时失效
+              （generation +1），然后立刻投递一次，省掉下一轮扫描的等待。
+
+        与 retry 的分工：retry 是"失败/取消之后再跑一轮"，只接受终态；
+        invoke 是"还没跑的提前跑"，只接受可 claim 的 pending / retryable。
+        两者都拒绝正在跑的任务（它马上就写回结果了）。
+
+        返回仍是异步的：这里只做到"已可执行 + 已投递"，真正跑完要看
+        GET /tasks/{task_id}。
+
+        Raises:
+            NotFoundError: 任务不存在。
+            TaskStateError: 任务正在跑或已终结。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
     async def reschedule(
             self,
             task_id: UUID,

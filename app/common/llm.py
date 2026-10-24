@@ -81,6 +81,8 @@ __all__ = [
 _INIT_PROVIDERS: dict[str, str] = {
     "deepseek": "deepseek",
     "qwen": "openai",
+    # 开发用的进程内 mock：端点也是 OpenAI 兼容，复用 openai 适配器。
+    "mock": "openai",
 }
 
 
@@ -98,6 +100,10 @@ _INIT_PROVIDERS: dict[str, str] = {
 _DIRECT_PROVIDERS: dict[str, tuple[str, str]] = {
     "kimi": ("langchain_moonshot", "ChatMoonshot"),
     "moonshot": ("langchain_moonshot", "ChatMoonshot"),
+    # DeepSeek 的思考模式要求多轮对话回传 assistant 的
+    # reasoning_content；langchain 的 OpenAI 兼容转换会把它丢掉。
+    # 用子类在 _get_request_payload 里补回去（见该模块 docstring）。
+    "deepseek": ("app.common.deepseek_chat", "ReasoningChatDeepSeek"),
 }
 
 #: 默认配置文件位置 —— app/config/llm.yaml。

@@ -145,6 +145,7 @@ message.completed / node.completed），现在全部由
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Mapping
 
 from langchain_core.messages import AIMessage
@@ -153,25 +154,33 @@ from langgraph.runtime import Runtime
 from app.agent.context.builder.base import BaseContextBuilder
 from app.agent.context.builder.contracts import ContextBuildRequest
 from app.agent.context.processor.dependencies import ContextDependencies
+from app.agent.event.task_events import publish_plan_cleared
+from app.common.context import ContextBuilderType
+from app.infra.agent.capability_resolver import ServiceCapabilityResolver
+from app.infra.agent.skill_exposure import ServiceSkillSource
+from app.agent.context.trace import ContextTrace
 from app.agent.model import (
     ModelRequest,
     ModelResolveContext,
     ModelResponse,
     ModelRuntime,
+    ModelTrace,
     required_capabilities_for,
 )
-from app.infra.graph import execution_ids, node_span
+from app.common.event import EventType, SpanKind
+from app.infra.graph import NodeSpec, execution_ids, node_span
 
 from .catalog import AGENT_TYPE, CONTEXT_BUILDER_TYPE, MODEL_ROLE, NODE_SPECS
 from .context import ReactContext
 from .state import ReactState
+from .trace import node_trace
 
 if TYPE_CHECKING:
     from app.agent.context.updater import ContextUpdater
 
 _SPEC = next(s for s in NODE_SPECS if s.node_id == "agent")
 
-__all__ = ["agent_node"]
+__all__ = ["agent_node", "run_agent_turn"]
 
 
 async def agent_node(
@@ -179,25 +188,132 @@ async def agent_node(
         runtime: Runtime[ReactContext],
 ) -> dict[str, Any]:
     """
-    构建上下文 → 调模型 → 回写上下文。
+    主图的模型节点：用主图的编译期常量调用一次模型。
+
+    实现全部在 `run_agent_turn` —— 子图的 `llm_node` 也走同一条路径，
+    只是换 spec / builder / agent_type / model_role（见
+    app/agent/graph/subagent/nodes.py）。
+
+    汇总回合的收尾也在这里：`synthesis_pending` 且模型不再调工具时，
+    清空任务列表并退出汇总。下一次走向由 `route_after_agent` 按
+    “没有 tasks / current_task” 判成 END。
+    """
+
+    result = await run_agent_turn(
+        state,
+        runtime,
+        spec=_SPEC,
+        builder=runtime.context.builder,
+        builder_type=CONTEXT_BUILDER_TYPE,
+        agent_type=AGENT_TYPE,
+        model_role=MODEL_ROLE,
+        state_update_keys=_STATE_UPDATE_KEYS,
+        tag_task_result=True,
+    )
+
+    if state.get("synthesis_pending") and _has_no_tool_calls(result):
+
+        _publish_synthesis_cleared(state)
+
+        result["tasks"] = []
+        result["current_task"] = {}
+        result["task_tool_keys"] = []
+        result["synthesis_pending"] = False
+
+    return result
+
+
+def _has_no_tool_calls(result: Mapping[str, Any]) -> bool:
+    """汇总回答是否已经收口（与 route_after_agent 的判据一致）。"""
+
+    messages = result.get("messages") or ()
+
+    if not messages:
+        return True
+
+    last = messages[-1]
+
+    return not (
+        isinstance(last, AIMessage) and last.tool_calls
+    )
+
+
+def _publish_synthesis_cleared(state: ReactState) -> None:
+    """汇总完成后收掉计划面板；失败只记日志，不影响回答。"""
+
+    plan = state.get("plan") or {}
+    plan_id = str(plan.get("plan_id") or "").strip()
+
+    if not plan_id:
+        return
+
+    try:
+        revision = int(plan.get("revision") or 0)
+    except (TypeError, ValueError):
+        revision = 0
+
+    publish_plan_cleared(
+        plan_id=plan_id,
+        revision=revision,
+        # 沿用已知 reason，前端不需要新增枚举；汇总完成对前端就是
+        # “计划已收尾”。
+        reason="completed",
+    )
+
+
+async def run_agent_turn(
+        state: Mapping[str, Any],
+        runtime: Runtime[ReactContext],
+        *,
+        spec: NodeSpec,
+        builder: BaseContextBuilder,
+        builder_type: ContextBuilderType,
+        agent_type: str,
+        model_role: str,
+        state_update_keys: tuple[str, ...],
+        tag_task_result: bool = True,
+) -> dict[str, Any]:
+    """
+    构建上下文 → 调模型 → 回写上下文（主图 / 子图共用）。
+
+    Parameters
+    ----------
+    spec
+        观测目录里的节点定义。子图传自己的 spec，于是 worker 的节点
+        以 `llm_node` 而不是 `agent` 的身份出现在观测里 —— 这也是
+        RunEventProjector 的 `message_nodes={"agent"}` 不会把 worker
+        的逐 token 正文当成用户可见回复推出去的前提。
+    builder
+        本次调用用的 Context Builder **实例**（主图 AGENT_INVOKE，
+        子图 SUB_AGENT）。
+    builder_type / agent_type / model_role
+        三者都是**编译期常量**，由调用图的 catalog 决定。这里不推导。
+    state_update_keys
+        `context_state_updates` 允许回写 state 的键白名单。
+    tag_task_result
+        是否给"无 tool_calls 的最终回答"打 `kind=task_result`。
 
     Returns:
-        {"messages": [AIMessage]} —— 交给 add_messages 归约合并。
+        {"messages": [AIMessage], ...} —— 交给 add_messages 归约合并。
     """
 
     context = runtime.context
 
+    # 节点侧 Trace：writer 用 get_stream_writer()（提示词第 5 节）。
+    # 未传 trace_id 时 emitter 是 disabled 的，下面所有 span 都是 None。
+    trace, node_span_id = node_trace(runtime)
+
     async with node_span(
             runtime,
-            node_id=_SPEC.node_id,
-            label=_SPEC.label,
-            group=_SPEC.group,
-            sequence=_SPEC.sequence,
+            node_id=spec.node_id,
+            label=spec.label,
+            group=spec.group,
+            sequence=spec.sequence,
             input_summary={
                 "message_count": len(state.get("messages") or ()),
-                "builder_type": CONTEXT_BUILDER_TYPE.value,
-                "agent_type": AGENT_TYPE,
-                "model_role": MODEL_ROLE,
+                "builder_type": builder_type.value,
+                "agent_type": agent_type,
+                "model_role": model_role,
             },
     ) as span:
 
@@ -211,8 +327,19 @@ async def agent_node(
         # 观测（下面的 node_span）留在这里 —— 它走的是 infra/graph，
         # 与运行事件流是两条链路，不该跟着一起搬。
 
+        # context.build 是父 Span；各 stage 的 parent 指向它。
+        build_span = trace.start(
+            EventType.CONTEXT_BUILD_STARTED,
+            span_kind=SpanKind.CONTEXT,
+            span_name="context.build",
+            end_type=EventType.CONTEXT_BUILD_COMPLETED,
+            failed_type=EventType.CONTEXT_BUILD_FAILED,
+            parent_span_id=node_span_id,
+            payload={},
+        )
+
         request = ContextBuildRequest(
-            builder_type=CONTEXT_BUILDER_TYPE,
+            builder_type=builder_type,
             thread_id=_thread_id(runtime),
             messages=tuple(state.get("messages") or ()),
             run_id=context.pipeline_run_id,
@@ -222,8 +349,8 @@ async def agent_node(
             # 该看哪些通道（那是 Processor 的声明式绑定，见
             # app/agent/context/processor/spec.py）。
             graph_state=_graph_state(state),
-            agent_type=AGENT_TYPE,
-            model_role=MODEL_ROLE,
+            agent_type=agent_type,
+            model_role=model_role,
             # 依赖随请求进：Builder 实例是共享的，构造期注入无处存放
             # （见 context/builder/contracts.py 的说明）。
             dependencies=ContextDependencies(
@@ -232,16 +359,49 @@ async def agent_node(
                 # 可 bind 的工具对象（见 infra/agent/tool_exposure.py）。
                 # 它是进程级无状态的，与 model_registry 同性质。
                 tool_source=context.tool_source,
+                # task 模式：SKILL_LOADER 用它们加载 skill 与解析能力。
+                # 只在 current_task 存在时被调用，普通对话不查库。
+                skill_source=ServiceSkillSource(),
+                capability_resolver=ServiceCapabilityResolver(),
+            ),
+            # 自有 runtime（builder）用节点传下来的同一个 emitter，
+            # 而不是自己去摸 get_stream_writer()。
+            trace=(
+                ContextTrace(
+                    emitter=trace,
+                    parent_span_id=build_span.span_id,
+                )
+                if build_span is not None
+                else None
             ),
         )
 
         # ContextBuilder 的产出直接就是 Model 模块的 ModelRequest ——
         # 全系统只有那一个请求类型，中间**没有转换层**（规格 §二十五）。
-        model_request = await _build_model_request(context.builder, request)
+        try:
+            model_request = await _build_model_request(builder, request)
+
+        except BaseException as exc:
+            if build_span is not None:
+                build_span.fail(exc)
+            raise
+
+        else:
+            if build_span is not None:
+                build_span.complete(payload={})
+
+        # ReAct 主循环默认打开思考 —— 即使这一轮带了 tools。
+        #
+        # ⚠️ 结构化输出仍然会关
+        # --------------------
+        # 若 model_request.response_format 非空（正常主循环不会有），
+        # thinking_off_extra_body 的优先级里 response_format 高于
+        # enable_thinking —— 思考模式会拒绝强制 tool_choice，也会截断 JSON。
+        model_request = replace(model_request, enable_thinking=True)
 
         model_runtime = context.model_registry.get_runtime(
-            agent_type=AGENT_TYPE,
-            model_role=MODEL_ROLE,
+            agent_type=agent_type,
+            model_role=model_role,
             context=ModelResolveContext(
                 # 这次请求本身要求的能力（有 tools -> 需要 tool_calling，
                 # 有 response_format -> 需要 structured_output）。
@@ -276,6 +436,10 @@ async def agent_node(
         response = await _invoke_model(
             model_runtime,
             model_request,
+            trace=ModelTrace(
+                emitter=trace,
+                parent_span_id=node_span_id,
+            ),
         )
 
         await _apply_context_update(
@@ -309,12 +473,23 @@ async def agent_node(
         # **只写"变了的东西"** —— 摘要没被压过就不重复写同一个值（见 state.py
         # 里"其余通道是最后写入者赢"那条说明）；白名单在
         # `_context_state_updates` 里。
-        result: dict[str, Any] = {"messages": [response.message]}
+        result: dict[str, Any] = {
+            "messages": [
+                _tag_task_result(response.message, state)
+                if tag_task_result
+                else response.message
+            ],
+        }
 
         if snapshot:
             result["context_result"] = snapshot
 
-        result.update(_context_state_updates(model_request))
+        result.update(
+            _context_state_updates(
+                model_request,
+                allowed=state_update_keys,
+            )
+        )
 
         # ⚠️ node.completed 也搬去 projector 了。可以从 `tasks` 还原的字段：
         #     node_id        data.name
@@ -369,6 +544,8 @@ async def _build_model_request(
 async def _invoke_model(
         model_runtime: ModelRuntime,
         model_request: ModelRequest,
+        *,
+        trace: ModelTrace | None = None,
 ) -> ModelResponse:
     """
     调用：把请求交给 Model Runtime，拿回统一的响应。
@@ -393,7 +570,7 @@ async def _invoke_model(
     调用方若需要"给出去一点就不重试"的提交语义，仍然可以传。）
     """
 
-    return await model_runtime.ainvoke(model_request)
+    return await model_runtime.ainvoke(model_request, trace=trace)
 
 
 async def _apply_context_update(
@@ -562,6 +739,15 @@ _CONTEXT_STATE_CHANNELS: tuple[str, ...] = (
     "retrieved_context",
     "exposed_tools",
     "summary",
+    # task 模式的输入：TASK_RESOLVER / SKILL_LOADER 从它读 skill 与
+    # 任务 payload；没有它时 task_mode 为 False，两个阶段跳过。
+    "current_task",
+    # 任务列表与计划快照：没有 current_task 的「团队决策」回合需要它们
+    # 计算「总计 / 待处理 / 可并行」，并给决策消息一个稳定的 plan id。
+    "tasks",
+    "plan",
+    # 所有任务完成后的汇总回合：TASK_RESOLVER 用它注入任务结果。
+    "synthesis_pending",
 )
 
 
@@ -658,11 +844,61 @@ def _snapshot_metrics(
 #: 对话的路径。
 #:
 #: 加键时在这里加，并想清楚"它为什么必须跨轮或跨迭代保活"。
-_STATE_UPDATE_KEYS: tuple[str, ...] = ("summary", "memory")
+def _tag_task_result(message: Any, state: Mapping[str, Any]) -> Any:
+    """
+    任务执行模式下的最终回答标 `kind=task_result`。
+
+    只标**没有 tool_calls** 的消息：带 tool_calls 的那条是工具循环的中间
+    产物，落库仍应是 tool_activity。主对话（current_task 为空）不标，
+    仍是 chat。
+
+    复制消息而不是就地改：response.message 还可能被观测/调用方读，
+    就地改会让"这条消息是什么"取决于谁先碰过它。
+    """
+
+    task = state.get("current_task")
+
+    if not isinstance(task, Mapping) or not task:
+        return message
+
+    if getattr(message, "tool_calls", None):
+        return message
+
+    if not hasattr(message, "model_copy"):
+        return message
+
+    metadata = task.get("metadata")
+    skill_key = ""
+    plan_id = ""
+
+    if isinstance(metadata, Mapping):
+        skill_key = str(metadata.get("skill_key") or "")
+        plan_id = str(metadata.get("plan_id") or "")
+
+    kwargs = dict(getattr(message, "additional_kwargs", None) or {})
+    kwargs.update({
+        "kind": "task_result",
+        "task_id": str(task.get("id") or ""),
+        "plan_id": plan_id,
+        "skill_key": skill_key,
+    })
+
+    return message.model_copy(update={"additional_kwargs": kwargs})
+
+
+_STATE_UPDATE_KEYS: tuple[str, ...] = (
+    "summary",
+    "memory",
+    # SkillLoader 算出的 task 模式工具 key；routing 在 current_task
+    # 非空时优先用它，避免 tools 节点按主 agent 的 tool_keys 拒绝。
+    "task_tool_keys",
+)
 
 
 def _context_state_updates(
         model_request: ModelRequest,
+        *,
+        allowed: tuple[str, ...] = _STATE_UPDATE_KEYS,
 ) -> dict[str, Any]:
     """
     取"需要回写图 state 的上下文构建产出"。
@@ -676,12 +912,16 @@ def _context_state_updates(
                     **运行**只召回一次（INITIAL），而 system 每次 ReAct
                     迭代都重建 —— 不保活的话，模型在第二次迭代就看不到
                     刚刚还在的那两段。
+        task_tool_keys
+                    SkillLoader 算出的 task 模式工具 key。路由 / tools
+                    节点读的是图 state，不是本次 ContextBuild 的 overlay；
+                    不回写的话模型看得到 skill 工具、tools 节点却拒绝。
 
     返回空 dict = "没有要写的"，于是调用方那句 `result.update(...)` 什么
     都不改（不会把通道写成 None）。
 
-    值必须是 Mapping：三个 state 通道（`summary` / `memory`）都是
-    `dict[str, Any]`，标量或列表在这里就该被丢掉而不是写进去。
+    summary / memory 的值必须是 Mapping；task_tool_keys 是字符串列表。
+    其余类型在这里丢掉，不写进 state。
     """
 
     updates = (model_request.metadata or {}).get("context_state_updates")
@@ -689,8 +929,20 @@ def _context_state_updates(
     if not isinstance(updates, Mapping):
         return {}
 
-    return {
-        key: dict(value)
-        for key, value in updates.items()
-        if key in _STATE_UPDATE_KEYS and isinstance(value, Mapping)
-    }
+    result: dict[str, Any] = {}
+
+    for key, value in updates.items():
+
+        if key not in allowed:
+            continue
+
+        # task_tool_keys 是 list，不是 Mapping；其余通道仍是 dict。
+        if key == "task_tool_keys":
+
+            if isinstance(value, (list, tuple)):
+                result[key] = [str(item) for item in value]
+
+        elif isinstance(value, Mapping):
+            result[key] = dict(value)
+
+    return result

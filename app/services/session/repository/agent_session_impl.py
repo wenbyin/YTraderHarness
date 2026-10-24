@@ -8,11 +8,13 @@ Transaction rule
 
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import func, or_, select, update
 
 from ..domain.entities import AgentSession
+from ..domain.schemas.enum import SessionStatus
 from ..models.sqlalchemy.agent_session import (
     AgentSession as AgentSessionModel,
 )
@@ -99,6 +101,136 @@ class AgentSessionRepositoryImpl(AgentSessionRepository):
 
         return None if model is None else self._to_entity(model)
 
+    async def get_for_update(
+            self,
+            session_id: UUID,
+            *,
+            user_id: str,
+    ) -> AgentSession | None:
+        """
+        可见性与 `get` 相同，额外加行锁。语义见契约。
+
+        `with_for_update()` 生成 `SELECT ... FOR UPDATE`：两个事务同时读到
+        active 时，后一个会阻塞到前一个提交，然后重读 —— 这正是
+        `create_run` 与归档需要的串行化点。
+        """
+
+        model = await self._session.scalar(
+            select(AgentSessionModel)
+            .where(
+                AgentSessionModel.session_id == session_id,
+                or_(
+                    AgentSessionModel.user_id == user_id,
+                    AgentSessionModel.user_id.is_(None),
+                ),
+            )
+            .with_for_update()
+        )
+
+        return None if model is None else self._to_entity(model)
+
+    async def get_owned_for_update(
+            self,
+            session_id: UUID,
+            *,
+            user_id: str,
+    ) -> AgentSession | None:
+        """
+        严格本人 + 行锁。理由见契约：NULL 存量会话不能被任何用户删除。
+        """
+
+        model = await self._session.scalar(
+            select(AgentSessionModel)
+            .where(
+                AgentSessionModel.session_id == session_id,
+                AgentSessionModel.user_id == user_id,
+            )
+            .with_for_update()
+        )
+
+        return None if model is None else self._to_entity(model)
+
+    async def list_page(
+            self,
+            *,
+            user_id: str,
+            status: str | None,
+            agent_id: str | None,
+            updated_after: datetime | None,
+            updated_before: datetime | None,
+            offset: int,
+            limit: int,
+    ) -> tuple[list[AgentSession], int]:
+        """
+        语义与排序见契约。
+
+        ⚠️ 条件只在 `_conditions` 里构造一次
+        ---------------------------------
+        count 与 items 必须是**同一组**筛选条件。这里不复制粘贴那几行 ——
+        复制出来的第二份迟早会少一个条件，而症状是“总数比列表多”，很难
+        从接口响应上看出是哪一边错了。
+
+        两条语句在同一请求事务里执行。READ COMMITTED 下两者之间可能有极小
+        的并发写入窗口（total 与 items 来自不同快照），与仓库其余列表接口
+        的取舍一致；要严格同快照需要改写成一条带窗口函数的语句。
+        """
+
+        conditions = self._conditions(
+            user_id=user_id,
+            status=status,
+            agent_id=agent_id,
+            updated_after=updated_after,
+            updated_before=updated_before,
+        )
+
+        total = (await self._session.execute(
+            select(func.count())
+            .select_from(AgentSessionModel)
+            .where(*conditions)
+        )).scalar_one()
+
+        result = await self._session.execute(
+            select(AgentSessionModel)
+            .where(*conditions)
+            .order_by(
+                # updated_at 会在“发消息”时被 touch 推到当下，同一时刻可能
+                # 有多行；补 session_id 让翻页稳定（不漏、不重）。
+                AgentSessionModel.updated_at.desc(),
+                AgentSessionModel.session_id.desc(),
+            )
+            .offset(offset)
+            .limit(limit)
+        )
+
+        return (
+            [self._to_entity(model) for model in result.scalars()],
+            total,
+        )
+
+    async def archive(
+            self,
+            session_id: UUID,
+            *,
+            user_id: str,
+    ) -> bool:
+        """
+        严格本人的条件更新。语义见契约。
+        """
+
+        result = await self._session.execute(
+            update(AgentSessionModel)
+            .where(
+                AgentSessionModel.session_id == session_id,
+                AgentSessionModel.user_id == user_id,
+            )
+            .values(
+                status=SessionStatus.ARCHIVED.value,
+                updated_at=func.now(),
+            )
+        )
+
+        return result.rowcount == 1
+
     async def touch(
             self,
             session_id: UUID,
@@ -164,6 +296,42 @@ class AgentSessionRepositoryImpl(AgentSessionRepository):
     # ========================================================
     # internals
     # ========================================================
+
+    @staticmethod
+    def _conditions(
+            *,
+            user_id: str,
+            status: str | None,
+            agent_id: str | None,
+            updated_after: datetime | None,
+            updated_before: datetime | None,
+    ) -> list:
+        """
+        列表与计数共用的 WHERE 条件。
+
+        `user_id == user_id` 是**严格等号**，刻意没有 `OR user_id IS NULL`：
+        列表只属于某个具体的人，见契约里那条说明。
+        """
+
+        conditions = [AgentSessionModel.user_id == user_id]
+
+        if status is not None:
+            conditions.append(AgentSessionModel.status == status)
+
+        if agent_id is not None:
+            conditions.append(AgentSessionModel.agent_id == agent_id)
+
+        if updated_after is not None:
+            conditions.append(
+                AgentSessionModel.updated_at >= updated_after
+            )
+
+        if updated_before is not None:
+            conditions.append(
+                AgentSessionModel.updated_at <= updated_before
+            )
+
+        return conditions
 
     @staticmethod
     def _to_entity(

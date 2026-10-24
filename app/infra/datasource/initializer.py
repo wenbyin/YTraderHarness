@@ -60,6 +60,9 @@ def import_all_models() -> None:
         # 才能解析那个字符串目标 —— 缺一个就是那句离原因很远的
         # "failed to locate a name"。
         "app.services.capability.models.sqlalchemy",
+        # Skill 管理与能力绑定。skill_capability 有一条跨表外键
+        # 指向 capability(id)，capability 包必须排在上面。
+        "app.services.skill.models.sqlalchemy",
         "app.services.session.models.sqlalchemy",
         # 挂在 agent_message 上的两张记忆索引表（agent_message_fts /
         # agent_message_vec）。
@@ -81,6 +84,10 @@ def import_all_models() -> None:
         # a name"—— 漏加的症状是表建不出来，且启动**不报错**，
         # 直到第一条 Task 提交时才炸 "relation tasks does not exist"。
         "app.services.task.models.sqlalchemy",
+        # Mock Model Stress Eval（stress_runs / stress_run_metrics）。
+        # 同样是"漏加不报错，直到第一次创建压测运行"——表结构以
+        # design_agent_eval/schema.sql 为准。
+        "app.services.stress.models.sqlalchemy",
     ]
 
     import_package_modules(*packages)
@@ -97,6 +104,10 @@ async def initialize_database(
     create_all() is idempotent:
         - table exists    -> do nothing
         - table missing   -> create it
+
+    ⚠️ 本仓没有 Alembic。**已存在的表**需要改结构时，不在这里做 ——
+    手工执行对应的 SQL 脚本（例如 tool_execution 的扩展见
+    `app/services/tool/tool_execution_migration.sql`）。
     """
     import_all_models()
 

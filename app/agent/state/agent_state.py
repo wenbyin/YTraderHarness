@@ -50,7 +50,6 @@ __all__ = [
     "empty_classification",
 ]
 
-
 #: 维度②（业务域）与维度④（能力域接口）的**共享**兜底值。
 #:
 #: 两个维度的候选集都来自数据库（CapabilityService 读出的 code），是
@@ -84,11 +83,9 @@ class BehaviorCategory(str, Enum):
 
 class ExecutionPlan(str, Enum):
     """维度③：这次该怎么**执行**。它驱动路由。"""
-
-    #: 直接答，不需要工具、不需要规划。
     DIRECT = "direct"
 
-    #: 需要工具，边走边定（ReAct 主循环）。
+    #: ReAct 主循环：直接回答、或需要工具时边走边定。
     REACT = "react"
 
     #: 需要先出计划再执行 -> 走 planner 节点。

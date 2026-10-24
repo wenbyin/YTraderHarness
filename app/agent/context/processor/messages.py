@@ -44,6 +44,7 @@ __all__ = [
     "is_system_message",
     "is_tool_message",
     "message_identifier",
+    "message_kind",
     "message_reasoning",
     "message_text",
     "message_type",
@@ -88,6 +89,29 @@ def _type_matches(message: Any, *tokens: str) -> bool:
 def is_human_message(message: Any) -> bool:
 
     return _type_matches(message, "human", "user")
+
+
+def message_kind(message: Any) -> str | None:
+    """
+    消息自带的业务 kind（`additional_kwargs["kind"]`）。
+
+    只有任务指令 / 任务结果会带它；普通消息没有，返回 None。它不参与
+    角色判定 —— 这是给 agent_message 落库分类用的标记。
+    """
+
+    kwargs = getattr(message, "additional_kwargs", None)
+
+    if not isinstance(kwargs, Mapping):
+        return None
+
+    value = kwargs.get("kind")
+
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+
+    return text or None
 
 
 def is_tool_message(message: Any) -> bool:

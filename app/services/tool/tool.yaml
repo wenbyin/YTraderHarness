@@ -53,6 +53,18 @@ paths:
           in: query
           schema:
             type: string
+            enum:
+              - local_method
+              - mcp
+              - openapi
+
+        - name: source_ref
+          in: query
+          description: >
+            Source object filter. For MCP this is the provider name
+            (see GET /mcp/providers).
+          schema:
+            type: string
 
         - name: classification_code
           in: query

@@ -18,8 +18,8 @@
 
     waiting_input
         契约有，观测**没有**。它表示"图停下来等人输入"（HITL 中断）。
-        观测层目前没有这个状态，因为图里还没有 interrupt 点 —— 见
-        app/agent/graph/react/planner_node.py 里列的落地注意事项。
+        观测层目前没有这个状态 —— HITL 中断点由工具节点 /
+        `app/agent/graph/planner/` 子图产生，不在这里建模。
         它出现在契约里是对的（前端要能表达"等你回话"），只是现在还
         产生不出来。
 
@@ -65,10 +65,14 @@ class SessionStatus(str, Enum):
 
     #: 已归档。语义上是只读。
     #:
-    #: ⚠️ 当前**产生不出来**：没有归档接口，创建时也固定是 active。
-    #: 它出现在契约里是因为前端要能表示"这个会话已经收起来了"；
-    #: 等归档接口落地时，别忘了在创建运行那一步加上
-    #: "archived 的会话不许再开新运行"的判断。
+    #: 产生它的唯一入口是 `DELETE /sessions/{session_id}`（软删）。
+    #: 归档后：
+    #:
+    #:     默认列表不再返回它（要 status=archived 才查到）
+    #:     不能开新运行（create_run 会抛 ConflictError -> 409）
+    #:     未结束的运行在归档时被取消
+    #:
+    #: 没有 unarchive 端点；归档是单向的。
     ARCHIVED = "archived"
 
 
@@ -121,11 +125,13 @@ class MessageKind(str, Enum):
 
     ⚠️ 它是给**客户端**的分类，服务端不据此改行为
     ------------------------------------------
-    服务端没有任何"按 kind 分派"的逻辑 —— 它决定的是**前端拿这条画成什么**。
-    所以这里只描述每种是什么，不描述它长什么样。
+    服务端没有"按 kind 分派业务"的逻辑 —— 它决定的是**前端拿这条画成什么**。
+    唯一的例外是**落库过滤**：message_recorder 用
+    `kind=task_instruction` 允许内部 HumanMessage 落库（普通 HumanMessage
+    仍然滤掉，因为用户消息已由建运行事务写过）。这不改变"前端怎么画"。
 
-    ⚠️ 四个取值里有三个有生产者，`interaction` 没有
-    --------------------------------------------
+    取值与生产者
+    ------------
         chat            对话正文。模型的正常回复，以及**用户**那条消息
                         （role=user 时同样是 chat）。今天绝大多数行都是它。
         tool_activity   工具调用 / 工具结果：带 `tool_calls` 的 AIMessage
@@ -137,13 +143,17 @@ class MessageKind(str, Enum):
                         目前唯一的生产者是取消时补的那条中断记录
                         （message_recorder.record_cancellation_notice）。
         interaction     人机协同的一次问答（HITL）。
-                        ⚠️ **当前仍然产生不出来**，但理由已经变了：中断点
-                        是接通的（见 interceptor/approval.py），可是审批那个
-                        **问句**只走 `hitl.requested` **事件**，从不写进
-                        agent_message。因此暂停那一轮在消息历史里留下的是
-                        tool_activity（带 tool_calls 的 AIMessage、
-                        status=interrupted），而不是一条 interaction ——
-                        也就是说"系统在问你什么"这件事，翻历史是翻不到的。
+                        `ask_user_question` 的 resume 路径会把问答落成一条
+                        `role=user` 的 interaction 消息（content 里同时有
+                        人可读的 text 块与结构化的 questions/answers 块）。
+                        这样暂停那一轮除了 tool_activity 的 AIMessage 之外，
+                        历史里也能直接看到"问了什么、答了什么"。
+        task_instruction
+                        planner / task_listener 注入的任务执行指令。
+                        role=assistant（它不是用户说的），meta 里带 task_id，
+                        前端据此把任务卡片从普通聊天里分出来。
+        task_result     任务执行模式下最终回答。role=assistant，
+                        meta 里带 task_id；与 task_instruction 成对出现。
     """
 
     CHAT = "chat"
@@ -153,6 +163,10 @@ class MessageKind(str, Enum):
     TOOL_ACTIVITY = "tool_activity"
 
     NOTICE = "notice"
+
+    TASK_INSTRUCTION = "task_instruction"
+
+    TASK_RESULT = "task_result"
 
 
 class MessageStatus(str, Enum):
@@ -172,15 +186,17 @@ class MessageStatus(str, Enum):
     映射在哪做：`application/message_recorder.py`，由运行的终态推消息的终态。
         运行 completed        -> 消息 completed
         运行 failed           -> 消息 failed
-        运行 waiting_input    -> 消息 interrupted（当前走不到，见 RunStatus）
-        运行 cancelled        -> 消息 cancelled（当前走不到）
+        运行 waiting_input    -> 消息 completed（消息完整，暂停的是 run；
+                                "还在等人"由 agent_run.status 表达）
+        运行 cancelled        -> 消息 cancelled
 
     用户消息**永远是 completed**：它是"接收时"写下的完整输入，不存在半截。
     """
 
     COMPLETED = "completed"
 
-    #: 生成被打断（HITL 中断）。当前产生不出来。
+    #: 生成被打断（消息本身不完整）。当前没有生产者：HITL 暂停时
+    #: assistant 消息是完整的，不记这个状态。
     INTERRUPTED = "interrupted"
 
     FAILED = "failed"

@@ -85,9 +85,14 @@ __all__ = [
     "LINEAR_NODE_IDS",
     "MODEL_ROLE",
     "NODE_SPECS",
+    "PLANNER_BUILDER_TYPE",
     "PLANNER_NODE",
     "REACT_TOOL_SCOPE_NAMESPACE",
     "RETIRED_NODE_SPECS",
+    "SUBAGENT_BUILDER_TYPE",
+    "SUBAGENT_DISPATCH_NODE",
+    "SUBAGENT_WORKER_NODE",
+    "TASK_LISTENER_NODE",
 ]
 
 
@@ -101,6 +106,25 @@ GRAPH_NAME = "agent_react"
 #: 1.3.0  tools 节点按 ToolNode 规范分两层，并接上真 ToolRuntime
 #:        （处理器从此拿得到 tool_call_id / thread_id / store；
 #:         审批拦截器不再走 fail-closed 的"通道不可用"分支）
+#: 1.4.0  加入 plan_control（enter / exit 两个图控制工具）；
+#:        路由从 classification.execution_plan 改为读 plan_status
+#: 1.5.0  enter / exit 改为**真工具**（经 tools 节点执行），移除
+#:        plan_control；tools 之后按 ToolMessage 里的计划指令条件路由
+#: 1.6.0  工具返回 LangGraph `Command`，跳转由 Command.goto 决定；
+#:        tools 不再有静态出边 / 条件边（handoff）
+#: 1.7.0  planner 真正产出 A2A 任务；新增 task_listener，
+#:        拓扑变为 planner -> task_listener -> agent
+#: 1.8.0  agent 无 tool_calls 且还有任务时回 task_listener；
+#:        全部任务结束才 END
+#: 1.9.0  planner 只产出计划（任务板改由 create_team 发布）；planner
+#:        之后默认回 task_listener，开发期可开关停在 END
+#: 1.10.0 task_listener 在 claim 前检测并行 ready 任务；有并行则回
+#:        main agent 做 team_decision，不直接 claim
+#: 1.11.0 create_team 改走 Command；新增 subagent_dispatch（预 claim +
+#:        动态 Send 扇出）与 subagent_worker（编译进父图的子图节点，
+#:        interrupt / custom 事件由父图管理）
+#: 1.12.0 planner 变成编译子图（独立 PlannerState / transcript /
+#:        checkpoint namespace）；父图节点名不变，只合并计划通道
 #:
 #: ⚠️ 1.2.0 / 1.3.0 的**拓扑指纹都没变**，版本号是这类改动唯一的痕迹
 #: ----------------------------------------------------------------
@@ -112,7 +136,7 @@ GRAPH_NAME = "agent_react"
 #: 所以"看指纹能发现图被改过"这条在这里**不成立**。真要让它成立得把
 #: group 或边的类型纳入指纹 —— 那会让所有历史指纹失效，代价大于收益。
 #: 因此：改这类"形状不变、语义变"的东西时，抬版本号是唯一能追溯的动作。
-GRAPH_VERSION = "1.3.0"
+GRAPH_VERSION = "1.12.0"
 
 
 #: 扇出分支 scope 的 uuid5 命名空间。
@@ -133,8 +157,30 @@ AGENT_NODE = "agent"
 #: Agent Builder 节点：对用户输入做初次理解与分类，并决定走向。
 AGENT_BUILDER_NODE = "builder"
 
-#: 规划节点（占位，见 planner_node.py）。
+#: 规划节点：生成 TaskDraft，转成 A2A Task 写入 state。
 PLANNER_NODE = "planner"
+
+#: planner 节点用的 Context Builder 类型（窄输入：摘要 + 历史 + prompt）。
+PLANNER_BUILDER_TYPE = ContextBuilderType.PLANNER
+
+#: 子代理子图的 llm_node 用的 Context Builder 类型。
+#:
+#: 它属于**另一张图**（app/agent/graph/subagent），但实例由本图的组合根
+#: 启动期解析一次后放进共享的 `ReactContext` —— 子图与主图跑在同一次
+#: 运行里，共用同一个 context 是刻意的（见 context.py 的说明）。
+SUBAGENT_BUILDER_TYPE = ContextBuilderType.SUB_AGENT
+
+#: 任务领取节点：从 state / Redis 任务板取下一个 ready task。
+TASK_LISTENER_NODE = "task_listener"
+
+#: 子代理派发节点：从任务板预 claim N 个 ready task，动态 Send 给 worker。
+SUBAGENT_DISPATCH_NODE = "subagent_dispatch"
+
+#: 子代理执行节点：一个 Send 分支编译一次子图（子图作为节点）。
+#:
+#: ⚠️ 它是**子图节点**，不是普通节点函数：interrupt 冒泡、resume、
+#: 子图 custom 事件进入父运行流都依赖这一点。
+SUBAGENT_WORKER_NODE = "subagent_worker"
 
 
 #: 本图的 Agent 类型 —— Model Registry 的第一把路由键。
@@ -223,8 +269,37 @@ NODE_SPECS: tuple[NodeSpec, ...] = (
         "任务规划",
         "linear",
         3,
-        "⚠️ 契约占位：planner 尚未设计，当前什么都不做、直接放行到 agent。"
-        "存在的意义是让 builder 的 plan 分支在拓扑上先闭合，见 planner_node.py。",
+        "编译进父图的 planner 子图：独立 transcript 做 ReAct 探索，"
+        "task_generator 把结果转成 TaskDraft / A2A tasks，"
+        "只把 plan / tasks / current_task / team_decision 交回父图。",
+    ),
+    NodeSpec(
+        "task_listener",
+        "任务领取",
+        "linear",
+        4,
+        "完成刚执行完的 current_task（落 COMPLETED / 清 claim），再领取"
+        "下一个 ready task；全部终态时清空任务列表。循环由 "
+        "listener -> agent -> listener 的图回边表达，节点内不做阻塞 while。",
+    ),
+    NodeSpec(
+        "subagent_dispatch",
+        "子代理派发",
+        "linear",
+        5,
+        "从任务板预 claim 最多 subagent_workers 个 ready task（CAS，"
+        "owner 按 worker 编号），用 Command.goto=[Send(...)] 动态扇出；"
+        "没有 ready task 时回 task_listener 收尾。任务板不可用时 fail-closed。",
+    ),
+    NodeSpec(
+        "subagent_worker",
+        "子代理执行",
+        "fanout",
+        6,
+        "一个 Send 分支执行一个已 claim 的任务：subagent 子图作为节点"
+        "（task_listener -> llm_node -> tool_node）。interrupt 由父图"
+        "冒泡 / resume；子图 output_schema 为空，transcript 不并回父图 "
+        "messages，结果只写任务板。",
     ),
 )
 
@@ -241,11 +316,25 @@ RETIRED_NODE_SPECS: tuple[NodeSpec, ...] = ()
 #: 显式写（条件边要先 register 分支，add_edge 表达不了）。两处必须
 #: 一致，改动时一起改 —— 指纹算的是这里，跑的是那里。
 EDGES: tuple[tuple[str, str], ...] = (
-    ("builder", "agent"),     # 执行方案不是 plan：正常主循环
-    ("builder", "planner"),   # 执行方案是 plan：先规划
-    ("planner", "agent"),     # 规划完（当前是占位）回到主循环
-    ("agent", "tools"),       # 模型要求调工具 —— **Send 扇出**，一个调用一个实例
-    ("tools", "agent"),       # 扇入：所有分支的 ToolMessage 汇进父状态后回到模型
+    ("builder", "agent"),       # 非计划模式，或计划仍有未完成任务
+    ("builder", "planner"),     # 计划模式且没有任务 / 任务全完成
+    ("builder", "tools"),       # 分类判定要规划 -> Send 合成 enter_plan_mode
+    ("planner", "task_listener"),   # 规划完，先领取一个 ready task
+    # 条件边：默认走上面那条去 task_listener；开发期开关可停在 END。
+    # END 在 langgraph 里的节点名就是 "__end__"。
+    ("planner", "__end__"),
+    ("task_listener", "agent"),     # 领取后交给主循环执行
+    ("agent", "task_listener"),     # 无 tool_calls 且还有任务：完成并领取下一个
+    ("agent", "tools"),         # 模型要求调工具 —— **Send 扇出**，一个调用一个实例
+    # ⚠️ 下面两条是 **Command 动态跳转**，不是装配时挂的静态边：
+    # tools 节点没有出边，下一跳由控制器分支的 Command.goto 决定。
+    # 写在这里是给拓扑指纹 / 前端画图看"可能去哪"。
+    ("tools", "planner"),       # 任意工具 Command(goto="planner")
+    ("tools", "agent"),         # 普通工具 / 无 goto / exit / 幂等 enter
+    ("tools", "subagent_dispatch"),  # create_team 审批通过 -> 派发
+    ("subagent_dispatch", "subagent_worker"),   # 预 claim 后 Send 扇出
+    ("subagent_dispatch", "task_listener"),     # 没有 ready task：收尾
+    ("subagent_worker", "subagent_dispatch"),   # join 后重新调度下一波
 )
 
 

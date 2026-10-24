@@ -70,6 +70,8 @@ import logging
 from typing import Any
 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+from .checkpoint_concurrency import disable_saver_lock
 from langgraph.store.base import TTLConfig
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from psycopg.rows import dict_row
@@ -104,6 +106,7 @@ class GraphCheckpointerProvider(DataSource):
             dsn: str,
             pool_min_size: int = 1,
             pool_max_size: int = 5,
+            parallel_cursor_operations: bool = True,
             store_default_ttl_minutes: int | None = 10_080,
             store_sweep_interval_minutes: int = 60,
     ) -> None:
@@ -123,6 +126,11 @@ class GraphCheckpointerProvider(DataSource):
         self._dsn = dsn
         self._min_size = pool_min_size
         self._max_size = pool_max_size
+
+        #: 是否允许 saver 的 cursor 操作并行。连接池模式下应为 True ——
+        #: 理由见 checkpoint_concurrency 的模块 docstring。设成 False 只是留一条
+        #: 可一键退回旧行为的开关。
+        self._parallel_cursor_operations = parallel_cursor_operations
 
         # ⚠️ 单位是**分钟** —— langgraph 的 BaseStore 就按分钟收
         # （见 `_ensure_open` 里 TTLConfig 那段的说明）。配置侧
@@ -253,6 +261,16 @@ class GraphCheckpointerProvider(DataSource):
 
         self._pool = pool
         self._saver = AsyncPostgresSaver(pool)
+
+        # ⚠️ AsyncPostgresSaver 用一个 asyncio.Lock 串行化**全部** cursor
+        # 操作（aio.py 的 `_cursor`）。连接池下每次操作各借各的连接，那把
+        # 锁没有存在理由，却会把整个进程的 checkpoint 读写排成一条队。
+        # 压测实测：322 个 run 时空转两次 checkpoint 读要 1.6s / 4.7s。
+        if self._parallel_cursor_operations:
+            disable_saver_lock(self._saver)
+            logger.info(
+                "Checkpointer: saver 的全局串行锁已关闭，cursor 操作按连接池并发。"
+            )
 
         # setup() 的签名看着像同步方法，实际是协程，必须 await。
         await self._saver.setup()

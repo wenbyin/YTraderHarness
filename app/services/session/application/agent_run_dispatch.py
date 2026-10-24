@@ -8,6 +8,13 @@
              -> 落消息（本轮产出的 assistant 消息）
              -> 映射终态并写回
 
+⚠️ 终态信封会被**直接丢弃**
+-------------------------
+会话删除会归档并取消未结束的运行；其中“调度器还不认识”的 queued 运行
+（post-commit 尚未受理、或进程重启后的孤儿）是在数据库里直接记为
+cancelled 的。那之后信封仍可能被投进来 —— handler 在 `_load_run` 之后
+先看状态，已终态就记一条日志返回，绝不重新执行一次已经结束的运行。
+
 ⚠️ 为什么**不用** infra 的 `GraphRunner`
 --------------------------------------
 `GraphRunner` 的终态推导（`app/infra/graph/runner.py::_derive_status`）
@@ -72,23 +79,43 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+import os
+import time
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
-from app.agent.event import RunEventType, publish_run_event
+from app.agent.event import (
+    RunEventType,
+    publish_run_event,
+    publish_trace_event,
+)
+from app.common.event import EventType as TraceEventType
+from app.common.event import SpanKind, SpanLink, SpanStatus, TraceError
+from app.common.event.trace import LinkRelation
+from app.common.event.trace_emitter import stable_span_id, tool_span_id
 from app.agent.event.run_event_projector import projector_factory
 from app.agent.graph.react.catalog import (
+    AGENT_BUILDER_NODE,
     AGENT_NODE,
     AGENT_TYPE,
+    CLASSIFIER_MODEL_ROLE,
     MODEL_ROLE,
+    NODE_SPECS,
 )
 from app.agent.graph.react.catalog import (
     GRAPH_NAME as _REACT_GRAPH_NAME,
+)
+from app.agent.graph.planner.catalog import (
+    AGENT_TYPE as _PLANNER_AGENT_TYPE,
+    MODEL_ROLE as _PLANNER_MODEL_ROLE,
+    NODE_SPECS as _PLANNER_NODE_SPECS,
+    PLANNER_LLM_NODE as _PLANNER_LLM_NODE,
 )
 from app.agent.graph.react.routing import TOOLS_NODE
 from app.common.repository.factory import RepositoryFactory
@@ -103,13 +130,86 @@ from app.infra.graph.cancellation import get_run_cancellation_registry
 from ..domain.entities import AgentRun
 from ..domain.schemas import RunStatus
 from ..repository.agent_run import AgentRunRepository
+from app.agent.tools.hitl_tool import parse_interaction
+
 from .message_recorder import (
     new_assistant_messages,
     record_cancellation_notice,
+    record_interaction,
     record_messages,
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _submit_memory_tasks(
+        *,
+        run_id: UUID,
+        session_id: UUID,
+        repositories: RepositoryFactory,
+) -> None:
+    """
+    后台提交 L0 / L1 记忆任务（fire-and-forget）。
+
+    ⚠️ 为什么可以放到 run.completed 之后
+    ------------------------------------
+    这两条任务读的是**已经提交**的消息与水位，不参与运行的终态判定；
+    `_finish` 已经提交了 run 状态与 agent_message。所以它们晚一点跑
+    不影响客户端看到的结果，只影响"下一轮之前记忆有没有排上"。
+
+    ⚠️ 进程被 SIGKILL 时可能丢
+    --------------------------
+    create_task 只在当前进程的事件循环里；进程直接被杀时还没执行的
+    任务就丢了。对这两条旁路任务是可接受的：L0 下一轮会重新索引该
+    会话（任务侧有幂等键），L1 的游标只在任务成功后才推进，漏一次
+    会在下一次触发时补上。要更严格就改成 outbox —— 那是另一套设计。
+    """
+
+    # 压测/诊断开关：关闭后不再提交 L0/L1 抽取任务，L2/L3 也不会被
+    # 触发。默认开启，mock 模式同样开启；要压测主链路时显式设为 0。
+    if os.environ.get(
+            "YTRADER_MEMORY_EXTRACTION", "1",
+    ).strip().lower() in {"0", "false", "no", "off"}:
+        return
+
+    # 延迟 import：见 handler 里同一段说明（避免把 document 模型栈拖进来）。
+    from app.services.memory.application.trigger import (
+        submit_atom_extract,
+        submit_extract,
+    )
+
+    try:
+        await submit_extract(run_id=run_id, session_id=session_id)
+
+    except Exception:  # noqa: BLE001 —— 旁路任务，失败只留日志
+        logger.exception("后台提交 L0 记忆索引任务失败（忽略）：run=%s", run_id)
+
+    try:
+        await submit_atom_extract(
+            session_id=session_id,
+            run_id=run_id,
+            repositories=repositories,
+        )
+
+    except Exception:  # noqa: BLE001 —— 旁路任务，失败只留日志
+        logger.exception("后台提交 L1 记忆抽取任务失败（忽略）：run=%s", run_id)
+
+
+def _consume_memory_task_exception(task: asyncio.Task) -> None:
+    """取走后台任务的异常回执；任务本身已经自己吞过并记日志。"""
+
+    if task.cancelled():
+        return
+
+    exc = task.exception()
+
+    if exc is not None:
+        logger.error(
+            "后台记忆任务提交异常退出：%s",
+            exc,
+            exc_info=exc,
+        )
+
 
 __all__ = [
     "NodeLogRecorder",
@@ -137,6 +237,15 @@ THREAD_NAMESPACE = "agentsess"
 
 #: 运行由谁触发。规格里没有这个字段（它是观测层的），写个常量免得两处拼错。
 TRIGGER_SOURCE = "api"
+
+
+#: 已经结束、不该再执行的状态。handler 开工前据此丢弃迟到的信封
+#: （典型来源：会话归档把尚未被调度器受理的 queued 运行直接取消了）。
+_TERMINAL_STATUSES: frozenset[str] = frozenset({
+    RunStatus.COMPLETED.value,
+    RunStatus.FAILED.value,
+    RunStatus.CANCELLED.value,
+})
 
 
 # ============================================================
@@ -227,6 +336,10 @@ def build_dispatch_handler(
         # 路径的代价就是永久卡死。
         interrupted = False
 
+        #: 这一段 handler 的起点（trace 的 run 级 duration_ms 用）。
+        #: 放在 try 之前：except / finally 路径也要能读到。
+        handler_started_ms = int(time.time() * 1000)
+
         # ⚠️ 这个 try 必须是函数体的**第一条语句**
         # --------------------------------------------
         # 下面的 finally 是**唯一**一处放 thread 锁的地方，它要覆盖：
@@ -253,6 +366,30 @@ def build_dispatch_handler(
                     f"{run_id}: no such row in agent_run. The dispatcher "
                     "was handed an id that this table does not know."
                 )
+
+            # ------------------------------------------------
+            # −1. 运行已经终态？
+            #
+            #    会话删除会把“调度器还不认识”的排队运行直接记为
+            #    cancelled（它可能还没被 post-commit 受理，或者进程重启
+            #    后没有任务在跑它）。那之后信封仍可能被投进来 —— 这里
+            #    直接丢弃，绝不重新执行一次已经结束的运行。
+            #
+            #    终态判断必须在 `_mark_running` 之前：否则会把 cancelled
+            #    覆盖回 running，图随后真的跑起来。
+            # ------------------------------------------------
+
+            if run.status in _TERMINAL_STATUSES:
+
+                logger.info(
+                    "Discarding dispatch for terminal run %s (status=%s).",
+                    run_id,
+                    run.status,
+                )
+
+                # finally 会走：interrupted 仍是 False，因此照常放锁；
+                # release 对不持有的键是 no-op。
+                return
 
             # ------------------------------------------------
             # 0. 排队期间就被取消了？
@@ -289,6 +426,9 @@ def build_dispatch_handler(
                     run_id,
                     RunStatus.CANCELLED,
                     None,
+                    trace_id=run.trace_id,
+                    session_id=run.session_id,
+                    started_at_ms=handler_started_ms,
                 )
 
                 # 提前 return，finally 照跑 —— 锁照样放得掉。
@@ -328,6 +468,9 @@ def build_dispatch_handler(
                         run_id,
                         RunStatus.FAILED,
                         exc,
+                        trace_id=run.trace_id,
+                        session_id=run.session_id,
+                        started_at_ms=handler_started_ms,
                     )
                     # 提前 return，但 finally 照跑 —— 锁照样放得掉。
                     return
@@ -360,6 +503,10 @@ def build_dispatch_handler(
 
             await _mark_running(repository_factory, run_id)
 
+            # 诊断：run.started → 第一个 node.started 的空档拆解。
+            # 只记慢的（>0.5s），正常请求不刷日志。
+            t_run_started = time.monotonic()
+
             # 事件与库里的状态**同时**成为事实：上面那一行提交之后，
             # "它确实开始过"才成立，这条事件才有依据。
             #
@@ -371,13 +518,35 @@ def build_dispatch_handler(
                 data={"status": RunStatus.RUNNING.value},
             )
 
+            # trace 的 run.started。同一个根 span_id（run_id）贯穿整次
+            # 运行；resume 时会再发一次，表示"这一段又开始跑了"。
+            await publish_trace_event(
+                TraceEventType.RUN_STARTED,
+                trace_id=run.trace_id,
+                run_id=str(run_id),
+                thread_id=str(run.session_id),
+                span_id=str(run_id),
+                span_kind=SpanKind.RUN,
+                span_name="run",
+                status=SpanStatus.RUNNING,
+                payload={
+                    "agent_type": AGENT_TYPE,
+                    "graph_name": REACT_GRAPH_NAME,
+                },
+            )
+
             if resume is not None:
                 # 审批被回答了 —— 与这次运行"确实又开始跑了"同一时刻成为
                 # 事实（上面那一行提交之后才发）。
                 #
                 # 发在这里而不是 API 层：那一层只登记派发，派发可能被拒收
                 # （队列满 / 正在关闭），那时说"已恢复"就是假的。
-                await _publish_hitl_resolved(run_id, resume)
+                await _publish_hitl_resolved(
+                    run_id,
+                    resume,
+                    trace_id=run.trace_id,
+                    session_id=run.session_id,
+                )
 
             # ------------------------------------------------
             # 3. 跑图。这里不持有任何业务事务。
@@ -404,6 +573,9 @@ def build_dispatch_handler(
                 # 空串归一成 None：`duty_key` 为空是允许的（存量运行、或没指定
                 # 职责），而"没有职责"与"职责叫空串"是同一件事。
                 duty_key=run.duty_key or None,
+                # Trace 开关：建运行时存下来的客户端值。resume 时同样
+                # 从运行行取 —— 不假设客户端会再传一次。
+                trace_id=run.trace_id or None,
             )
 
             context = definition.context_factory(run_context)
@@ -420,6 +592,20 @@ def build_dispatch_handler(
                 "run_id": str(run_id),
             }
 
+            # 恢复时：先把这次 HITL 问答落成 interaction 消息。
+            #
+            # 用户回答走 `Command(resume=...)`，不经过 `_initial_state`；
+            # 不在这里补，历史里只有 assistant 的 tool_activity，翻不到
+            # "问了什么、答了什么"。写失败不阻止 resume（见 helper）。
+            if resume is not None:
+                await _record_resume_interactions(
+                    repository_factory,
+                    compiled=compiled,
+                    config=config,
+                    run=run,
+                    resume=resume,
+                )
+
             # ------------------------------------------------
             # 3.5 图跑之前，先数一下这条 thread 上已经有多少条消息。
             #
@@ -432,7 +618,17 @@ def build_dispatch_handler(
             # checkpointer，下面的 invoke 马上就会以更明确的方式报出来。
             # ------------------------------------------------
 
+            t_before_count = time.monotonic()
             prior_count = await _message_count(compiled, config)
+            t_after_count = time.monotonic()
+
+            if t_after_count - t_before_count > 0.5:
+                logger.warning(
+                    "Agent run %s: checkpointer aget_state took %.2fs "
+                    "before graph start.",
+                    run_id,
+                    t_after_count - t_before_count,
+                )
 
             error: BaseException | None = None
 
@@ -514,15 +710,20 @@ def build_dispatch_handler(
                             run_id=str(run_id),
                             message_nodes={AGENT_NODE},
                             message_roles={MODEL_ROLE},
-                            node_facts={
-                                AGENT_NODE: {
-                                    "agent_type": AGENT_TYPE,
-                                    "model_role": MODEL_ROLE,
-                                },
-                            },
+                            # 节点目录里的身份字段（node_id / label /
+                            # group / sequence）。以前只注入了 agent 一个，
+                            # trace 需要给每个 node.* 都带上。
+                            node_facts=_node_facts(),
+                            # Trace：客户端传了才开。custom 模式始终请求
+                            # （工具事件走它）；不开 trace 只是少请求
+                            # tools 通道、不写 trace topic。
+                            trace_id=run.trace_id or None,
+                            session_id=str(run.session_id),
                         ),
                     ],
                 )
+
+                t_after_stream = time.monotonic()
 
                 # ⚠️ `async with` 必须在 try **里面**：`__aexit__` 会走
                 # `abort()`，那里面有 await。放到 try 外面的话，那一步若是
@@ -530,6 +731,22 @@ def build_dispatch_handler(
                 # `_record_produced_messages` / `_finish`，run 行就永远停在
                 # running —— 正是这个 except 要防的那件事。
                 async with run_stream:
+                    t_before_output = time.monotonic()
+                    pre_graph = t_before_output - t_run_started
+
+                    if pre_graph > 0.5:
+                        logger.warning(
+                            "Agent run %s: %.2fs between run.started and "
+                            "graph output start "
+                            "(aget_state %.2fs, astream_events setup %.2fs, "
+                            "__aenter__ %.2fs).",
+                            run_id,
+                            pre_graph,
+                            t_after_count - t_before_count,
+                            t_after_stream - t_after_count,
+                            t_before_output - t_after_stream,
+                        )
+
                     # 驱动器。返回值不再被消费 —— 终态改从
                     # `run_stream.interrupted()` 取，理由见 `_terminal_status`。
                     #
@@ -596,7 +813,10 @@ def build_dispatch_handler(
 
             if interrupted:
                 await _publish_hitl_requested(
-                    run_id, pending_interrupts
+                    run_id,
+                    pending_interrupts,
+                    trace_id=run.trace_id,
+                    session_id=run.session_id,
                 )
 
             # ------------------------------------------------
@@ -679,6 +899,9 @@ def build_dispatch_handler(
                 run_id,
                 terminal_status,
                 error,
+                trace_id=run.trace_id,
+                session_id=run.session_id,
+                started_at_ms=handler_started_ms,
             )
 
             # ---- L0 记忆索引：把这一轮交给后台任务 ----
@@ -745,36 +968,24 @@ def build_dispatch_handler(
             # 那几行放在函数内是同一个理由。
             if terminal_status is not RunStatus.WAITING_INPUT:
 
-                from app.services.memory.application.trigger import (
-                    submit_extract,
-                    submit_atom_extract,
-                )
-
-                await submit_extract(
-                    run_id=run_id,
-                    session_id=run.session_id,
-                )
-
-                # ---- L1 原子记忆：按轮次触发（不是每轮都抽）----
+                # ---- L0/L1 记忆任务：移出 handler 关键路径 ----
                 #
-                # 紧挨着 L0 那条，但它**读的不是 L0 的索引** —— 它按自己的
-                # 水位（memory_atom_cursor.last_seq）直接读 agent_message，所以
-                # 两者之间没有先后依赖，L0 的任务还没跑完也能抽。
+                # 它们发生在 run.completed 之后，读的是**已经提交**的消息
+                # 与水位，不参与终态判定。改成 create_task 之后，thread 锁
+                # 可以立刻释放、worker 可以接下一轮，不再被这 1.6s 挡住。
                 #
-                # ⚠️ 与 L0 的差别只有一处：L0 每轮都索引，L1 攒够轮次才抽
-                # （没攒够则排一条延迟 60s 的兜底任务，语义是"用户停手就
-                # 抽"）。判定与理由全在 memory/application/trigger.py 的
-                # submit_atom_extract 里，这里只负责"在这一刻问它"。
-                #
-                # ⚠️ 也排除 WAITING_INPUT：与 L0 同一条理由 —— "停下等人"
-                # 不是运行的结尾，收尾会再发生一次（resume 跑完）。而 L1 的
-                # 轮次计数与抽取时机本来就是解耦的（计数按会话的**用户消息
-                # 总数**算，不随抽取推进），早排一次只会多一条空转任务。
-                await submit_atom_extract(
-                    session_id=run.session_id,
-                    run_id=run_id,
-                    repositories=repository_factory,
+                # ⚠️ 代价：进程被直接杀掉时，排队中的提交会丢（见
+                # `_submit_memory_tasks` 的 docstring）。这两条都是自愈的
+                # 旁路任务，接受这个窗口。
+                task = asyncio.create_task(
+                    _submit_memory_tasks(
+                        run_id=run_id,
+                        session_id=run.session_id,
+                        repositories=repository_factory,
+                    ),
+                    name=f"memory-submit:{run_id}",
                 )
+                task.add_done_callback(_consume_memory_task_exception)
 
         finally:
             # 唯一一处放锁。理由与覆盖范围见上面 try 的说明。
@@ -909,9 +1120,37 @@ async def pending_interrupt_ids(
     ]
 
 
+def _approval_outcome(data: Any) -> str:
+    """
+    resume 值 -> Trace 的三种审批结论。
+
+    只做**词表映射**，不替 ApprovalDecision 判语义（那个仍由拦截器做）：
+    approve/allow/always -> approved；reject/deny -> rejected；
+    其余（含无法识别）-> rejected（fail-closed，与拦截器一致）。
+    """
+
+    if isinstance(data, bool):
+        return "approved" if data else "rejected"
+
+    if isinstance(data, dict):
+        data = data.get("decision", data.get("choice"))
+
+    if isinstance(data, str):
+        normalized = data.strip().lower()
+        if normalized in ("approve", "allow", "always"):
+            return "approved"
+        if normalized in ("reject", "deny"):
+            return "rejected"
+
+    return "rejected"
+
+
 async def _publish_hitl_requested(
         run_id: UUID,
         interrupts: Sequence[Any],
+        *,
+        trace_id: str | None = None,
+        session_id: UUID | None = None,
 ) -> None:
     """
     "这次运行在等人工审批" —— 每个中断一条。
@@ -936,7 +1175,9 @@ async def _publish_hitl_requested(
             dict(value) if isinstance(value, dict) else {"value": value}
         )
 
-        data["interrupt_id"] = str(getattr(item, "id", "") or "")
+        interrupt_id = str(getattr(item, "id", "") or "")
+
+        data["interrupt_id"] = interrupt_id
 
         await publish_run_event(
             RunEventType.HITL_REQUESTED,
@@ -945,10 +1186,78 @@ async def _publish_hitl_requested(
             node=TOOLS_NODE,
         )
 
+        if not trace_id:
+            continue
+
+        tool_call_id = data.get("tool_call_id")
+        tool_name = str(data.get("tool_key") or "")
+        failed_task_id = data.get("task_id")
+
+        approval_span_id = stable_span_id(
+            "approval", trace_id, interrupt_id
+        )
+
+        approval_parent = (
+            tool_span_id(str(trace_id), str(tool_call_id))
+            if tool_call_id is not None
+            else (
+                str(failed_task_id)
+                if failed_task_id is not None
+                else str(run_id)
+            )
+        )
+
+        await publish_trace_event(
+            TraceEventType.HITL_APPROVAL_REQUESTED,
+            trace_id=trace_id,
+            run_id=str(run_id),
+            thread_id=None if session_id is None else str(session_id),
+            span_id=approval_span_id,
+            parent_span_id=approval_parent,
+            span_kind=SpanKind.APPROVAL,
+            span_name="approval",
+            status=SpanStatus.RUNNING,
+            payload={
+                "approval_id": interrupt_id,
+                "action_name": tool_name,
+            },
+            event_id=stable_span_id(
+                "event", trace_id, interrupt_id, "approval_requested"
+            ),
+        )
+
+        if tool_call_id is not None:
+            await publish_trace_event(
+                TraceEventType.TOOL_INTERRUPTED,
+                trace_id=trace_id,
+                run_id=str(run_id),
+                thread_id=None if session_id is None else str(session_id),
+                span_id=tool_span_id(str(trace_id), str(tool_call_id)),
+                parent_span_id=(
+                    str(failed_task_id)
+                    if failed_task_id is not None
+                    else str(run_id)
+                ),
+                span_kind=SpanKind.TOOL,
+                span_name=tool_name or "tool",
+                status=SpanStatus.INTERRUPTED,
+                payload={
+                    "tool_name": tool_name,
+                    "tool_call_id": str(tool_call_id),
+                    "interrupt_id": interrupt_id,
+                },
+                event_id=stable_span_id(
+                    "event", trace_id, interrupt_id, "tool_interrupted"
+                ),
+            )
+
 
 async def _publish_hitl_resolved(
         run_id: UUID,
         resume: dict[str, dict[str, Any]],
+        *,
+        trace_id: str | None = None,
+        session_id: UUID | None = None,
 ) -> None:
     """
     "那些中断被回答了" —— 每个一条，与 `hitl.requested` 对称。
@@ -971,6 +1280,55 @@ async def _publish_hitl_resolved(
             str(run_id),
             data={"interrupt_id": interrupt_id, "data": data},
             node=TOOLS_NODE,
+        )
+
+        if not trace_id:
+            continue
+
+        approval_span_id = stable_span_id(
+            "approval", trace_id, str(interrupt_id)
+        )
+
+        await publish_trace_event(
+            TraceEventType.HITL_DECISION,
+            trace_id=trace_id,
+            run_id=str(run_id),
+            thread_id=None if session_id is None else str(session_id),
+            span_id=approval_span_id,
+            span_kind=SpanKind.APPROVAL,
+            span_name="approval",
+            payload={
+                "approval_id": str(interrupt_id),
+                "decision": _approval_outcome(data),
+                "actor_type": "user",
+            },
+            event_id=stable_span_id(
+                "event", trace_id, str(interrupt_id), "hitl_decision"
+            ),
+        )
+
+        await publish_trace_event(
+            TraceEventType.HITL_RESUMED,
+            trace_id=trace_id,
+            run_id=str(run_id),
+            thread_id=None if session_id is None else str(session_id),
+            span_id=approval_span_id,
+            span_kind=SpanKind.APPROVAL,
+            span_name="approval",
+            status=SpanStatus.COMPLETED,
+            links=[
+                SpanLink(
+                    relation=LinkRelation.RESUMED_FROM,
+                    span_id=approval_span_id,
+                )
+            ],
+            payload={
+                "approval_id": str(interrupt_id),
+                "resumed_span_id": approval_span_id,
+            },
+            event_id=stable_span_id(
+                "event", trace_id, str(interrupt_id), "hitl_resumed"
+            ),
         )
 
 
@@ -1076,6 +1434,14 @@ def _initial_state(run: AgentRun) -> dict[str, Any]:
     多轮历史因此可以工作了：`add_messages` 会把这一轮的 HumanMessage 追加
     到该 thread 已有的 state 上。代价见模块 docstring 的 a / b 两条。
 
+    ⚠️ **不要**在这里写 `plan_status` / `plan`
+    -----------------------------------------
+    新运行的初始 state 会**合并**到同一条 thread 的 checkpoint 上。写
+    `plan_status="off"` 等于每一轮都把正在进行的计划模式重置一次；而写
+    `plan={}` 会把 planner 已产出的任务清空。模式状态由 tools 节点
+    （执行 enter / exit 工具后结算）与 planner（计划产出）写，派发方
+    只负责不要碰它们。
+
     Raises:
         ValueError: `input.text` 缺失或只有空白。规格与 DTO 都要求必填，
                    走到这里说明有人绕过了接口直接写库。
@@ -1137,6 +1503,90 @@ async def _message_count(
         return 0
 
     return len(snapshot.values.get("messages") or [])
+
+
+async def _record_resume_interactions(
+        repository_factory: RepositoryFactory,
+        *,
+        compiled: Any,
+        config: dict[str, Any],
+        run: AgentRun,
+        resume: Mapping[str, Any],
+) -> None:
+    """
+    这次 resume 里若有 ask_user_question，把问答落成 interaction 消息。
+
+    ⚠️ 为什么不抛
+    -----------
+    写历史是旁路；写失败不该阻止图 resume（用户已经把答案给了，图还能
+    继续）。但必须留日志 —— 否则"历史里为什么没有这次问答"又成了一个
+    只能靠翻 checkpoint 猜的问题。
+    """
+
+    try:
+        snapshot = await compiled.aget_state(config)
+
+    except Exception:  # noqa: BLE001 - 见 docstring
+        logger.exception(
+            "Agent run %s: 读取中断快照失败，本次 HITL 问答不落库。",
+            run.run_id,
+        )
+        return
+
+    by_id = {
+        str(getattr(item, "id", "")): item
+        for item in (getattr(snapshot, "interrupts", ()) or ())
+    }
+
+    for interrupt_id, data in resume.items():
+
+        item = by_id.get(str(interrupt_id))
+
+        if item is None:
+            continue
+
+        payload = getattr(item, "value", None)
+
+        if (
+                not isinstance(payload, Mapping)
+                or payload.get("type") != "ask_user_question"
+        ):
+            # 审批等其它中断：不是问答，不写 interaction。
+            continue
+
+        try:
+            questions, answers, annotations = parse_interaction(
+                payload, data
+            )
+
+            if not questions:
+                continue
+
+            written = await record_interaction(
+                repository_factory,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                business_agent_id=run.duty_key,
+                questions=questions,
+                answers=answers,
+                annotations=annotations,
+                interrupt_id=str(interrupt_id),
+            )
+
+            if written:
+                logger.info(
+                    "Agent run %s: HITL 问答已写为 interaction 消息"
+                    "（%d 个问题）。",
+                    run.run_id,
+                    len(questions),
+                )
+
+        except Exception:  # noqa: BLE001 - 见 docstring
+            logger.exception(
+                "Agent run %s: HITL 问答落库失败（interrupt %s）。",
+                run.run_id,
+                interrupt_id,
+            )
 
 
 async def _record_produced_messages(
@@ -1252,6 +1702,51 @@ async def _record_cancellation_notice(
         )
 
 
+def _node_facts() -> dict[str, dict[str, Any]]:
+    """
+    节点名 -> trace / run 事件需要的领域字段。
+
+    `tasks` 协议事件只给节点名；node_id / label / group / sequence 是图的
+    编译期常量（NODE_SPECS），agent_type / model_role 则只有两个模型节点
+    才有。全部在这里注入，投影层不需要 import 图。
+    """
+
+    facts: dict[str, dict[str, Any]] = {
+        spec.node_id: {
+            "node_id": spec.node_id,
+            "label": spec.label,
+            "group": spec.group,
+            "sequence": spec.sequence,
+        }
+        for spec in NODE_SPECS
+    }
+
+    # planner 子图的节点也要有 group / label：projector 用 group 判断
+    # 哪些节点是 fanout（planner_tool 的 trace 不能挂到 run 上）。
+    for spec in _PLANNER_NODE_SPECS:
+        facts.setdefault(spec.node_id, {
+            "node_id": spec.node_id,
+            "label": spec.label,
+            "group": spec.group,
+            "sequence": spec.sequence,
+        })
+
+    facts.setdefault(AGENT_NODE, {}).update({
+        "agent_type": AGENT_TYPE,
+        "model_role": MODEL_ROLE,
+    })
+    facts.setdefault(AGENT_BUILDER_NODE, {}).update({
+        "agent_type": AGENT_TYPE,
+        "model_role": CLASSIFIER_MODEL_ROLE,
+    })
+    facts.setdefault(_PLANNER_LLM_NODE, {}).update({
+        "agent_type": _PLANNER_AGENT_TYPE,
+        "model_role": _PLANNER_MODEL_ROLE,
+    })
+
+    return facts
+
+
 async def _mark_running(
         repository_factory: RepositoryFactory,
         run_id: UUID,
@@ -1266,6 +1761,10 @@ async def _finish(
         run_id: UUID,
         status: RunStatus,
         error: BaseException | None,
+        *,
+        trace_id: str | None = None,
+        session_id: UUID | None = None,
+        started_at_ms: int | None = None,
 ) -> None:
     """
     写终态。错误信息**必须落库**：规格的 Run 只回 status，日志又会滚掉，
@@ -1299,6 +1798,9 @@ async def _finish(
         status,
         error_type=error_type,
         error_message=error_message,
+        trace_id=trace_id,
+        session_id=session_id,
+        started_at_ms=started_at_ms,
     )
 
 
@@ -1308,6 +1810,9 @@ async def _publish_terminal(
         *,
         error_type: str | None,
         error_message: str | None,
+        trace_id: str | None = None,
+        session_id: UUID | None = None,
+        started_at_ms: int | None = None,
 ) -> None:
     """
     终态事件。
@@ -1347,3 +1852,51 @@ async def _publish_terminal(
         return
 
     await publish_run_event(event_type, str(run_id), data=payload)
+
+    # ---- Trace 的 run 终止事件 ----
+    #
+    # 与 run 事件的分叉点：契约里 cancelled 折叠成 run.failed，而 trace
+    # 词表有独立的 run.cancelled；waiting_input 两边都不发（这次运行没完）。
+    duration_ms = (
+        None
+        if started_at_ms is None
+        else max(0, int(time.time() * 1000) - started_at_ms)
+    )
+
+    trace_error = (
+        TraceError(
+            type=error_type or "Error",
+            message=error_message or "",
+        )
+        if status is RunStatus.FAILED
+        else None
+    )
+
+    if status is RunStatus.COMPLETED:
+        trace_type = TraceEventType.RUN_COMPLETED
+        trace_status = SpanStatus.COMPLETED
+        trace_payload: dict[str, Any] = {}
+
+    elif status is RunStatus.CANCELLED:
+        trace_type = TraceEventType.RUN_CANCELLED
+        trace_status = SpanStatus.CANCELLED
+        trace_payload = {"reason": error_message or "cancelled"}
+
+    else:
+        trace_type = TraceEventType.RUN_FAILED
+        trace_status = SpanStatus.FAILED
+        trace_payload = {}
+
+    await publish_trace_event(
+        trace_type,
+        trace_id=trace_id,
+        run_id=str(run_id),
+        thread_id=None if session_id is None else str(session_id),
+        span_id=str(run_id),
+        span_kind=SpanKind.RUN,
+        span_name="run",
+        status=trace_status,
+        duration_ms=duration_ms,
+        payload=trace_payload,
+        error=trace_error,
+    )

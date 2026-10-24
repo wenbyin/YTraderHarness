@@ -18,7 +18,7 @@ ReAct 图：一轮对话里模型与工具的循环。
                  ▼
                 END          模型不再要工具就收尾
 
-四个节点都是**普通 async 函数**（不是类）：langgraph 的 `ToolNode`
+所有节点都是**普通 async 函数**（不是类）：langgraph 的 `ToolNode`
 之所以是类，是因为它持有构图期的工具列表；这里的工具可用性是每次
 调用由 `capability_loader` 阶段决定、随运行而变的，没有
 per-instance 状态可持。

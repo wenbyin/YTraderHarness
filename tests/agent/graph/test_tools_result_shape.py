@@ -181,7 +181,7 @@ def test_ledger_result_warns_when_it_degrades(
     """
 
     with caplog.at_level(
-            logging.WARNING, logger="app.agent.graph.react.tools"
+            logging.WARNING, logger="app.services.tool.application._execution"
     ):
         degraded = _ledger_result({"fine": 1, "bad": object()})
 
@@ -196,7 +196,7 @@ def test_ledger_result_warns_for_unknown_top_level_types(
     """既不是 JSON 原生、也不是容器 / pydantic / 已知标量 —— 同样降级。"""
 
     with caplog.at_level(
-            logging.WARNING, logger="app.agent.graph.react.tools"
+            logging.WARNING, logger="app.services.tool.application._execution"
     ):
         degraded = _ledger_result(object())
 
@@ -238,7 +238,7 @@ def test_ledger_result_never_raises(
     """
 
     with caplog.at_level(
-            logging.WARNING, logger="app.agent.graph.react.tools"
+            logging.WARNING, logger="app.services.tool.application._execution"
     ):
         stored = _ledger_result(_Explodes())
 

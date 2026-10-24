@@ -85,6 +85,10 @@ class RedisDataSource(DataSource):
 
         config = definition.config
 
+        #: 供独立线程（Stress Driver 的 TraceAggregator）新建自己的
+        #: redis.asyncio 客户端时复用同一份连接串。
+        self._url = config.url
+
         # from_url 是惰性的：只解析 URL、建连接池对象，**不建连**。
         # 配置写错要到 health_check 才会暴露 —— 这正是它存在的意义，
         # 与 neo4j / elasticsearch 那两个数据源一致。
@@ -107,14 +111,14 @@ class RedisDataSource(DataSource):
         # （run_coroutine_threadsafe）又会被"循环卡住"连带拖死 —— 那种
         # 卡顿恰恰是写线程存在的理由。所以它必须是一份**同步**客户端。
         #
-        # max_connections=1：只有一条写线程用它。redis 的命令执行本身是
-        # 单线程的，开大只是白占服务端的连接额度（见 models.py 里
-        # RedisConfig.max_connections 的说明）。
+        # 事件发布端的写线程池：event_stream.yaml 的 `write_workers` 个
+        # 线程各占一条同步连接。池上限必须 ≥ 线程数，否则池满时
+        # redis-py 立刻抛 MaxConnectionsError（不排队）。
         self._sync_client: redis_sync.Redis = redis_sync.Redis.from_url(
             config.url,
             **{
                 **_client_options(config),
-                "max_connections": 1,
+                "max_connections": config.sync_max_connections,
             },
         )
 
@@ -165,6 +169,12 @@ class RedisDataSource(DataSource):
             self,
     ) -> Redis:
         return self._client
+
+    @property
+    def url(self) -> str:
+        """Redis 连接串（与主客户端同一份配置）。"""
+
+        return self._url
 
     @property
     def client(

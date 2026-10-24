@@ -165,7 +165,7 @@ class RunContext:
     #: 它按会话稳定是业务侧的安排，不是 infra 的契约。而会话详情页、
     #: 消息、运行列表这些**给人看的东西**全按 session_id 关联。
     #:
-    #: 工具执行账本（tool_execution）用后者做判重键的第一段：存
+    #: 工具执行账本（tool_execution）用后者做维度键的第一段：存
     #: thread_id 的话，每次查账本都要先反查一次会话，而那个映射就在
     #: 业务侧手边（`run.session_id`）。
     #:
@@ -195,6 +195,12 @@ class RunContext:
     #:
     #: 与 caller_identity 同一条取法：infra 只负责转交，不解释它的形状。
     duty_key: Any = None
+
+    #: 客户端传入的 Trace 聚合键（None = 未开启 Trace）。
+    #:
+    #: infra 只负责转交：它不读 Redis、不知道 trace 事件长什么样。
+    #: 业务侧（ReactContext / 投影层）据此决定要不要发 trace 事件。
+    trace_id: Any = None
 
 
 @runtime_checkable

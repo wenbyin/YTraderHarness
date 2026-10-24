@@ -680,8 +680,22 @@ class ApprovalInterceptor(ToolInterceptor):
 
         # ---- 真的问 ------------------------------------------------
 
+        task_id = getattr(
+            getattr(runtime, "execution_info", None),
+            "task_id",
+            None,
+        )
+
         decision = ApprovalDecision.parse(
-            interrupt(self._payload(parsed, invocation, run_id))
+            interrupt(
+                self._payload(
+                    parsed,
+                    invocation,
+                    run_id,
+                    tool_call_id=tool_call_id,
+                    task_id=task_id,
+                )
+            )
         )
 
         # ---- 拒绝：短路，工具不执行 --------------------------------
@@ -772,6 +786,9 @@ class ApprovalInterceptor(ToolInterceptor):
             parsed: ApprovalConfig,
             invocation: ToolInvocation,
             run_id: str,
+            *,
+            tool_call_id: str | None = None,
+            task_id: str | None = None,
     ) -> dict[str, Any]:
         """
         交给审批人看的东西。
@@ -799,6 +816,11 @@ class ApprovalInterceptor(ToolInterceptor):
             "approver_role": parsed.approver_role,
             "options": _options(parsed),
             "run_id": run_id,
+            # Trace 关联用：interrupt_id 要到 dispatch 才生成，但
+            # tool_call_id / task_id 在这一刻是已知的。带上它们，派发层
+            # 才能把 tool.interrupted 挂到正确的 Tool Span 上。
+            "tool_call_id": tool_call_id,
+            "task_id": task_id,
             # ⚠️ 下发等待时长：审批界面要显示"还能等多久"。
             #   没有它，客户端只能自己定一个窗口 —— 那个窗口与后端将来真正
             #   清理的时刻对不上，等于编了一个不存在的 deadline。

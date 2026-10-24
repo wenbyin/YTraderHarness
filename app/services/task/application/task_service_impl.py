@@ -177,6 +177,37 @@ class TaskServiceImpl(TaskService):
 
         return revived.task_id
 
+    async def invoke(
+            self,
+            task_id: UUID,
+    ) -> Task:
+
+        current = await self._require(task_id)
+
+        # 复用 reschedule 而不是新写一条 SQL：它已经保证了
+        # "只在可 claim 时生效 + generation 自增"，而这两件事对
+        # "立即触发"一条定时任务同样是必须的 —— 少了 generation +1，
+        # 已经睡在原来那个时刻的定时器醒来时会认不出自己已被取代。
+        updated = await self._tasks.reschedule(
+            task_id,
+            execute_at=None,
+        )
+
+        if updated is None:
+            # 与 retry / reschedule 同一套路：用**刚读到的**状态报错。
+            raise TaskStateError(
+                f"任务当前是 {current.status.value}，不能立即触发。"
+                "只有还没开始跑的（pending / retryable）任务可以提前触发："
+                "正在跑的任务马上就会写回结果；已终结的再触发会产生"
+                "第二次外部副作用（失败/取消的重跑请用 retry）。"
+            )
+
+        # execute_at 已经是 null，这条路必然是"现在就该跑"，
+        # 无条件推一次，不必像 reschedule 那样再判一次时间。
+        self._schedule_dispatch(updated.task_id)
+
+        return updated
+
     async def reschedule(
             self,
             task_id: UUID,

@@ -39,7 +39,6 @@ app/infra/datasource/redis.py 的类 docstring。
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from app.agent.event import (
     RedisStreamSink,
@@ -49,6 +48,7 @@ from app.agent.event import (
     reset_run_stream_registry,
     start_event_publisher,
 )
+from app.common.factories import get_redis_factory
 from app.services.session.application.run_liveness import (
     probe_run_liveness,
 )
@@ -58,20 +58,21 @@ __all__ = ["aclose_event_stream", "initialize_event_stream"]
 logger = logging.getLogger(__name__)
 
 
-async def initialize_event_stream(
-        datasource_manager: Any,
-) -> None:
+async def initialize_event_stream() -> None:
     """
     装配并启动事件流的发布端与广播端。
 
-    拿不到 Redis 数据源时不报错：装空发布器，运行照常。
+    客户端从**应用级 Redis 工厂**取（与工具缓存 / 画像缓存同一条路）；
+    Redis 未装配时工厂返回 None，装空发布器，运行照常。
     """
 
-    redis_source = datasource_manager.get_optional("redis")
+    redis_factory = get_redis_factory()
+
+    sync_client = redis_factory.optional_sync_client()
 
     sink = (
-        RedisStreamSink(redis_source.sync_client)
-        if redis_source is not None
+        RedisStreamSink(sync_client)
+        if sync_client is not None
         else None
     )
 
@@ -88,7 +89,7 @@ async def initialize_event_stream(
     #    get_graph_dispatcher() / get_repository_factory() 取依赖，因此
     #    不受"读取端先于 dispatcher 装配"这个顺序的影响。
     build_run_stream_registry(
-        redis_source.stream_client if redis_source is not None else None,
+        redis_factory.optional_stream_client(),
         probe=probe_run_liveness,
     )
 

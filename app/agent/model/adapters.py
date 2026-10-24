@@ -190,8 +190,6 @@ class LangChainProviderAdapter:
         # 没有任何"之后"。
         _log_request(client, request)
 
-        print(request.messages)
-
         try:
             if on_delta is not None and self._can_stream(client, request):
                 message = await self._astream(
@@ -210,8 +208,6 @@ class LangChainProviderAdapter:
 
                     if text:
                         await on_delta(text)
-
-            print(message)
 
         except asyncio.CancelledError:
             # 取消**不是** provider 失败。归一化会把它变成可重试的
@@ -656,6 +652,17 @@ def thinking_off_extra_body(
     """
     这次调用要额外并进请求体的参数 —— 目前只有"关掉思考模式"这一种。
 
+    判定顺序（**关优先**）：
+
+        1. 模型 / 调用方显式 disable_thinking  -> 关
+        2. response_format 非空（JSON schema） -> 关（强制 tool_choice / 截断）
+        3. request.enable_thinking             -> 开（覆盖"带 tools"）
+        4. 带 tools                            -> 关（防 DSML 泄漏）
+        5. 其余（纯文本）                      -> 不关，走 provider 默认
+
+    ReAct 主循环把 `enable_thinking=True`，于是"带工具 -> 关思考"不再
+    适用于它；但结构化输出（分类等）仍然关。
+
     两个判据**缺一不可**，合起来才是"按模型 × 这次要什么"：
 
         模型声明了 structured_output_extra_body    （model.yaml 逐模型声明）
@@ -753,18 +760,34 @@ def thinking_off_extra_body(
     无声消失。一处来源，就是这里。
     """
 
-    if (
-            not definition.disable_thinking
-            and request.response_format is None
-            and not request.tools
-            and not request.disable_thinking
-    ):
-        return {}
-
     extra_body = definition.structured_output_extra_body
 
     if not extra_body:
         return {}
+
+    # 关优先：模型级 / 调用级显式关闭
+    if definition.disable_thinking or request.disable_thinking:
+        return _thinking_off_extra(extra_body)
+
+    # 结构化输出必须关：思考模式不接受强制 tool_choice，且思考与正文
+    # 共用 max_tokens，容易把 JSON 截断。
+    if request.response_format is not None:
+        return _thinking_off_extra(extra_body)
+
+    # ReAct 主循环显式要求保留思考：**覆盖**"带 tools"这一条。
+    if request.enable_thinking:
+        return {}
+
+    # 带普通工具：默认关，防止 DSML 泄漏。
+    if request.tools:
+        return _thinking_off_extra(extra_body)
+
+    # 纯文本：不关，走 provider 默认（通常是思考模式）。
+    return {}
+
+
+def _thinking_off_extra(extra_body: Mapping[str, Any]) -> dict[str, Any]:
+    """模型定义的关思考参数 -> 请求体片段（深拷贝）。"""
 
     # deepcopy 而不是 dict(...)：这是**嵌套**dict，浅拷贝只复制最外层 ——
     # 里层的 {"thinking": {...}} 仍与模型定义共享。而定义是进程级注册表里的

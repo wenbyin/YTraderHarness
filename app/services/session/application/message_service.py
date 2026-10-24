@@ -18,7 +18,8 @@
 ⚠️ 这里也没有"取单条 / 删除 / 编辑"
 ---------------------------------
 规格里没有这些端点，消息也是不可变的（没有 updated_at）。契约不该比规格
-多出接口 —— 与 AgentSessionService 里那条"没有 delete / archive"同一条规矩。
+多出接口 —— 与"会话只有归档、没有消息级删除"同一条规矩：DELETE
+/sessions/{id} 软删的是会话状态，不碰消息行。
 """
 
 from __future__ import annotations

@@ -147,11 +147,17 @@ components:
 
         kind:
           type: string
+          description: >-
+            chat / interaction / tool_activity / notice /
+            task_instruction / task_result。
+            任务消息的 metadata 里带 task_id / plan_id / skill_key。
           enum:
             - chat
             - interaction
             - tool_activity
             - notice
+            - task_instruction
+            - task_result
 
         business_agent_id:
           type: [string, 'null']

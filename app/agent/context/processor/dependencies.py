@@ -38,9 +38,11 @@ from .budget import HeuristicTokenCounter, TokenCounter
 from .history import HistorySelector, TurnWindowHistorySelector
 from .policy import ContextPolicyResolver, DefaultContextPolicyResolver
 from .sources import (
+    CapabilityResolver,
     KnowledgeSource,
     MemorySource,
     ProfileSource,
+    SkillSource,
     ToolExposureSource,
 )
 from .summarization import ModelRegistrySummaryCompactor, SummaryCompactor
@@ -86,6 +88,16 @@ class ContextDependencies:
     knowledge_source: KnowledgeSource | None = None
     tool_source: ToolExposureSource | None = None
 
+    #: task 模式的两条取数依赖。
+    #:
+    #: skill_source         skill_key -> SkillSnapshot
+    #: capability_resolver  capability codes -> tool_keys
+    #:
+    #: 缺省时 SkillLoader 会降级：没有 skill 就用通用任务提示词，
+    #: 没有 resolver 就给空工具集（不是回落到主 agent 的工具）。
+    skill_source: SkillSource | None = None
+    capability_resolver: CapabilityResolver | None = None
+
     summary_compactor: SummaryCompactor | None = None
 
     # ========================================================
@@ -119,6 +131,34 @@ class ContextDependencies:
     def resolved_history_selector(self) -> HistorySelector:
 
         return self.history_selector or TurnWindowHistorySelector()
+
+    def resolved_skill_source(self) -> SkillSource:
+        """
+        skill 源。
+
+        缺省用 `ServiceSkillSource()`（按需查 SkillService）—— 与
+        tool_source 的默认实现同一形状：它只在 task 模式的 SkillLoader
+        里被调用，普通对话不会碰数据库。
+        """
+
+        if self.skill_source is not None:
+            return self.skill_source
+
+        from app.infra.agent.skill_exposure import ServiceSkillSource
+
+        return ServiceSkillSource()
+
+    def resolved_capability_resolver(self) -> CapabilityResolver:
+        """能力 code -> tool_keys；缺省用服务实现。"""
+
+        if self.capability_resolver is not None:
+            return self.capability_resolver
+
+        from app.infra.agent.capability_resolver import (
+            ServiceCapabilityResolver,
+        )
+
+        return ServiceCapabilityResolver()
 
     def resolved_compactor(
             self,
@@ -167,6 +207,8 @@ class ContextDependencies:
                     "memory_source",
                     "knowledge_source",
                     "tool_source",
+                    "skill_source",
+                    "capability_resolver",
                     "summary_compactor",
                 )
                 if getattr(self, name) is not None

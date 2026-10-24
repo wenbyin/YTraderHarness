@@ -76,9 +76,11 @@ class AgentSession(Base):
         comment=(
             "会话归属的用户 ID —— Casdoor 的 sub（见 app/common/auth），"
             "与 file.uploaded_by 同一口径。\n\n"
-            "⚠️ 它是**所有 session 接口的过滤键**，查询条件为 "
-            "`user_id = 当前用户 OR user_id IS NULL`；NULL 是刻意保留的"
-            "存量语义（加这列之前的会话对谁都可见），不代表可以省略 —— "
+            "⚠️ 它是 session 接口的过滤键，但两种口径不同：\n\n"
+            "    按 id 读      `user_id = 当前用户 OR user_id IS NULL`\n"
+            "    列表 / 删除   `user_id = 当前用户`（严格）\n\n"
+            "NULL 是刻意保留的存量语义（加这列之前的会话对谁都可见），"
+            "但无主会话不出现在任何人的列表里、也不能被删除。"
             "新建会话必须写入。"
         ),
     )

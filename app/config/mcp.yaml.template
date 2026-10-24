@@ -1,0 +1,67 @@
+# MCP provider 配置。
+#
+# 复制成 mcp.yaml 再改（真文件已 gitignore —— 它装本机路径与密钥）：
+#
+#     cp app/config/mcp.yaml.template app/config/mcp.yaml
+#
+# 没配 mcp.yaml 时 MCP 整体关闭：不连 server、不扫描、不注册工具。
+#
+# 设计立场（见 app/common/mcp.py 的模块说明）：
+#   - provider 的**连接参数**是部署数据，住在这里，不进代码；
+#   - 工具清单是 server 的 tools/list 返回的运行时事实，不在这里声明；
+#   - 默认 allowlist：server 升级多出来的工具不会自动可执行。
+
+mcp:
+  #: 总开关。false = 不扫描、不注册、不连接。
+  enabled: true
+
+  providers:
+
+    # 本地 tdx-link-mcp（stdio）。
+    #
+    # 安装：.venv 里 pip install tdx-link-mcp
+    # 启动：.venv/Scripts/tdx-link-mcp.exe（Windows）
+    #       它的 tools/list 不依赖通达信终端已启动 —— tdx_lib 是
+    #       延迟导入的，真正调用行情工具时才需要终端。
+    tdx:
+      enabled: true
+      transport: stdio
+      command: "${YTRADER_MCP_TDX_COMMAND:-.venv/Scripts/tdx-link-mcp.exe}"
+      args: []
+      env: {}
+      # cwd: null
+
+      # 启动 + initialize + 首次 list_tools 的总预算。
+      startup_timeout_ms: 15000
+
+      # 单次调用的传输层兜底；read_backtest 之类可能很慢。
+      call_timeout_ms: 120000
+
+      tools:
+        # all / allowlist / denylist。默认 allowlist。
+        mode: allowlist
+
+        # 默认只放只读工具。要放开某个工具，把它加进 allow ——
+        # 尤其是下面这些**会改变状态或有真实副作用**的，想清楚再放：
+        #
+        #   execute_trade      真实下单 / 撤单
+        #   manage_portfolio   增删改板块
+        #   screen_and_save    选股并写入板块
+        #   setup_grid_trading 配置网格交易
+        #   schedule_strategy  定时策略
+        #   manage_task        注册系统定时任务（schtasks/cron）
+        #   manage_realtime    订阅 / 退订实时行情
+        #   manage_expert      开关 / 创建专家
+        #   run_daily_session  写业绩库并生成报告
+        allow:
+          - ensure_tdx_ready
+          - get_market_info
+          - screen_stocks
+          - screen_combo
+          - run_backtest
+          - get_financial_info
+          - get_market_stats
+          - check_version
+          - list_experts
+
+        deny: []

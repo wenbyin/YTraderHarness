@@ -1,7 +1,7 @@
 # START_UP.md — 配置与启动
 
 > YTraderHarness · 配置手册与启动时序
-> 覆盖范围：`app/config/**`（运行时配置，10 份）、`app/services/**/*.yaml`（HTTP 契约规格，19 份）、
+> 覆盖范围：`app/config/**`（运行时配置，10 份）、`app/services/**/*.yaml`（HTTP 契约规格，20 份）、
 > 以及 `app/main.py` 的 lifespan 启动链。
 > 本文回答一个问题：**"这个服务要跑起来，哪些文件要配、按什么顺序读、改完怎么生效。"**
 
@@ -43,7 +43,7 @@
 | | **运行时配置** | **契约规格** |
 |---|---|---|
 | 位置 | `app/config/**` | `app/services/**/*.yaml` |
-| 数量 | 10 份 | 19 份 |
+| 数量 | 10 份 | 20 份 |
 | 顶层结构 | 自由（按各加载器的 pydantic 模型） | 统一 `openapi: 3.1.0` + `info` / `servers` / `paths` / `components` |
 | 启动时加载？ | **会**，全部解析 + 校验 | **不会**，一个字节都不读 |
 | 谁在用 | `app/main.py` lifespan 各步骤 | Python DTO（`app/services/*/domain/schemas/*.py`）声明"照它实现" |
@@ -230,7 +230,7 @@ OAuth 登录流（`/auth/login` → Casdoor → `/auth/callback`）、claim 名�
 
 ---
 
-## 5. 契约规格清单（`app/services/**/*.yaml`，19 份）
+## 5. 契约规格清单（`app/services/**/*.yaml`，20 份）
 
 **统一结构**：`openapi: 3.1.0` + `info` / `servers` / `[tags]` / `[security]` / `paths` / `components`。
 **运行时零加载**。唯一的解析者是开发期脚本 `python -m app.agent.spec_check`（**只覆盖 document 那 6 份**）。
@@ -239,10 +239,11 @@ OAuth 登录流（`/auth/login` → Casdoor → `/auth/callback`）、claim 名�
 |---|---|---|---|
 | `session/session.yaml` | 554 | Agent Runtime API | `/sessions`、`/{id}/runs`、`/runs/{run_id}/events`、`/resume`、`/cancel` |
 | `session/messages.yaml` | 253 | Messages API | `/sessions/{session_id}/messages` |
-| `task/task.yaml` | 536 | Async Task Management | `/tasks`、`/lineage`、`/cancel`、`/retry`、`/reschedule` |
+| `task/task.yaml` | 582 | Async Task Management | `/tasks`、`/lineage`、`/cancel`、`/retry`、`/invoke`、`/reschedule` |
 | `tool/tool.yaml` | 644 | Tool Definition Management | `/tools`、`/discovery/sync`、`/{tool_id}/documentation` |
 | `tool/tool_processor.yaml` | 547 | Tool Processor Management | `/processors`、`/tools/{tool_id}/processors`、`/order` |
 | `capability/capability.yaml` | 367 | Capability Management | `/capabilities`、`/capabilities/{id}` |
+| `skill/skill.yaml` | 500 | Skill Management | `/skills`、`/{id}/capabilities` |
 | `context/context_builder.yaml` | 585 | Context Builder Catalog（只读） | `/context-builders`、`/{type}/pipeline` |
 | `model`（无独立 yaml） | — | 模型目录由 `model.yaml` 承载，**不是** OpenAPI 契约 | — |
 | `memory/memory.yaml` | 397 | Memory Search API（L0 工具） | `/memory/search` |

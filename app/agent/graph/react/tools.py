@@ -7,26 +7,27 @@
 **每跑一次只处理一个调用**：
 
     读 payload 里那一个 call -> 算允许集 -> 执行或拒绝 -> 回一条 ToolMessage
+    控制器分支再把工具的 Command（或默认 goto=agent）交回 LangGraph
 
 执行本身**不在这里** —— 链怎么驱动、service 怎么造、参数怎么包，都在
 `app/infra/agent/tool_executor.py`。本节点只管图语义：读 payload、
 写 messages、记观测。
 
-分两层：图语义 / ToolNode 规范
-------------------------------
-    tools_node        图语义。只做两件 `_wrap_tool_call` 做不了的事：
-                      把节点的 `Runtime` 变成处理器契约要的
-                      `ToolRuntime`；把返回的那条 ToolMessage 包成
-                      state 更新
-    _wrap_tool_call   一次调用的**全部**逻辑。签名就是 langgraph
-                      `ToolNode` 的 `awrap_tool_call`：
-                      `(ToolCallRequest, execute) -> ToolMessage`
+分两层：图语义 / 单次调用
+------------------------
+    tools_node        图语义：把节点的 `Runtime` 变成处理器契约要的
+                      `ToolRuntime`；把结果包成 state 更新；控制器
+                      分支返回 `Command` 决定下一跳
+    _wrap_tool_call   一次调用的**全部**逻辑。入参与 langgraph
+                      `ToolNode` 的 `awrap_tool_call` 同形，返回
+                      `_ToolCallResult`（ToolMessage + 可选 Command）
 
-为什么照 ToolNode 的规范分这一层
-    将来换成 langgraph 预构建的 `ToolNode` 是**一行**
-    （`ToolNode(tools=..., awrap_tool_call=_wrap_tool_call)`），
-    而不是把这段再重写一遍。观测的 `node_span` 也因此落在 hook 里 ——
-    那个位置在两种形态下都成立。
+为什么不再严格照 `awrap_tool_call` 的返回类型
+    **任何**工具都可以返回 `Command.goto` 做 handoff（不只计划工具），
+    单返回 ToolMessage 表达不了下一跳。`_ToolCallResult` 把"给模型
+    看的消息"和"给图看的跳转"分开；将来若换成预构建 `ToolNode`，
+    需要把控制器 / 计划状态结算这段适配过去（它自己支持 Command，
+    但不知道我们的 plan_* 语义）。
 
 为什么今天**不**直接用预构建的那个
     它一次节点执行会跑完一条 AIMessage 里的**全部** tool_call
@@ -93,51 +94,61 @@ exposed_tools —— 于是"没有 tool_keys"就等于"没有工具"，两条路
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import date, datetime
-from decimal import Decimal
-from typing import Any
+from typing import Any, NamedTuple
 from uuid import UUID
 
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.errors import GraphInterrupt
+from langgraph.config import get_stream_writer
 from langgraph.prebuilt.tool_node import (
     ToolCallRequest,
     ToolRuntime,
 )
 from langgraph.runtime import Runtime
-from pydantic import BaseModel
+from langgraph.types import Command
 
+from app.agent.context.processor.reference import wrap_reference
+from app.agent.tools.hitl_tool import (
+    ASK_USER_QUESTION_TOOL_KEY,
+)
+from app.agent.tools.plan_tool import PLAN_CONTROL_TOOL_KEYS
 from app.agent.tools.processor.context import (
     ToolCallDenied,
     ToolOutcome,
 )
+from app.common.event import TOOL_STREAM_KIND, RunEventType
 from app.common.factories import get_service_factory
 from app.common.tool_caller import ToolCaller, tool_caller_scope
 from app.infra.agent.tool_executor import get_tool_executor
 from app.infra.agent.tool_exposure import for_wire
-from app.infra.graph import branch_scope_id, node_span
-from app.services.tool.application import (
-    ToolExecutionService,
-    ToolQueryService,
-)
-from app.services.tool.domain.entities import ToolExecution
-from app.services.tool.domain.schemas.enum import (
-    ToolExecutionStatus,
-)
+from app.infra.graph import NodeSpec, branch_scope_id, node_span
+from app.services.tool.application import ToolQueryService
+from app.services.tool.application._execution import execution_result
 from app.services.tool.registry import select_specs, tool_key_of
 
-from .catalog import NODE_SPECS, REACT_TOOL_SCOPE_NAMESPACE
+from .catalog import (
+    AGENT_NODE,
+    NODE_SPECS,
+    REACT_TOOL_SCOPE_NAMESPACE,
+)
 from .context import ReactContext
 from .state import ToolBranchPayload
 
 _SPEC = next(s for s in NODE_SPECS if s.node_id == "tools")
 
-__all__ = ["tools_node"]
+#: 不走处理器链的工具。
+#:
+#: 计划控制（enter/exit）与 HITL 提问都是进程内的控制工具：没有副作用，
+#: 不需要审批 / 缓存 / 重试，而且必须在**还没同步进 tool_definition** 时
+#: 也能执行。`tool_id=None` 在 ToolExecutor 里就是"空链"。
+_CHAINLESS_TOOL_KEYS = PLAN_CONTROL_TOOL_KEYS | {
+    ASK_USER_QUESTION_TOOL_KEY,
+}
+
+__all__ = ["command_update", "execute_tool_branch", "tools_node"]
 
 #: ToolNode 规范里那个 `execute` 回调的形状：`(request) -> ToolMessage`。
 #:
@@ -150,6 +161,9 @@ logger = logging.getLogger(__name__)
 
 def _branch_span_kwargs(
         state: ToolBranchPayload,
+        *,
+        spec: NodeSpec = _SPEC,
+        scope_namespace: UUID = REACT_TOOL_SCOPE_NAMESPACE,
 ) -> dict[str, Any]:
     """
     组装 `node_span` 的关键字参数，顺便守卫 payload。
@@ -190,12 +204,12 @@ def _branch_span_kwargs(
         )
 
     return {
-        "node_id": _SPEC.node_id,
-        "label": _SPEC.label,
-        "group": _SPEC.group,
-        "sequence": _SPEC.sequence,
+        "node_id": spec.node_id,
+        "label": spec.label,
+        "group": spec.group,
+        "sequence": spec.sequence,
         "branch_scope_id": branch_scope_id(
-            REACT_TOOL_SCOPE_NAMESPACE, call_scope
+            scope_namespace, call_scope
         ),
     }
 
@@ -223,6 +237,96 @@ def _render(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+def _reference_content(tool_key: str, value: Any) -> str:
+    """
+    成功工具结果 -> 带引用数据定界的 ToolMessage 正文。
+
+    工具返回的可能是网页正文、检索片段、外部 API 响应 —— 这些内容由
+    外部控制，统一包成 `<ref:tool>` 并附上引用数据规则。失败 / 拒绝 /
+    未暴露工具的消息是**本进程写的**，不走这里。
+    """
+
+    content = _render(value)
+
+    if not content.strip():
+        return content
+
+    return wrap_reference("tool", tool_key, content)
+
+
+#: 计划控制工具在返回值里携带的指令。
+_PLAN_TRANSITIONS = frozenset({"enter", "exit"})
+
+
+class _ToolCallResult(NamedTuple):
+    """
+    一次工具调用的结果。
+
+    `message` 是**必须**写回对话的 ToolMessage（每个 tool_call 一条）。
+    `command` 只在工具返回 `Command` 时存在 —— 它携带工具自己定义的
+    `goto`（计划控制工具的跳转逻辑就写在这里）。
+    """
+
+    message: ToolMessage
+
+    command: Command | None = None
+
+
+def _plan_update(value: Any) -> Mapping[str, Any] | None:
+    """`Command.update` / dict 返回值里的计划指令载荷。"""
+
+    if isinstance(value, Command):
+        return value.update if isinstance(value.update, Mapping) else None
+
+    if isinstance(value, Mapping):
+        return value
+
+    return None
+
+
+def _plan_directive(value: Any) -> str | None:
+    """
+    工具返回值里的计划指令；不是控制工具就返回 None。
+
+    ⚠️ 认两种形状
+    -------------
+        计划工具   `Command(update={"plan_transition": ...})`
+        旧形状     `{"plan_transition": ...}`（纯 dict，不触发跳转）
+
+    普通工具可能返回任意值（含字符串），这里不能把它们误判成控制工具。
+    """
+
+    payload = _plan_update(value)
+
+    if payload is None:
+        return None
+
+    raw = payload.get("plan_transition")
+
+    if isinstance(raw, str) and raw in _PLAN_TRANSITIONS:
+        return raw
+
+    return None
+
+
+def _plan_message_text(value: Any) -> str:
+    """控制工具返回的 `message`（附带可选 reason）；没有就留空。"""
+
+    payload = _plan_update(value)
+
+    if payload is None:
+        return ""
+
+    text = str(payload.get("message") or "")
+
+    reason = str(payload.get("reason") or "").strip()
+
+    if reason:
+        text = f"{text}（理由：{reason}）" if text else f"理由：{reason}"
+
+    return text
+
+
 def _outcome_message(
         tool_call_id: str | None,
         tool_key: str,
@@ -232,8 +336,34 @@ def _outcome_message(
 
     if outcome.ok:
 
+        # 工具返回 Command：正文优先取 update.message；普通 Command
+        # 没有 message 时退化为 update 的 JSON 渲染（与原版一样，工具
+        # 的返回值就是这次调用的结果）。计划指令只在这条返回里**额外**
+        # 进 additional_kwargs，不影响其他工具。
+        if isinstance(outcome.value, Command):
+
+            directive = _plan_directive(outcome.value)
+
+            extra: dict[str, Any] = {}
+
+            if directive is not None:
+                extra["plan_transition"] = directive
+
+            content = _plan_message_text(outcome.value)
+
+            if not content and outcome.value.update:
+                content = _render(outcome.value.update)
+
+            return ToolMessage(
+                content=content,
+                tool_call_id=tool_call_id or "",
+                name=tool_key,
+                status="success",
+                additional_kwargs=extra,
+            )
+
         return ToolMessage(
-            content=_render(outcome.value),
+            content=_reference_content(tool_key, outcome.value),
             tool_call_id=tool_call_id or "",
             name=tool_key,
             status="success",
@@ -278,6 +408,78 @@ def _unexposed_message(
         name=tool_key,
         status="error",
     )
+
+
+def _publish_tool_event(
+        event_type: RunEventType,
+        *,
+        tool_call_id: Any,
+        tool_name: str,
+        **data: Any,
+) -> None:
+    """
+    把工具生命周期写进图的**自定义流**，由 RunEventProjector 投影成前端事件。
+
+    为什么不直接 `publish_run_event`
+    -------------------------------
+    运行事件的**唯一投影层**是 `RunEventProjector`（见它的模块 docstring）。
+    节点自己写 Redis 会让同一次执行出现两个来源：前端拿到的 tool.called
+    与 trace 的 tool span 各自独立，id 口径也对不上（实测 langgraph 的
+    `tools` 通道会给直接 `ainvoke` 的工具发一对假 id 的事件）。
+
+    写自定义流之后，工具事件与 trace 的 `fanout.*` 走同一条路：
+
+        tools 节点 --custom stream--> RunEventProjector --> Redis（SSE）
+
+    `get_stream_writer()` 在图外（直接调节点函数、单测）会抛，吞掉即可
+    —— 那种场合本来也没有订阅端。writer 本身在未请求 `custom` 模式时
+    是 no-op，不会阻塞工具执行。
+    """
+
+    try:
+        writer = get_stream_writer()
+    except Exception:  # noqa: BLE001 - 图外运行没有 writer，不是错误
+        return
+
+    writer({
+        "kind": TOOL_STREAM_KIND,
+        "event": event_type.value,
+        "tool_call_id": tool_call_id,
+        "tool_name": tool_name,
+        **data,
+    })
+
+
+def _tool_event_result(outcome: ToolOutcome) -> dict[str, Any]:
+    """ToolOutcome -> tool.completed 的 output / error 字段。"""
+
+    if outcome.ok:
+
+        # Command 不是可 JSON 化的结果；观测里给跳转目标与更新载荷，
+        # 而不是把它 str() 成一段看不懂的 repr。
+        if isinstance(outcome.value, Command):
+
+            update = (
+                dict(outcome.value.update)
+                if isinstance(outcome.value.update, Mapping)
+                else {}
+            )
+
+            return {
+                "output": {
+                    "goto": str(outcome.value.goto),
+                    "update": update,
+                }
+            }
+
+        return {"output": _render(outcome.value)}
+
+    error = outcome.error
+
+    if isinstance(error, ToolCallDenied):
+        return {"error": f"调用被拒绝（工具未执行）：{error}"}
+
+    return {"error": f"{type(error).__name__}: {error}"}
 
 
 def _bucket(outcome: ToolOutcome) -> str:
@@ -347,412 +549,63 @@ async def _resolve_tool_ids(
 
 
 # ============================================================
-# 执行账本（tool_execution）
+# 执行守卫
 # ============================================================
 #
-# 「先查后执行」的判定**全部**落在 claim 上（一条原子语句），
-# 见 app/services/tool/repository/tool_execution.py 的说明。这里
-# 只做三件事：取身份、驱动 claim、按结果落终态。
+# 守卫已经搬到处理器链里的 AROUND 拦截器
+# （app/agent/tools/processor/interceptor/execution_guard.py）。
+# 本节点不再自己记账：它只负责把工具交给执行器、把结果转成
+# ToolMessage。账本的预占 / 计数 / 落终态都在守卫里。
 #
-# ⚠️ 每次本表写入都是**自己的短事务**（factory.scope(begin=True)），
-# 且 claim 必须在 execute 之前提交。这不是风格问题：
+# 为什么搬走：守卫要按 scope（会话 / 运行 / 用户 / 全局）与
+# execution（方法 / 方法 + 参数）两个维度计数，而这些配置挂在
+# tool_processor 链上 —— 放在节点里就只能写死一种语义。
 #
-#     写在工具那个事务里    工具回滚会把记录一起回滚，而"副作用
-#                           到底发生过没有"恰恰要在那一刻还查得到
-#     写在 execute 之后     崩在中间就没有任何记录，账本等于没有
-
-
-class _LedgerUnavailable(Exception):
-    """
-    账本当前用不了（身份取不到、工厂没装配、数据库断了）。
-
-    ⚠️ 它的语义是**不执行工具**，不是"跳过记录照常执行"。
-    一次没有记录的副作用是不可追溯的，而不可追溯比失败更糟 ——
-    与 `_resolve_tool_ids` 拿不到链时一律不执行同一条立场。
-    """
-
-
-def _ledger_identity(
-        request: ToolCallRequest,
-) -> tuple[UUID, UUID]:
-    """
-    判重键里的 `(session_id, run_id)` —— **两个都取自 graph context**。
-
-        session_id  ReactContext.session_id（即 agent_session.session_id）
-        run_id      ReactContext.pipeline_run_id
-
-    ⚠️ 为什么两个都不从 config 取
-    ----------------------------
-    config 里**没有** session_id，只有 `configurable.thread_id` ——
-    那是 langgraph 的内部键（`dev:react:<uuid>`），不是会话主键。
-    拿它当 session_id 存进去，账本行上就是一个谁都认不出的字符串，
-    排查时每次都得先反查会话表。
-
-    config 顶层那个 `run_id` 同样不用：它是给 LangSmith trace 对齐的
-    langgraph 概念。本仓"一次运行"的身份是 `context.pipeline_run_id`
-    （审批归档也用它，见 interceptor/approval.py 的 `_run_id`）。两者
-    今天恰好相等，但契约上只有后者是业务身份。
-
-    ⚠️ 拿不到就抛（不执行工具），**不兜底造一个键**
-    --------------------------------------------
-    造出来的键会把**不同的会话**混进同一行 —— 那比拒绝执行危险得多：
-    前者的症状是"A 会话的调用被 B 会话的记录挡住"，而它不会报错。
-
-    `session_id` 由派发方从 `run.session_id` 填（agent_run_dispatch），
-    它在这条路径上必然有值；为 None 只可能是图装配错了。
-    """
-
-    context = getattr(request.runtime, "context", None)
-
-    session_id = getattr(context, "session_id", None)
-    run_id = getattr(context, "pipeline_run_id", None)
-
-    if session_id is None or run_id is None:
-        raise _LedgerUnavailable(
-            "拿不到 (session_id, run_id)，无法建立执行记录，"
-            "因此未执行工具。两者都来自 graph context"
-            "（ReactContext.session_id / pipeline_run_id）——"
-            "缺任一个都说明这次调用不在正常的图装配下。"
-        )
-
-    return session_id, run_id
-
-
-def _execution_scope(
-        *,
-        begin: bool,
-) -> Any:
-    """
-    取一段**独立**的执行账本事务的上下文管理器。
-
-    与 `_resolve_tool_ids` 同一套取工厂的方式（`get_service_factory`
-    在应用没跑过 lifespan 时抛 RuntimeError），失败一律转成
-    `_LedgerUnavailable`：调用方只认那一个信号。
-
-    取工厂是同步的，所以这里是普通函数 —— 不要写成 `async def`：
-    那样调用处得先 `await` 拿上下文管理器再 `async with`，多一层
-    没有意义的跳转。
-    """
-
-    try:
-        factory = get_service_factory()
-
-    except RuntimeError as exc:
-        raise _LedgerUnavailable(
-            f"应用未装配，执行账本不可用（{exc}），因此未执行工具。"
-        ) from exc
-
-    return factory.scope(ToolExecutionService, begin=begin)
-
-
-async def _claim_execution(
-        session_id: UUID,
-        run_id: UUID,
-        tool_key: str,
-        arguments: Mapping[str, Any],
-) -> ToolExecution | None:
-    """
-    原子抢占。返回 None = **没抢到，不许执行**。
-
-    抢不到只有一种含义：那一行已经存在且状态不可重跑（别人正在跑、
-    已经跑成功、或不知道跑没跑）。见 repository 那边的说明。
-    """
-
-    try:
-        async with _execution_scope(begin=True) as service:
-
-            return await service.claim(
-                session_id=session_id,
-                run_id=run_id,
-                tool_key=tool_key,
-                arguments=arguments,
-            )
-
-    except _LedgerUnavailable:
-        raise
-
-    except Exception as exc:  # noqa: BLE001 - 一律转成"不执行"
-
-        raise _LedgerUnavailable(
-            f"执行账本不可用（{type(exc).__name__}: {exc}），"
-            "因此未执行工具。"
-        ) from exc
-
-
-async def _find_execution(
-        session_id: UUID,
-        run_id: UUID,
-        tool_key: str,
-        arguments: Mapping[str, Any],
-) -> ToolExecution | None:
-    """
-    取那一行，**只为措辞**（"它现在是什么状态"）。
-
-    失败返回 None 而不是抛：它不参与判定，拿不到就少说一句状态，
-    为此把整个拒绝过程炸掉不值得。
-    """
-
-    try:
-        async with _execution_scope(begin=False) as service:
-
-            return await service.find(
-                session_id=session_id,
-                run_id=run_id,
-                tool_key=tool_key,
-                arguments=arguments,
-            )
-
-    except Exception:  # noqa: BLE001 - 见上
-
-        logger.exception("读取执行记录失败，拒绝文案里将不带状态。")
-
-        return None
-
-
-async def _settle_execution(
-        execution_id: UUID,
-        *,
-        status: ToolExecutionStatus,
-        result: Any = None,
-        error_exc: BaseException | None = None,
-) -> None:
-    """
-    落终态。
-
-    ⚠️ **永不抛**。走到这里工具已经跑过了（或已经被中断/取消），
-    把一次"已经发生的事"因为记账失败而变成一次失败，是拿观测去
-    推翻事实。失败记 ERROR 级日志。
-
-    ⚠️ 但它的失败是有代价的：中断与取消那两条路上，一行停在
-    PENDING/RUNNING 会让 resume 或下一次相同调用被**拒绝**（策略
-    是 fail-closed）。因此这里的失败必须看得见 —— 它是运维信号，
-    不是噪音。
-    """
-
-    try:
-        async with _execution_scope(begin=True) as service:
-
-            await service.settle(
-                execution_id,
-                status=status,
-                result=result,
-                error_exc=error_exc,
-            )
-
-    except Exception:  # noqa: BLE001 - 见 docstring
-
-        logger.exception(
-            "执行记录落终态失败（execution_id=%s, status=%s）。"
-            "⚠️ 工具本身已经跑过了，这次失败只影响账本 —— "
-            "但那一行会停在旧状态，下一次相同调用会被判成"
-            "「不可重跑」而拒绝。",
-            execution_id,
-            status.value,
-        )
-
-
-#: 递归规范化的深度上限。
-#:
-#: 防御**自引用**的容器（A 里放 B，B 里又放回 A）。`json.dumps` 遇到
-#: 那种结构会自己抛 ValueError，而这里是手写递归 —— 不设上限就是
-#: RecursionError，那会一路冒到节点外，把一次成功的调用变成崩图。
-#:
-#: 与 registry/schema.py 的 MAX_SCHEMA_DEPTH 是同一类防御。
-_MAX_RESULT_DEPTH = 12
-
-#: 递归里遇到一个"不知道该变成什么"的叶子。
-#:
-#: 用一个内部异常而不是返回哨兵值：容器递归的每一层都要能把"这一支
-#: 认不出来"往上带，而哨兵值没法与"工具真的返回了这个值"区分。
-class _NotJsonable(Exception):
-    def __init__(self, type_name: str) -> None:
-        super().__init__(type_name)
-        self.type_name = type_name
-
-
-def _jsonable(value: Any, depth: int = 0) -> Any:
-    """
-    递归把一个值变成 JSON 能表达的东西；认不出来就抛 `_NotJsonable`。
-
-    ⚠️ 为什么必须递归，而不是试一次 `json.dumps`
-    ------------------------------------------
-    第一版是"试着 dumps 一下，失败就整份降级"，结果**本仓最常见的
-    返回形状恰好是最先降级的那个**：`capability.list_capabilities`
-    返回 `list[Capability]`（pydantic 实体列表），落到"容器里有异物"
-    那条路，`result` 列存的是一段 repr 文本 —— 而它作为一个 JSONB 列
-    的意义正是可查询。真实数据里看到的：
-
-        result = "\\"[\\\\\\"id=UUID('8af0325a-...') code='CAPABILI..."
-
-    递归之后同一份值存成 `[{"id": "...", "code": "..."}, ...]`，
-    `result->0->>'code'` 这种查询才有意义。
-
-    ⚠️ "能变成什么"的判据锚在 pydantic 上
-    ------------------------------------
-    标量那几条（datetime / date / UUID / Decimal 的形态）与
-    `model_dump(mode="json")` 给出的一致 —— 同一份值不论裹不裹在
-    pydantic 里，存进库的形状都一样。这不是"随手挑的几种"，是
-    "pydantic 会把它变成什么，就当它是什么"。
-    """
-
-    if depth > _MAX_RESULT_DEPTH:
-        raise _NotJsonable(f"嵌套超过 {_MAX_RESULT_DEPTH} 层（或自引用）")
-
-    # JSON 原生 —— 原样存。
-    #
-    # ⚠️ bool 要排在 int 前面？不需要：`isinstance(True, int)` 为真，
-    # 但两者都是 JSON 原生、都原样返回，所以先后无所谓。
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-
-    # 服务方法与工具最常返回的东西：实体 / DTO。
-    if isinstance(value, BaseModel):
-        return value.model_dump(mode="json")
-
-    if isinstance(value, dict):
-        return {
-            str(key): _jsonable(item, depth + 1)
-            for key, item in value.items()
-        }
-
-    # tuple / set 也当数组 —— 与 model_dump(mode="json") 的处理一致。
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_jsonable(item, depth + 1) for item in value]
-
-    # ---- 标量：与 model_dump(mode="json") 对齐的那几种 ----
-    if isinstance(value, datetime):
-        return value.isoformat()
-
-    if isinstance(value, date):
-        return value.isoformat()
-
-    if isinstance(value, (UUID, Decimal)):
-        return str(value)
-
-    raise _NotJsonable(type(value).__name__)
+# ⚠️ 代价：没有挂守卫的工具没有执行记录（链不存在时 AROUND 不跑）。
+# 上线时给需要保护的工具挂上 execution_guard_interceptor。
 
 
 def _ledger_result(value: Any) -> Any:
     """
-    工具返回值 -> `result` 列能存的形态。
+    兼容入口：落库规范化已移到 application/_execution.execution_result。
 
-    ⚠️ 与 `_render` 的分工：`_render` 产出**给模型看的正文**（一个
-    字符串），本函数产出**入库的结构**（JSONB）。两者判断的"值能
-    变成什么"有重叠，但目的不同 —— 不要合并。
-
-    ⚠️ 降级**不静默**：认不出来的叶子会让**整份**值降级成
-    `_render` 的文本，于是 `result` 列存的是一段字符串而不是结构，
-    读的人无从分辨。所以打 WARNING 并带上类型名 —— 与
-    `select_specs` 跳过不可执行工具时的"跳过要留痕"同一条立场。
-
-    想让某个工具的结果保持结构化，就让它返回
-    `"能 JSON 化"` 的形状（`model_dump(mode="json")` 之后的实体、
-    或 `str(uuid)`）—— 与 cache 拦截器那条"参数请用可序列化的形态"
-    是同一类要求。
-
-    ⚠️ 不做长度截断：`_render` 的 docstring 已经说明了为什么
-    （悄悄砍一刀会让读的人以为那就是全部）。大结果的组织方式是
-    artifact 那条路，不是在这里截。
-
-    ⚠️ **永不抛**
-    ------------
-    走到这里工具已经跑过了。为了记一笔账而把一次成功的调用变成崩节点，
-    是拿观测去推翻事实 —— 与 `_settle_execution` 同一条立场。
-
-    这不是空话：降级那条路走的是 `_render`，而 `_render` 的
-    `default=str` 会调 `str()`，**一个 repr 会抛的对象能让它炸**。
-    实测过，所以这里兜住。
+    保留这个名字是因为既有测试直接从本模块 import 它；实现只有一份。
     """
 
-    try:
-        return _jsonable(value)
-
-    except _NotJsonable as exc:
-        return _degrade(
-            value, f"类型 {exc.type_name} 不知道怎么变成 JSON"
-        )
-
-    except RecursionError:
-        # _MAX_RESULT_DEPTH 挡在前面，走到这里说明别的递归（例如
-        # BaseModel.model_dump 自己陷进去了）。兜住，不让它出节点。
-        return _degrade(value, "规范化时递归过深")
-
-
-def _degrade(value: Any, reason: str) -> str:
-    """
-    降级成一段文本，并留下 WARNING。
-
-    ⚠️ 这一段是"能记多少算多少"：`_render` 也可能炸（repr 会抛的
-    对象），所以再兜一层。两层的存在理由是同一个 —— 记账失败绝不能
-    影响工具调用本身的成败。
-    """
-
-    logger.warning(
-        "工具返回值记入执行记录时降级成文本（%s），"
-        "result 列里存的是这段文本，不是结构化数据。",
-        reason,
-    )
-
-    try:
-        return _render(value)
-
-    except Exception:  # noqa: BLE001 - 见 docstring
-
-        logger.warning(
-            "连降级渲染也失败了，result 列里只留一个占位。",
-            exc_info=True,
-        )
-
-        return f"<{type(value).__name__}：无法记入 result 列>"
-
-
-def _recorded_message(
-        tool_call_id: str | None,
-        tool_key: str,
-        existing: ToolExecution | None,
-) -> ToolMessage:
-    """
-    这次调用在这个键上**已经有记录**，且那个状态不可重跑 ——
-    因此工具没有执行。
-
-    ⚠️ 回的是 `status="error"` 的真实结果，不是假的成功消息。
-    工具确实一次都没跑，把"已执行过"说成一次成功会让模型基于一个
-    不存在的结果继续编 —— 见模块 docstring 的同一段立场。
-
-    ⚠️ 文案**带状态**：模型据此能分清"已经成功了别再问"与
-    "上一次没跑成或不知道跑没跑"。运维看日志时也一样。
-    """
-
-    status = (
-        existing.status.value if existing is not None else "未知"
-    )
-
-    return ToolMessage(
-        content=(
-            f"工具 {tool_key!r} 的这次调用（相同参数）已经有一条执行"
-            f"记录，状态为 {status}，本次**未重复执行**。\n"
-            "上一次的结果已经在上文里；如果确实需要重新执行，"
-            "请改变参数或先处理掉那条记录。"
-        ),
-        tool_call_id=tool_call_id or "",
-        name=tool_key,
-        status="error",
-    )
+    return execution_result(value)
 
 
 async def tools_node(
         state: ToolBranchPayload,
         runtime: Runtime[ReactContext],
         config: RunnableConfig,
-) -> dict[str, Any]:
+) -> dict[str, Any] | Command:
     """
     执行**一个**工具调用，把结果作为 ToolMessage 放回 messages。
 
-    ⚠️ 返回值只有一个键、且恒只有一条消息 —— 这是刻意的：每个
-    tool_call 都必须有一条对应的 ToolMessage，少一条会让下一轮 agent
-    看到悬空的 tool_call，部分 provider 直接拒绝这次请求。写回靠父
-    状态 `messages` 上的 `add_messages` reducer 汇总（扇出的 N 个分支
-    因此不会互相覆盖，且顺序与 Send 顺序一致）。
+    ⚠️ 恒只有一条消息、且每个 tool_call 都必须有
+    -----------------------------------------
+    少一条 ToolMessage 会让下一轮 agent 看到悬空的 tool_call，部分
+    provider 直接拒绝这次请求。写回靠父状态 `messages` 上的
+    `add_messages` reducer 汇总（扇出的 N 个分支因此不会互相覆盖，
+    且顺序与 Send 顺序一致）。
+
+    ⚠️ 返回值有两种：dict 与 Command
+    -----------------------------
+    非控制器分支返回 `{"messages": [...], ...}`；控制器分支返回
+    `Command(goto=..., update=...)` —— 下一跳由工具返回的 `goto`
+    （计划工具）或 payload 的 `return_to`（普通工具，默认 agent）决定，
+    没有 after 路由。
+
+    计划控制工具通过注入的 `ToolRuntime.state` 读到调用前的
+    `plan_status` / `plan`，在自己的 `Command.update` 里直接写
+    `plan_status` / `plan_origin` / `plan`。本节点只做两件事：
+
+        `_command_update` 过滤掉 plan_transition / message / reason
+        （它们由 ToolMessage 承载，不是 state 通道）
+        控制器分支把 Command 原样交给 LangGraph
+
+    那几个状态通道带 `_last_value` reducer，并发写不会炸。
 
     ⚠️ 第三个参数 `config` 是 **langgraph 注入的**，不是可选的
     ------------------------------------------------------
@@ -765,24 +618,116 @@ async def tools_node(
     其余见模块 docstring 的"分两层"。
     """
 
-    message = await _wrap_tool_call(
+    result = await _wrap_tool_call(
         _tool_request(state, runtime, config),
         _no_direct_execute,
     )
 
-    return {"messages": [message]}
+    update: dict[str, Any] = {"messages": [result.message]}
+
+    # 工具在 Command.update 里直接写状态。这里**不按工具类型过滤**：
+    # 任何工具返回的 Command.update 都按原样并入 state（与原版
+    # LangGraph 一致）。未知键由 LangGraph 按 state schema 处理。
+    if result.command is not None:
+        update.update(command_update(result.command))
+
+    # 非控制器分支只写消息 / 状态，不负责跳转 —— 一个 super-step
+    # 只能有一个 Command 决定下一跳，否则多个工具同时要去的节点都会
+    # 被调度。控制器是**本批第一个调用**，与工具类型无关。
+    # 缺这个键（本次改动之前 checkpoint 下来的 pending task）按控制器
+    # 处理：旧 payload 里没有控制工具，所有分支都会去 agent，同一个
+    # 目标重复出现没有副作用；反过来（当非控制器）会让图没有下一跳。
+    if not state.get("is_controller", True):
+        return update
+
+    if result.command is not None:
+
+        # 原样透传工具的 goto：字符串 / 节点列表 / Send 列表都合法
+        # （与原版 ToolNode 一致）。只有"没有目标"（None / 空 tuple）
+        # 才回默认的 agent —— 本图的 tools 没有静态出边，必须给一个
+        # 下一跳。
+        goto = result.command.goto or AGENT_NODE
+
+        return Command(goto=goto, update=update)
+
+    # 普通工具（或控制工具执行失败）：回到发起这次调用的节点。
+    # 主 agent 是 "agent"；planner 的工具循环传 "planner"。
+    return Command(
+        goto=str(state.get("return_to") or AGENT_NODE),
+        update=update,
+    )
+
+
+async def execute_tool_branch(
+        state: Mapping[str, Any],
+        runtime: Runtime[ReactContext],
+        config: RunnableConfig,
+        *,
+        spec: NodeSpec,
+        scope_namespace: UUID,
+) -> _ToolCallResult:
+    """
+    执行**一个**工具分支，供不同图共用。
+
+    `tools_node` 与子图的 `tool_node` 都调它 —— 执行 / 审批 / 记账仍然
+    只走 `ToolExecutor` + processor chain，这里不复制任何一份。
+
+    Parameters
+    ----------
+    spec / scope_namespace
+        观测身份。子图传自己的 `tool_node` spec 与分支 scope 命名空间，
+        于是 worker 的工具行不会与主图的 `tools` 扇出撞在一起。
+
+    ⚠️ state 必须是**分支 payload**（含 `call` / `tool_keys`），不是完整
+    图 state —— `_tool_request` 按 ToolNode 规范把它原样交给
+    `ToolRuntime.state`。
+    """
+
+    return await _wrap_tool_call(
+        _tool_request(state, runtime, config),
+        _no_direct_execute,
+        span_kwargs=_branch_span_kwargs(
+            state, spec=spec, scope_namespace=scope_namespace,
+        ),
+    )
+
+
+def command_update(command: Command) -> dict[str, Any]:
+    """
+    `Command.update` -> state 更新。
+
+    **原样返回**，不按工具类型过滤 —— 与原版 LangGraph 的
+    `ToolNode` 一致：工具在 `Command.update` 里写什么，就按 state
+    schema 合并什么。计划工具额外带的 `plan_transition` / `message` /
+    `reason` 也在其中；`ReactState` 没有声明它们时由 LangGraph 丢弃。
+    """
+
+    if not isinstance(command.update, Mapping):
+        return {}
+
+    return {str(key): value for key, value in command.update.items()}
+
+
+#: 兼容旧名字：既有测试与调用方按 `_command_update` 引用它。实现只有
+#: 一份（见 `command_update`）。
+_command_update = command_update
 
 
 async def _wrap_tool_call(
         request: ToolCallRequest,
         execute: DirectToolCall,
-) -> ToolMessage:
+        *,
+        span_kwargs: dict[str, Any] | None = None,
+) -> _ToolCallResult:
     """
     一次工具调用的**全部**逻辑 —— 校验允许集、驱动处理器链、记观测。
 
-    签名就是 langgraph `ToolNode` 的 `awrap_tool_call`（见模块 docstring
-    的"分两层"）。观测的 `node_span` 也在这里：它是逐分支的，而本 hook
-    一次只服务一个调用，位置正好。
+    入参与 langgraph `ToolNode` 的 `awrap_tool_call` 同形，但返回
+    `_ToolCallResult`（ToolMessage + 可选的 Command）—— 计划工具需要
+    把 `Command.goto` 带到节点外，单返回 ToolMessage 表达不了。
+
+    观测的 `node_span` 也在这里：它是逐分支的，而本 hook 一次只服务
+    一个调用，位置正好。
 
     ⚠️ `execute` **从不被调用**
     -------------------------
@@ -792,9 +737,8 @@ async def _wrap_tool_call(
     执行它就绕过了处理器链，而审批、脱敏、缓存、鉴权全挂在链上。
     真正的执行走 `ToolExecutor.execute(...)`。
 
-    参数留着是为了**签名对齐**：将来把它交给预构建的 `ToolNode` 时，
-    那里传进来的 `execute` 会是真的执行入口，届时把下面那句
-    `get_tool_executor().execute(...)` 换成调它即可。
+    参数保留是为了让"换成预构建 ToolNode"时形状不用大改；届时把
+    下面那句 `get_tool_executor().execute(...)` 换成调它即可。
     """
 
     state = request.state if isinstance(request.state, dict) else {}
@@ -806,7 +750,11 @@ async def _wrap_tool_call(
 
     async with node_span(
             request.runtime,
-            **_branch_span_kwargs(state),
+            **(
+                span_kwargs
+                if span_kwargs is not None
+                else _branch_span_kwargs(state)
+            ),
             input_summary={"requested": requested},
     ) as span:
 
@@ -836,6 +784,16 @@ async def _wrap_tool_call(
         # 那样模型能成功调用的名字就变成 {安全名} ∪ {tool_key}，而
         # tool_key 从没发给它 —— 表面上还是过了允许集，实际上放宽了。
         tool_key = tool_key_of(requested, allowed)
+        event_name = tool_key or requested
+
+        # 前端需要看到工具开始/结束。见 _publish_tool_event 的说明：
+        # 写自定义流，由 RunEventProjector 统一投影。
+        _publish_tool_event(
+            RunEventType.TOOL_CALLED,
+            tool_call_id=tool_call_id,
+            tool_name=event_name,
+            input=arguments,
+        )
 
         if tool_key is None:
 
@@ -853,9 +811,26 @@ async def _wrap_tool_call(
                 "status": "error",
             })
 
-            return _unexposed_message(tool_call_id, requested)
+            _publish_tool_event(
+                RunEventType.TOOL_COMPLETED,
+                tool_call_id=tool_call_id,
+                tool_name=event_name,
+                error=f"工具 {requested!r} 不在本次暴露的工具集合中",
+            )
 
-        tool_ids = await _resolve_tool_ids([tool_key])
+            return _ToolCallResult(
+                message=_unexposed_message(tool_call_id, requested)
+            )
+
+        command: Command | None = None
+
+        if tool_key in _CHAINLESS_TOOL_KEYS:
+            # 控制 / HITL 工具是进程内的，没有库里的处理器链，也不该被
+            # 审批 / 缓存 / 重试包住。`tool_id=None` 在 ToolExecutor 里
+            # 表示"空链、直接执行工具本体"。
+            tool_ids: dict[str, Any] | None = {}
+        else:
+            tool_ids = await _resolve_tool_ids([tool_key])
 
         if tool_ids is None:
             # 查不到链就别执行（见 _resolve_tool_ids 的说明）。
@@ -867,43 +842,51 @@ async def _wrap_tool_call(
             )
             bucket = "failed"
             unavailable = True
-            already_executed = False
-            ledger_unavailable = False
             message = _outcome_message(
                 tool_call_id, tool_key, outcome
             )
         else:
 
-            (
-                message,
-                bucket,
-                unavailable,
-                already_executed,
-                ledger_unavailable,
-            ) = await _execute_with_ledger(
+            outcome = await _execute_tool(
                 request,
                 tool_key,
                 tool_ids,
                 arguments,
                 tool_call_id,
             )
+            bucket = _bucket(outcome)
+            unavailable = False
+            message = _outcome_message(
+                tool_call_id, tool_key, outcome
+            )
+
+            if isinstance(outcome.value, Command):
+                command = outcome.value
+
+        _publish_tool_event(
+            RunEventType.TOOL_COMPLETED,
+            tool_call_id=tool_call_id,
+            tool_name=event_name,
+            **_tool_event_result(outcome),
+        )
 
         span.set_metrics(
             _metrics(
                 bucket,
                 allowed=True,
                 unavailable=unavailable,
-                already_executed=already_executed,
-                ledger_unavailable=ledger_unavailable,
             )
         )
         span.set_output_summary({
             "tool_key": tool_key,
             "tool_call_id": str(tool_call_id or ""),
             "status": message.status,
+            # 工具自带的跳转目标（没有就是空串）—— 观测里能直接看出
+            # "这次调用把图带去了哪"。
+            "handoff": str(command.goto) if command is not None else "",
         })
 
-        return message
+        return _ToolCallResult(message=message, command=command)
 
 
 def _tool_caller(context: Any) -> ToolCaller:
@@ -948,197 +931,44 @@ def _tool_caller(context: Any) -> ToolCaller:
     )
 
 
-async def _execute_with_ledger(
+async def _execute_tool(
         request: ToolCallRequest,
         tool_key: str,
         tool_ids: dict[str, Any],
         arguments: Any,
         tool_call_id: Any,
-) -> tuple[ToolMessage, str, bool, bool, bool]:
+) -> ToolOutcome:
     """
-    走执行账本地执行一次工具。
+    驱动执行器跑一次工具。
 
-    返回 `(ToolMessage, bucket, catalog_unavailable, already_executed,
-    ledger_unavailable)`。
+    账本（守卫）不再在这里：它是链上的 AROUND 处理器，由
+    ToolExecutor 在 compile_chain 时包住工具调用。中断 / 取消 /
+    拒绝的记账也在守卫里 —— 本节点只管把结果翻成 ToolMessage。
 
-    顺序是**固定的四步**，每一步的位置都有理由：
-
-        1. 取身份      拿不到就不执行（fixture 之外的正常装配下必有）
-        2. claim       独立事务、**在 execute 之前提交**
-        3. execute     抢到了才跑
-        4. settle      按结果落终态
-
-    ⚠️ 2 与 3 之间必须真的提交
-    -------------------------
-    claim 写在工具那个事务里的话，工具一回滚记录跟着回滚 ——
-    而"副作用到底发生过没有"恰恰要在那一刻还查得到。这与
-    `_resolve_tool_ids` 为什么单独开一段 scope 是同一件事。
-
-    ⚠️ 为什么"已经有记录"回的是 error 而不是成功
-    -----------------------------------------
-    因为工具**确实一次都没跑**。把"已执行过"说成一次成功，会让模型
-    基于一个不存在于本次运行的结果继续编 —— 见模块 docstring 里
-    "为什么不返回一条假的 ToolMessage"。
+    ⚠️ 调用者身份仍在执行之前放进 ContextVar：工具的入参 schema 是
+    给模型看的，`user_id` 绝不能走那里（模型能填一个别人的 id）。
     """
 
-    try:
-        session_id, run_id = _ledger_identity(request)
-
-        claimed = await _claim_execution(
-            session_id,
-            run_id,
-            tool_key,
-            arguments if isinstance(arguments, dict) else {},
-        )
-
-    except _LedgerUnavailable as exc:
-
-        # 账本用不了 -> **不执行**。一次没有记录的副作用不可追溯，
-        # 而不可追溯比失败更糟（与"拿不到链就不执行"同一条立场）。
-        logger.warning("执行账本不可用，%s 未执行：%s", tool_key, exc)
-
-        return (
-            _outcome_message(
-                tool_call_id, tool_key, ToolOutcome(error=exc)
-            ),
-            "failed",
-            False,
-            False,
-            True,
-        )
-
-    if claimed is None:
-
-        # 抢不到 = 已经有一行、且状态不可重跑。取回来只为说清是哪种。
-        existing = await _find_execution(
-            session_id,
-            run_id,
-            tool_key,
-            arguments if isinstance(arguments, dict) else {},
-        )
-
-        logger.warning(
-            "工具 %s 的这次调用（相同参数）已有执行记录"
-            "（status=%s），未重复执行。",
-            tool_key,
-            existing.status.value if existing is not None else "?",
-        )
-
-        return (
-            _recorded_message(tool_call_id, tool_key, existing),
-            "denied",
-            False,
-            True,
-            False,
-        )
-
-    # ⚠️ 身份在**执行之前**放进进程内的调用者上下文
-    # -------------------------------------------
-    # 见 app/common/tool_caller.py：工具的入参 schema 是给**模型**看的，
-    # `user_id` 绝不能走那里（模型能填一个别人的 id）。所以需要身份的服务
-    # 方法从那边读，而不是从自己的参数里拿。
-    #
-    # 写入点只有这一处 —— 工具执行只有这一条链。
     caller = _tool_caller(request.runtime.context)
 
-    try:
-        with tool_caller_scope(caller):
-            outcome = await get_tool_executor().execute(
-                tool_key,
-                arguments if isinstance(arguments, dict) else {},
-                tool_id=tool_ids.get(tool_key),
-                tool_call_id=(
-                    str(tool_call_id) if tool_call_id else None
-                ),
-                # 调用者身份：从**每次运行**的 context 取（它由派发方
-                # 交进来），不是从 state —— 分支读不到父状态，而身份在
-                # 一次运行里也不变，放这里比放 state 干净（见
-                # context.py 的说明）。它最终进 invocation.context，
-                # 供工具级的鉴权处理器判权。
-                #
-                # ⚠️ 与上面那个 caller **不是同一件事**：这份快照是给
-                # 工具级鉴权用的（它要 groups / roles 判权），而
-                # `ToolCaller` 只带 user_id 与会话，给"要搜谁的数据"
-                # 那种需要。两者同源（都出自 ReactContext），但消费者
-                # 不同 —— 别把前者删了以为后者能替。
-                caller_identity=getattr(
-                    request.runtime.context, "caller_identity", None
-                ),
-                # ⚠️ 真的 `ToolRuntime` —— 审批拦截器靠它拿
-                # `tool_call_id` / `config.configurable.thread_id` /
-                # `store`（见 processor/interceptor/approval.py 的
-                # `_identifiers` 与 `_ledger`）。传 None 会让整条审批
-                # 退化成 fail-closed 的"通道不可用"分支。
-                runtime=request.runtime,
-            )
-
-    except GraphInterrupt:
-
-        # 审批中断。**工具没有执行**（审批是 BEFORE），所以这一行
-        # 要记成 INTERRUPT —— 而它必须是可重跑的，否则 resume 时
-        # claim 会撞上这一行、把审批通过的工具永久挡住。
-        #
-        # ⚠️ 原样抛回：langgraph 靠这个异常暂停图，吞掉它等于把审批
-        # 变成静默的放行。实测抓了再抛不会破坏中断机制。
-        await _settle_execution(
-            claimed.execution_id,
-            status=ToolExecutionStatus.INTERRUPT,
+    with tool_caller_scope(caller):
+        return await get_tool_executor().execute(
+            tool_key,
+            arguments if isinstance(arguments, dict) else {},
+            tool_id=tool_ids.get(tool_key),
+            tool_call_id=(
+                str(tool_call_id) if tool_call_id else None
+            ),
+            caller_identity=getattr(
+                request.runtime.context, "caller_identity", None
+            ),
+            # 真的 `ToolRuntime` —— 审批拦截器靠它拿
+            # `tool_call_id` / `config.configurable.thread_id` /
+            # `store`（见 processor/interceptor/approval.py 的
+            # `_identifiers` 与 `_ledger`）。传 None 会让整条审批
+            # 退化成 fail-closed 的"通道不可用"分支。
+            runtime=request.runtime,
         )
-
-        raise
-
-    except asyncio.CancelledError as exc:
-
-        # 取消。与 tool_executor 的处理一致：取消不是"工具失败了",
-        # 它继续往上抛（见那里的模块 docstring）。这里只留痕。
-        # 工具未跑到（取消发生在链上任意位置，可能已经跑过 —— 说不准
-        # 就是 RUNNING 的语义，但取消的常规路径是"还没执行"）。
-        await _settle_execution(
-            claimed.execution_id,
-            status=ToolExecutionStatus.CANCELLED,
-            error_exc=exc,
-        )
-
-        raise
-
-    # ---- 分类落终态 --------------------------------------------------
-    #
-    # ⚠️ 没有 FAILED 这一支：它背着"确认无副作用"这个承诺，而我们
-    # 判不出它是否成立（工具可能已经产生外部副作用 —— 下单走外部
-    # 接口那类不在 factory.scope 的事务里，回滚不了）。因此未分类的
-    # 失败一律落 RUNNING（不确定），而**不是** FAILED —— 后者会错误地
-    # 许可重试一个有副作用的操作。见 enum 的说明。
-    if outcome.ok:
-
-        await _settle_execution(
-            claimed.execution_id,
-            status=ToolExecutionStatus.SUCCESS,
-            result=_ledger_result(outcome.value),
-        )
-
-    elif isinstance(outcome.error, ToolCallDenied):
-
-        await _settle_execution(
-            claimed.execution_id,
-            status=ToolExecutionStatus.REJECTED,
-            error_exc=outcome.error,
-        )
-
-    else:
-
-        await _settle_execution(
-            claimed.execution_id,
-            status=ToolExecutionStatus.RUNNING,
-            error_exc=outcome.error,
-        )
-
-    return (
-        _outcome_message(tool_call_id, tool_key, outcome),
-        _bucket(outcome),
-        False,
-        False,
-        False,
-    )
 
 
 def _tool_request(
@@ -1252,8 +1082,6 @@ def _metrics(
         *,
         allowed: bool,
         unavailable: bool = False,
-        already_executed: bool = False,
-        ledger_unavailable: bool = False,
 ) -> dict[str, Any]:
     """
     本分支的指标。见模块 docstring 的"指标是逐分支的"。
@@ -1261,15 +1089,13 @@ def _metrics(
     键名是**稳定的**（观测面板按它取值），因此这里用固定集合而不是
     直接把桶名铺开 —— 后者会让"某个键今天没有"变成"这个指标消失了"。
 
-    两个新增的键（执行账本）：
+    ⚠️ 执行账本相关的两个键已经移除：
+        already_executed / ledger_unavailable
 
-        already_executed    这次调用撞上了同键的已有记录、没重复执行。
-                            **它上升说明模型在同一轮里反复要求同一件事**，
-                            或者用户在重复提交同一个操作 —— 是个业务信号，
-                            不是噪音。
-        ledger_unavailable  这个分支遇到了"账本不可用"，因此没执行工具。
-                            与 catalog_unavailable 同性质：求和得到的是
-                            "有多少分支遇到"，**不是**"账本是不是不可用"。
+    它们属于守卫（processor/interceptor/execution_guard.py）的判定，
+    不再由本节点产生。新守卫把
+    `execution_guard.decision` / `execution_guard.status` 写进
+    `ToolInvocation.context`，观测面板应改从那里取值。
     """
 
     return {
@@ -1280,6 +1106,4 @@ def _metrics(
         "failed": 1 if bucket == "failed" else 0,
         "unexposed": 1 if bucket == "unexposed" else 0,
         "catalog_unavailable": unavailable,
-        "already_executed": already_executed,
-        "ledger_unavailable": ledger_unavailable,
     }

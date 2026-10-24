@@ -48,9 +48,11 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
+    "CapabilityResolver",
     "KnowledgeSource",
     "MemorySource",
     "ProfileSource",
+    "SkillSource",
     "ToolExposureSource",
 ]
 
@@ -102,6 +104,27 @@ class KnowledgeSource(Protocol):
             conversation_id: str | None,
             limit: int,
     ) -> Sequence[Mapping[str, Any]]:
+        ...
+
+
+@runtime_checkable
+class SkillSource(Protocol):
+    """按 skill_key 取一次执行用的 SkillSnapshot。
+
+    它是 ContextBuilder 与 Skill 模块之间的边界：处理器只拿快照，不认识
+    SkillService / 数据库。拿不到（未注册 / 非 ACTIVE）返回 None，由
+    SkillLoader 决定是否降级为通用任务提示词。
+    """
+
+    async def load(self, skill_key: str) -> Any:
+        ...
+
+
+@runtime_checkable
+class CapabilityResolver(Protocol):
+    """能力 code -> 本次可 bind 的 tool_key。"""
+
+    async def tool_keys(self, codes: Sequence[str]) -> Sequence[str]:
         ...
 
 

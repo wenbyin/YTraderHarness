@@ -195,6 +195,13 @@ paths:
         by default, and the error says how many tools are using it.
         Pass force=true to confirm and unlink them.
 
+        Deleting a node that is still bound to one or more Skills is
+        **always refused**, and force does not override it: the
+        skill_capability foreign key is ON DELETE RESTRICT because
+        removing the binding would silently shrink that Skill's tool
+        visibility. Unbind it first via
+        PUT /skills/{skill_id}/capabilities, or deactivate the capability.
+
       parameters:
         - $ref: '#/components/parameters/CapabilityId'
 
@@ -206,7 +213,8 @@ paths:
           description: |
             Confirm deletion when the capability is still referenced
             by tools; those links are removed as well. Has no effect on
-            the children check, which force cannot override.
+            the children check or on Skill bindings — neither can be
+            overridden by force.
 
       responses:
         '204':

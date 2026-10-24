@@ -67,6 +67,16 @@ class CreateRunRequest(APIModel):
         ),
     )
 
+    trace_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description=(
+            "客户端传入的 Trace 聚合键。**传了才开启 Trace**："
+            "为空时一条 trace 事件都不写（连 Redis 键都不产生）。"
+            "它可以跨 run / session 使用，因此事件里另带 run_id。"
+        ),
+    )
+
 
 class ResumeAnswer(APIModel):
     """对**一次**中断的回答。"""
@@ -154,5 +164,13 @@ class Run(APIModel):
         description=(
             "queued / running / waiting_input / completed / failed / "
             "cancelled。"
+        ),
+    )
+
+    trace_id: str | None = Field(
+        default=None,
+        description=(
+            "建运行时传入的 Trace 聚合键。为空表示这次运行没有开启 Trace。"
+            "客户端自己传过的值，回显不引入新的信息。"
         ),
     )

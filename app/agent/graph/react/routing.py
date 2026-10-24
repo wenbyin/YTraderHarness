@@ -1,12 +1,20 @@
 """
 走向判断：builder 之后去哪、agent 之后去哪。
 
-单独一个模块，理由与 document/pipeline/fanout.py 相同：它是**纯函数**
-—— 只看 state，不碰 runtime、不碰数据库、不建图。因此能脱离图单独测
-（喂一个 state 进去，断言返回哪个分支），而图里的条件边只能整张图跑。
+单独一个模块，理由与 document/pipeline/fanout.py 相同：它基本是**纯函数**
+—— 只看 state、不碰数据库、不建图。因此能脱离图单独测（喂一个 state
+进去，断言返回哪个分支），而图里的条件边只能整张图跑。
+
+⚠️ 唯一的例外：`route_after_agent` 会发 trace 的 `fanout.*` / `graph.transition`
+------------------------------------------------------------------------------
+这些事件需要"这次 agent 执行的 task_id"和真实的 Send 分支清单 —— 两者
+只有路由函数知道。它因此声明了 `runtime` 参数（langgraph 的 RunnableCallable
+会注入），并用 `get_stream_writer()` 写 custom stream。trace 未开启时
+直接返回，不产生任何副作用。
 
     route_after_builder   Agent Builder 判出的执行方案 -> agent / planner
-    route_after_agent     模型**有没有要求调工具** -> 一批 Send（一调用一分支）/ END
+    route_after_agent     模型**有没有要求调工具** -> 一批 Send（一调用一分支）
+                          / task_listener（还有任务）/ END
 
 ⚠️ ReactState 必须是**运行时** import，不能放进 TYPE_CHECKING
 ------------------------------------------------------------
@@ -45,18 +53,38 @@ LangGraph 在 `add_conditional_edges` 时会对这些路由函数调
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import Any
 
 from langchain_core.messages import AIMessage
+from langgraph.config import get_stream_writer
 from langgraph.graph import END
+from langgraph.runtime import Runtime
 from langgraph.types import Send
 
-from app.agent.state import ExecutionPlan
+from app.common.event import EventType, SpanKind, SpanStatus, TraceEmitter
+from app.common.event.trace_emitter import stable_span_id, tool_span_id
+from app.infra.graph import execution_ids
 
+from .context import ReactContext
+from .plan_state import (
+    PLAN_ACTIVE,
+    PLAN_OFF,
+    plan_needs_replan,
+)
 from .state import ReactState
 
-__all__ = ["route_after_agent", "route_after_builder"]
+__all__ = [
+    "STOP_AFTER_PLANNER_ENV",
+    "STOP_AFTER_PUBLISH_ENV",
+    "TASK_LISTENER_NODE",
+    "call_scope",
+    "resolve_tool_keys",
+    "route_after_agent",
+    "route_after_builder",
+    "route_after_planner",
+]
 
 
 #: 要调工具时去的节点，必须是 catalog.NODE_SPECS 里的 node_id。
@@ -65,41 +93,215 @@ TOOLS_NODE = "tools"
 #: 主循环节点。
 AGENT_NODE = "agent"
 
-#: 规划节点（占位，见 planner_node.py）。
+#: 规划节点（编译子图，见 app/agent/graph/planner/）。
 PLANNER_NODE = "planner"
 
+#: 任务领取 / 完成节点。
+TASK_LISTENER_NODE = "task_listener"
 
-def route_after_builder(state: ReactState) -> str:
+
+def _route_for_plan(state: ReactState) -> str:
     """
-    Agent Builder 判出的执行方案 -> 去哪。
+    `plan_status` + 计划任务状态 -> 去 planner 还是 agent。
 
-        plan            -> planner（先规划再执行）
-        其余（含 other）-> agent（正常主循环）
+    这是本图**唯一**的"该不该重新规划"判据，builder 之后与 tools 之后
+    共用同一份实现：
 
-    ⚠️ 为什么 `direct` 与 `react` 走同一个节点
+        非 plan 模式                     -> agent
+        plan，且没有任务 / 任务全完成    -> planner（生成新计划）
+        plan，且还有任务未完成           -> agent（继续执行）
+
+    ⚠️ 不再看 `classification.execution_plan`
     ---------------------------------------
-    两者的差别是"这次要不要给模型工具"，那是 `exposed_tools` 的产生
-    路径（能力选择）该管的事，不是节点二选一。本图里 agent 节点既可能
-    直接答复、也可能要求调工具（它自己按有没有 tool_calls 决定，见
-    route_after_agent）—— 所以 `direct` 与 `react` 在**拓扑上**没有
-    分岔点。真要把 direct 做成"不带工具"，改的是能力选择那一步。
-
-    ⚠️ 没有分类结果 / 降级 / 判不出来，一律走 agent
-    ---------------------------------------------
-    那就是这次改动之前的行为。分类失败不该让对话走一条从没跑过的路。
+    分类只负责**提议**进入计划模式（builder 把它结算成 plan_status）。
+    如果这里再读一次 classification，就出现两个判定源：分类说 plan、
+    state 说 off 时，"路由把 agent 送去 planner 但状态没变"这种中间态
+    又回来了。权威来源只有一个：`plan_status`。
     """
 
-    classification = state.get("classification") or {}
+    if state.get("plan_status") != PLAN_ACTIVE:
+        return AGENT_NODE
 
-    plan = classification.get("execution_plan")
-
-    if plan == ExecutionPlan.PLAN.value:
+    if plan_needs_replan(state.get("plan")):
         return PLANNER_NODE
 
     return AGENT_NODE
 
 
-def _tool_keys(state: ReactState) -> list[str]:
+#: 临时开关：planner 产出计划后**直接结束本轮**，便于只检查计划 / 不再
+#: 往下执行。默认 **关**（1 = 停，0 = 继续）。
+#:
+#: 历史名字是 `YTRADER_PLAN_STOP_AFTER_PUBLISH`（当时 planner 还负责发布
+#: 任务板）。现在发布已经移到 `create_team`，名字保留兼容；新名字更准确：
+#:
+#:     YTRADER_PLAN_STOP_AFTER_PLANNER=1
+#:
+#: ⚠️ 这是开发期开关，不是产品配置。接上 team_decision / worker 派发后
+#: 应当删掉它，由决策节点决定下一跳。
+STOP_AFTER_PLANNER_ENV = "YTRADER_PLAN_STOP_AFTER_PLANNER"
+
+#: 兼容旧名字。
+STOP_AFTER_PUBLISH_ENV = "YTRADER_PLAN_STOP_AFTER_PUBLISH"
+
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+
+def route_after_planner(state: ReactState) -> str:
+    """
+    planner 之后去哪。
+
+        默认            -> task_listener（继续执行）
+        开关置 1        -> END（只出计划，便于检查）
+
+    默认必须继续：planner 已经不发布任务板，停在 END 会得到一次
+    「completed 但没有任何 assistant 回复」的运行 —— 前端看起来像卡死。
+
+    继续时仍然走 `task_listener`，而不是直接 `agent`：listener 负责
+    领取第一个 ready task 并把任务指令写进 messages，这一步不能省。
+    """
+
+    raw = os.environ.get(STOP_AFTER_PLANNER_ENV)
+
+    if raw is None:
+        raw = os.environ.get(STOP_AFTER_PUBLISH_ENV, "0")
+
+    stop = str(raw).strip().lower() not in _FALSY
+
+    return END if stop else TASK_LISTENER_NODE
+
+
+def _tool_sends(
+        state: ReactState,
+        message: AIMessage,
+        *,
+        plan_origin: str,
+        return_to: str = AGENT_NODE,
+) -> list[Send]:
+    """
+    一条 AIMessage 里的全部 tool_call -> 一批 `Send(TOOLS_NODE, payload)`。
+
+    builder 与 agent 共用：分类器合成的 enter 调用和模型自己的调用因此
+    走**完全相同的**执行路径（tools 扇出 -> 工具执行 -> Command.goto）。
+
+    空列表是**禁止**的：LangGraph 对空 destinations 不报错，而是让这次
+    运行静默结束。调用方必须先确认 `message.tool_calls` 非空。
+    """
+
+    calls = list(message.tool_calls)
+
+    if not calls:
+        raise ValueError(
+            "_tool_sends 收到一条没有 tool_calls 的 AIMessage —— "
+            "调用方必须先判空（空 Send 会让整次运行静默结束）。"
+        )
+
+    tool_keys = resolve_tool_keys(state)
+    plan_status = str(state.get("plan_status") or PLAN_OFF)
+    plan = state.get("plan") or {}
+
+    # 控制工具（create_team）要读完整任务列表：判有无待完成任务、查依赖环、
+    # 发布任务板。普通工具用不到它，但 Send 的 payload 形状是统一的。
+    #
+    # ⚠️ 这是**临时方案**：payload 随 pending task 进 checkpoint，N 个工具
+    # 分支就会有 N 份 tasks。等对齐官方 ToolRuntime.state（用 CONFIG_KEY_READ
+    # 从 channels 水合）之后，这里可以去掉，见 tools.py 的 TODO。
+    raw_tasks = state.get("tasks")
+    tasks = (
+        list(raw_tasks)
+        if isinstance(raw_tasks, (list, tuple))
+        else []
+    )
+
+    # 一个 super-step 只能有一个分支决定下一跳：**第一个调用**是
+    # 控制器。这与具体工具无关 —— 任何工具返回 Command 都能通过它
+    # 控制下一跳（不是只有计划工具）。
+    #
+    # ⚠️ 扇出的固有限制：同一批多个工具时，只有第一个工具的 Command
+    # 会被采用。原版 ToolNode 在一个节点里执行全部调用，可以同时
+    # 返回多个 Command；本图是一调用一分支，要完全对齐需要再加一个
+    # 汇总屏障 —— 那是独立改动。
+    return [
+        Send(
+            TOOLS_NODE,
+            {
+                "call": call,
+                "tool_keys": tool_keys,
+                "call_scope": call_scope(message, index, call),
+                # 分支读不到父状态：控制工具要靠这几个值判断是不是
+                # 一次真正的模式切换（enter 在 plan 模式下是幂等的）。
+                "plan_status": plan_status,
+                "plan_origin": plan_origin,
+                "plan": plan,
+                "tasks": tasks,
+                # 普通工具（含 ask_user_question）执行完回到哪：
+                # 主 agent -> "agent"；planner 自己的工具循环 -> "planner"。
+                "return_to": return_to,
+                "is_controller": index == 0,
+            },
+        )
+        for index, call in enumerate(calls)
+    ]
+
+
+def route_after_builder(state: ReactState) -> str | list[Send]:
+    """
+    builder 之后去哪。
+
+        最后一条是合成工具调用（分类判定要规划）-> Send 到 tools
+        off                                      -> agent（正常主循环）
+        plan，没有任务 / 任务全完成              -> planner（先规划再执行）
+        plan，还有任务未完成                     -> agent（继续执行当前计划）
+
+    `react` / `other` 在**拓扑上**没有分岔点：它们都回 agent，差别只在
+    能力选择与 `exposed_tools`（见 agent_builder_node 的模块 docstring）。
+
+    ⚠️ 分类器与模型走的是**同一条**进入路径
+    -----------------------------------
+    分类判定要规划时，builder 合成一条 `enter_plan_mode` 的 AIMessage
+    （不是直接写 state）。这里把它 Send 到 tools —— 与模型自己调用
+    控制工具完全同一条路。工具返回 `Command(goto="planner")`，tools
+    节点写状态并把它交给 LangGraph。
+
+    resume 不会重跑 builder；checkpoint 里的 plan_status 因此是模式
+    在中断后仍然成立的依据。
+    """
+
+    messages = state.get("messages") or ()
+
+    if messages and isinstance(messages[-1], AIMessage) and messages[-1].tool_calls:
+
+        last = messages[-1]
+        extra = getattr(last, "additional_kwargs", None) or {}
+        origin = str(extra.get("plan_origin") or "tool")
+
+        return _tool_sends(state, last, plan_origin=origin)
+
+    return _route_for_plan(state)
+
+
+def resolve_tool_keys(state: Mapping[str, Any]) -> list[str]:
+    """
+    本次暴露的工具 key。
+
+    task 模式下优先用 SkillLoader 写回的 `task_tool_keys`：模型看到的
+    是 skill 的工具，路由与 tools 节点必须用同一个集合，否则会把模型
+    刚调用的工具判成“未暴露”。
+    """
+
+    if state.get("current_task"):
+        task_keys = state.get("task_tool_keys")
+
+        if isinstance(task_keys, (list, tuple)):
+            return [str(item) for item in task_keys]
+
+    return _normal_tool_keys(state)
+
+
+#: 兼容旧名字：既有测试按 `_tool_keys` 引用它。实现只有一份。
+_tool_keys = resolve_tool_keys
+
+
+def _normal_tool_keys(state: Mapping[str, Any]) -> list[str]:
     """
     本次暴露的工具 key（Agent Builder 写进 `context_policy` 的输入）。
 
@@ -122,7 +324,7 @@ def _tool_keys(state: ReactState) -> list[str]:
     return [str(item) for item in raw]
 
 
-def _call_scope(
+def call_scope(
         message: AIMessage,
         index: int,
         call: Mapping[str, Any],
@@ -156,9 +358,12 @@ def _call_scope(
     return f"{message.id}:{call_id or index}"
 
 
-def route_after_agent(state: ReactState) -> str | list[Send]:
+def route_after_agent(
+        state: ReactState,
+        runtime: Runtime[ReactContext],
+) -> str | list[Send]:
     """
-    模型要求调工具就继续，否则收尾。
+    模型要求调工具就继续；否则有任务回 task_listener，没任务才收尾。
 
     ⚠️ 只看 `tool_calls`，**不看 `invalid_tool_calls`**
     --------------------------------------------------
@@ -204,18 +409,132 @@ def route_after_agent(state: ReactState) -> str | list[Send]:
     last = messages[-1]
 
     if not (isinstance(last, AIMessage) and last.tool_calls):
+        # 还有任务（或还有未清掉的 current_task）就回 listener：
+        # listener 负责把刚执行完的任务落终态、清 current_task，再领取
+        # 下一个。两者都没有才 END。
+        if state.get("tasks") or state.get("current_task"):
+            return TASK_LISTENER_NODE
+
         return END
 
-    tool_keys = _tool_keys(state)
+    calls = list(last.tool_calls)
 
-    return [
-        Send(
-            TOOLS_NODE,
-            {
-                "call": call,
-                "tool_keys": tool_keys,
-                "call_scope": _call_scope(last, index, call),
-            },
+    # Trace：fanout + 真实的 agent -> tools 控制流。
+    #
+    # 这里是唯一**可靠**知道"这批 Send 是谁、什么时候派出去的"的地方：
+    # 分支函数作为 agent 节点的 writer 执行，`runtime` 由 langgraph 注入，
+    # 因此拿得到本次 agent 执行的 task_id（= 投影层 node.* 的 span_id）。
+    # 事件走 get_stream_writer()（提示词第 5 节的图内通道）。
+    _emit_fanout_trace(runtime, last, calls)
+
+    # enter / exit 也是普通工具：照常扇出执行，由 tools 节点结算状态。
+    # 模型主动调用的来源永远是 "tool"；分类器合成的那条走
+    # route_after_builder，plan_origin 由合成消息携带。
+    return _tool_sends(state, last, plan_origin="tool")
+
+
+def _emit_fanout_trace(
+        runtime: Runtime[ReactContext],
+        last: AIMessage,
+        calls: list[Any],
+) -> None:
+    """
+    从路由函数发出 fanout.* / graph.transition。
+
+    ⚠️ 确定性 ID
+    ------------
+    路由函数在 resume / replay 时可能被重新求值。span_id 与 event_id
+    都由 (trace_id, agent task_id, call_scope) 确定性生成，这样重复
+    求值产生的重复事件能被 event_id 去重，而不是变成两条不同的记录。
+
+    ⚠️ 不写业务 State
+    ----------------
+    分支关系全部在这里算出来并通过 custom stream 发出；Send payload
+    里**没有** trace 字段（提示词第 4 节第 10 条）。
+    """
+
+    context = getattr(runtime, "context", None)
+    trace_id = getattr(context, "trace_id", None)
+
+    if not trace_id:
+        return
+
+    run_id = getattr(context, "pipeline_run_id", None)
+    session_id = getattr(context, "session_id", None)
+
+    ids = execution_ids(runtime)
+    agent_task_id = ids.task_id or (
+        str(run_id) if run_id is not None else "unknown"
+    )
+
+    emitter = TraceEmitter(
+        trace_id=trace_id,
+        run_id=str(run_id) if run_id is not None else "",
+        thread_id=None if session_id is None else str(session_id),
+        writer=get_stream_writer(),
+    )
+
+    fanout_id = stable_span_id("fanout", trace_id, agent_task_id)
+
+    emitter.instant(
+        EventType.FANOUT_STARTED,
+        span_kind=SpanKind.FANOUT,
+        span_name="tool_fanout",
+        span_id=fanout_id,
+        parent_span_id=agent_task_id,
+        status=SpanStatus.RUNNING,
+        payload={
+            "fanout_type": "tool_calls",
+            "dispatch_mode": "parallel",
+            "expected_branch_count": len(calls),
+        },
+        event_id=stable_span_id("event", fanout_id, "started"),
+    )
+
+    for index, call in enumerate(calls):
+        call_id = call.get("id") if isinstance(call, dict) else None
+        branch_scope = call_scope(last, index, call)
+
+        # 分支子 Span —— 与工具执行链里的 tool span 用同一个确定性 id，
+        # 也与投影层从协议推 tool.* 时算出的 id 一致。
+        branch_span_id = (
+            tool_span_id(str(trace_id), str(call_id))
+            if call_id is not None
+            else stable_span_id("tool", trace_id, branch_scope)
         )
-        for index, call in enumerate(last.tool_calls)
-    ]
+
+        emitter.instant(
+            EventType.FANOUT_BRANCH_CREATED,
+            span_kind=SpanKind.FANOUT,
+            span_name="tool_fanout",
+            span_id=fanout_id,
+            parent_span_id=agent_task_id,
+            payload={
+                "branch_id": branch_scope,
+                "branch_span_id": branch_span_id,
+                "branch_index": index,
+                "target_kind": "tool",
+                "target_name": str(call.get("name") or ""),
+            },
+            event_id=stable_span_id(
+                "event", fanout_id, branch_scope, "branch_created"
+            ),
+        )
+
+        emitter.instant(
+            EventType.GRAPH_TRANSITION,
+            span_kind=SpanKind.NODE,
+            span_name="graph.transition",
+            span_id=agent_task_id,
+            payload={
+                "from_span_id": agent_task_id,
+                "to_span_id": branch_span_id,
+                "from_node": AGENT_NODE,
+                "to_node": TOOLS_NODE,
+                "transition_kind": "conditional",
+                "route_key": "tool_calls",
+            },
+            event_id=stable_span_id(
+                "event", fanout_id, branch_scope, "transition"
+            ),
+        )

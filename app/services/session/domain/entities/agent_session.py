@@ -70,8 +70,9 @@ class AgentSession(BaseModel):
         description=(
             "会话归属的用户 ID —— Casdoor 的 sub（app/common/auth），"
             "字符串，与 file.uploaded_by 同一口径。"
-            "所有 session 接口按它过滤：等于当前用户、或为 None"
-            "（加这列之前的存量会话，对谁都可见）才可见。"
+            "按 id 读时按「等于当前用户、或为 None」过滤（None 是加这列"
+            "之前的存量会话，对谁都可见）；列表与删除则是**严格等于**"
+            "当前用户 —— 无主会话不出现在任何人的列表里，也不能被删除。"
         ),
     )
 

@@ -10,7 +10,7 @@ servers:
 
 tags:
   - name: Sessions
-    description: Agent 会话的建立与查询
+    description: Agent 会话的建立、列表、查询与归档
   - name: Runs
     description: Agent 运行
 
@@ -27,6 +27,101 @@ security:
 paths:
 
   /sessions:
+
+    get:
+      summary: List the caller's agent sessions
+      operationId: listSessions
+      tags:
+        - Sessions
+
+      description: |
+        只返回 `user_id` 等于当前调用者的会话。
+
+        ⚠️ 存量会话（`user_id` 为 null）**不在列表里** —— 它们仍可以按 id
+        读、发消息，但“我的会话列表”不属于任何一个人。把无主会话混进每个
+        人的列表会让分页与 total 失去意义。
+
+        默认只列 `active`；软删（DELETE）后的会话要显式传
+        `status=archived` 才看得到。
+
+        排序固定为最后活动时间（`updated_at`）倒序；同一时刻的按
+        `session_id` 倒序，保证翻页稳定。时间区间是闭区间，且参数**必须
+        带时区偏移**（例如 `2026-10-18T00:00:00Z`），否则 400。
+
+      parameters:
+
+        - name: status
+          in: query
+          required: false
+          description: 按状态过滤。不传等价于 active。
+          schema:
+            type: string
+            enum:
+              - active
+              - archived
+            default: active
+
+        - name: agent_id
+          in: query
+          required: false
+          description: 按 Agent 类型精确过滤。
+          schema:
+            type: string
+
+        - name: updated_after
+          in: query
+          required: false
+          description: >-
+            最后活动时间下界（闭区间），如 2026-10-18T00:00:00Z。
+            必须带时区偏移。
+          schema:
+            type: string
+            format: date-time
+
+        - name: updated_before
+          in: query
+          required: false
+          description: >-
+            最后活动时间上界（闭区间），如 2026-10-19T00:00:00Z。
+            必须带时区偏移。
+          schema:
+            type: string
+            format: date-time
+
+        - name: page
+          in: query
+          required: false
+          description: 页码，从 1 开始。
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+
+        - name: page_size
+          in: query
+          required: false
+          description: 每页条数。
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+
+      responses:
+
+        "200":
+          description: 一页会话
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionPage"
+
+        "400":
+          description: >-
+            时间参数不带时区，或 updated_after 晚于 updated_before
+            （-> to_http_error 的 ValueError 分支）。
+
+
     post:
       summary: Create agent session
       operationId: createSession
@@ -78,6 +173,55 @@ paths:
 
         "404":
           description: Session not found
+
+
+    delete:
+      summary: Delete (archive) a session
+      operationId: deleteSession
+      tags:
+        - Sessions
+
+      description: |
+        **软删除**：把会话的 `status` 置为 `archived`，不物理删除行，
+        也不清理 checkpoint / 消息 / 记忆索引。
+
+        只允许删除**本人**的会话：别人的、以及 `user_id` 为 null 的存量
+        公共会话都返回 404（不泄露 id 是否存在）。
+
+        归档前会自动取消该会话所有未结束的运行：
+
+            有进程内任务的 queued / running
+                请求取消（异步受理，不等图真正停下）
+            waiting_input / 无进程内任务的孤儿运行
+                在事务内直接记为 cancelled
+
+        ⚠️ 取消正在执行的运行是**异步**的：204 只表示归档已提交、取消
+        已请求。与 `POST /runs/{run_id}/cancel` 一样，“受理不等于完成”。
+
+        ⚠️ `waiting_input` 的运行被直接记为 cancelled，不会产生
+        `run.failed` 终止事件；挂在事件流上的客户端靠空闲探活发现运行
+        已终态后关流。
+
+        已归档的会话重复 DELETE 是幂等的：返回 204，不推进 `updated_at`。
+
+      parameters:
+
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+
+      responses:
+
+        "204":
+          description: 会话已归档（幂等）
+
+        "404":
+          description: >-
+            会话不存在、不属于当前用户，或它是 `user_id` 为 null 的存量
+            公共会话（三者同一响应）。
 
 
 
@@ -140,6 +284,12 @@ paths:
         "404":
 
           description: Session not found
+
+        "409":
+
+          description: >-
+            会话已归档（archived），不能再开新运行。归档是只读的；
+            archived 的会话不会自动恢复。
 
 
 
@@ -256,12 +406,6 @@ paths:
         "404":
 
           description: 运行不存在，或它所属的会话不属于当前用户。
-
-        "409":
-
-          description: >-
-            这次运行不在 waiting_input。跑完的没什么可恢复，
-            正在跑的还没停下来。
 
         "422":
 
@@ -417,6 +561,34 @@ components:
             "最后活动"，而两者在建会话那一刻是同一个值。
 
 
+    SessionPage:
+
+      type: object
+
+      required:
+
+        - items
+        - total
+
+      properties:
+
+        items:
+
+          type: array
+
+          description: 当前页的会话，按 updated_at 倒序。
+          items:
+            $ref: "#/components/schemas/Session"
+
+        total:
+
+          type: integer
+
+          description: >-
+            满足筛选条件的**总数**（不只是当前页的条数），用于画页码。
+            与 items 在同一个请求事务里查询。
+
+
 
     CreateRunRequest:
 
@@ -468,6 +640,18 @@ components:
           type: object
 
 
+        trace_id:
+
+          type: string
+
+          maxLength: 255
+
+          description: |
+            客户端传入的 Trace 聚合键。**传了才开启 Trace**：为空时
+            一条 trace 事件都不写（连 Redis 键都不产生）。它可以跨
+            run / session 使用，因此事件里另带 run_id。
+
+
 
 
     Run:
@@ -501,6 +685,16 @@ components:
             - completed
             - failed
             - cancelled
+
+
+        trace_id:
+
+          type: string
+
+          nullable: true
+
+          description: |
+            建运行时传入的 Trace 聚合键。为空表示这次运行没有开启 Trace。
 
 
 

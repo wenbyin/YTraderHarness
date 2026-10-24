@@ -96,6 +96,7 @@ from ..domain.tasks import MemorySceneExtractParams
 from ..repository.atom import MemoryAtomRepository
 from ..repository.scene import MemorySceneRepository
 from .memory_scene_service import MemorySceneService
+from .profile_cache import profile_cache_invalidation_hook
 from .trigger import submit_persona_extract, task_id_of
 
 __all__ = [
@@ -394,6 +395,13 @@ class MemorySceneServiceImpl(MemorySceneService):
             f" / 跳过 {report.skipped}，scope={scope.key}，"
             f"场景 {report.total_scenes} 个",
             flush=True,
+        )
+
+        # L2 的写入全部完成（仍在同一事务里）。**提交成功之后**失效
+        # L2 缓存（只失效 L2 —— L3 是独立的键，由它自己的任务负责）——
+        # 提前删会让读者在提交前把旧值写回去。
+        self.post_commit.append(
+            profile_cache_invalidation_hook(scope, "l2")
         )
 
         # ---- 8. 问一次"这个 scope 该不该重生成画像" ------------------

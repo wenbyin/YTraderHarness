@@ -1,0 +1,68 @@
+# ============================================================
+# 部署事实（哪台机器、哪块盘）
+#
+# 这些值描述"东西放在哪"，不描述"这一轮怎么跑"：
+#
+#   不进业务配置区   业务配置会被冻结进 PipelineConfigSnapshot，
+#                    换机器后历史快照还指着旧路径
+#   不进 datasource/ 那个目录只收带顶层 `type` 的数据源
+#   也不写死在代码里 容器与开发机的路径不同
+#
+# 语法与 app/config/datasource/*.yaml 一致：${NAME:-default}
+# 读取器：app/common/app_config.py
+# ============================================================
+
+paths:
+  #: 稠密向量模型目录（512 维）。
+  #:
+  #: ⚠️ 写入期与查询期必须是同一个 —— 换它等于已有向量全部作废，
+  #: 且维度可能还对得上、检索照常返回结果，只是排序没有意义。
+  #: 换模型时还要同时换 embedder 的能力键（见 const.py 的说明）。
+  embedding_model: "${BGE_EMBEDDING_MODEL:-G:/models/bge-small-zh-v1.5}"
+
+  #: 精排模型目录（cross-encoder，bge-reranker-v2-m3）。
+  #: 只服务精排，与上面的向量空间无关，换它不需要重建索引。
+  reranker_model: "${BGE_RERANKER_MODEL:-G:/models/bge-reranker-v2-m3}"
+
+  #: QA 测试数据集的落盘目录（给人看、给外部工具读，需要稳定文件名）。
+  qa_output_dir: "${QA_OUTPUT_DIR:-G:/QA}"
+
+  #: 本地文件存储根目录。
+  #: 相对路径以**进程 CWD** 为基准；容器里建议给绝对路径并挂 volume。
+  file_storage: "${FILE_STORAGE_PATH:-./data/files}"
+
+  #: OpenAPI 规格自检扫描的目录（开发用，见 app/agent/spec_check.py）。
+  spec_dir: "${SPEC_DIR:-app/services/document}"
+
+# ============================================================
+# 模型身份
+# ============================================================
+
+models:
+  embedding:
+    #: 稠密向量维度。
+    #:
+    #: ⚠️ 三处必须同时一致：模型本身、Milvus collection 的 schema、
+    #: 已经写进库的向量。改了它而没重建索引，检索**照常返回结果**，
+    #: 只是排序没有意义 —— 而且**不报错**。
+    #:
+    #: 建 collection 之前就要拿到这个值，所以它是配置而不是运行时探测。
+    dimensions: "${BGE_EMBEDDING_DIMENSIONS:-512}"
+
+# ============================================================
+# Mock 模型服务（开发 / 前端联调）
+# ============================================================
+#
+# 启动：
+#     python run_server.py --mock
+#     python run_server.py --no-mock
+#
+# 也可以设置 MOCK_MODEL_ENABLED=1/0；优先级高于配置文件。
+#
+# ⚠️ 详细参数（端口、TTFT/字数/速率分布、工具调用概率）在
+#    app/config/mock_model.yaml。
+#
+# ⚠️ 这里**刻意不写 mock_model 段**：本文件由 app/common/app_config.py
+#    的 AppConfig 校验，而它是 extra="forbid" 的；新增顶层键会让整份
+#    app.yaml 被拒绝。mock 配置独立成文件，既不动生产配置的校验，
+#    也方便整体删除。生产环境不要打开。

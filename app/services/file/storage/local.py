@@ -48,11 +48,15 @@ from tempfile import NamedTemporaryFile
 from typing import Final
 from uuid import UUID
 
+from app.common.app_config import load_app_config
+
 from ..domain.schemas.file import StoredFile
 from .base import FileStorage
 
 
-DEFAULT_BASE_PATH: Final[str] = "./data/files"
+#: 取值：`app/config/app.yaml` 的 `paths.file_storage`
+#: （环境变量 `FILE_STORAGE_PATH` 可覆盖）。
+DEFAULT_BASE_PATH: Final[str] = load_app_config().paths.file_storage
 DEFAULT_SOURCE_NAME: Final[str] = "source"
 
 #: Windows 扩展长度路径前缀。Path.resolve() 在路径超过 MAX_PATH

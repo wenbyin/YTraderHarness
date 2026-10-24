@@ -1,13 +1,15 @@
 """
 Agent 运行时会话与运行的接口。
 
-对应 session.yaml 的前六个端点：
-    POST /sessions                    建会话
-    GET  /sessions/{session_id}       查会话
-    POST /sessions/{session_id}/runs  建运行
-    GET  /runs/{run_id}/events        事件流（SSE）
-    POST /runs/{run_id}/resume        回答一次人工审批
-    POST /runs/{run_id}/cancel        取消一次正在跑的运行
+对应 session.yaml 的八个端点：
+    GET    /sessions                  列本人的会话
+    POST   /sessions                  建会话
+    GET    /sessions/{session_id}     查会话
+    DELETE /sessions/{session_id}     软删（归档）
+    POST   /sessions/{session_id}/runs  建运行
+    GET    /runs/{run_id}/events      事件流（SSE）
+    POST   /runs/{run_id}/resume      回答一次人工审批
+    POST   /runs/{run_id}/cancel      取消一次正在跑的运行
 
 以及 messages.yaml 的一个端点（**另一份规格**，路由在本文件）：
     GET  /sessions/{session_id}/messages   一页会话历史
@@ -64,9 +66,17 @@ session.yaml 里 createSession 声明的是 "200"。契约先行 —— 规格�
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from datetime import datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    status,
+)
 from fastapi.responses import StreamingResponse
 
 from app.agent.event import (
@@ -74,8 +84,10 @@ from app.agent.event import (
     RunStreamAttachment,
     TooManyRunStreamsError,
     get_run_stream_registry,
+    publish_trace_event,
     sse_frame,
 )
+from app.common.event import EventType, SpanKind
 from app.agent.tools.processor.context import build_caller_context
 from app.common.auth import AuthenticatedUser, current_user
 from app.common.factories import get_service_factory
@@ -98,6 +110,8 @@ from app.services.session.domain.schemas import (
     ResumeRequest,
     Run,
     Session,
+    SessionPage,
+    SessionStatus,
 )
 
 router = APIRouter()
@@ -136,6 +150,80 @@ def _org_id(
     """
 
     return user.org_id or None
+
+
+@router.get(
+    "/sessions",
+    response_model=SessionPage,
+    tags=["Sessions"],
+)
+async def list_sessions(
+        status_: SessionStatus | None = Query(
+            default=SessionStatus.ACTIVE,
+            alias="status",
+            description=(
+                "按状态过滤。默认 active —— 软删（archived）的会话要"
+                "显式指定才出现。"
+            ),
+        ),
+        agent_id: str | None = Query(
+            default=None,
+            max_length=255,
+            description="按 Agent 类型精确过滤。",
+        ),
+        updated_after: datetime | None = Query(
+            default=None,
+            description=(
+                "最后活动时间下界（闭区间）。必须带时区偏移，"
+                "例如 2026-10-18T00:00:00Z。"
+            ),
+        ),
+        updated_before: datetime | None = Query(
+            default=None,
+            description=(
+                "最后活动时间上界（闭区间）。必须带时区偏移，"
+                "例如 2026-10-19T00:00:00Z。"
+            ),
+        ),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+        service: AgentSessionService = Service[AgentSessionService],
+        user: AuthenticatedUser = Depends(current_user),
+):
+    """
+    列当前用户**本人**的会话，按最后活动时间倒序。
+
+    ⚠️ 归属是严格等号，不是按 id 读那套“本人或 NULL”
+    --------------------------------------------
+    `GET /sessions/{id}` 允许读 `user_id` 为 NULL 的存量公共会话，但列表
+    只属于具体的人：无主会话不会出现在任何人的列表里。传的是
+    `user.subject`，**不是** `_owner_id(user)` —— 后者会把空串归一成
+    None，查询就变成了 `IS NULL`，正好把公共会话漏出来。
+
+    ⚠️ 时间参数必须带时区
+    ------------------
+    naive datetime 没有唯一含义（服务器时区？UTC？），而 `updated_at` 是
+    TIMESTAMPTZ。静默补时区会让“差 8 小时”这类问题一直藏到用户发现列表
+    少了数据才暴露，因此服务层直接 400。
+
+    Raises:
+        ValueError: 时间不带时区，或 updated_after 晚于 updated_before
+                    -> 400。
+    """
+
+    try:
+        return await service.list_sessions(
+            user_id=user.subject,
+            status=status_,
+            agent_id=agent_id,
+            updated_after=updated_after,
+            updated_before=updated_before,
+            page=page,
+            page_size=page_size,
+        )
+
+    except ValueError as exc:
+        raise to_http_error(exc) from exc
 
 
 @router.post(
@@ -179,6 +267,54 @@ async def get_session(
 
     try:
         return await service.get_session(
+            session_id,
+            user_id=user.subject,
+        )
+
+    except ValueError as exc:
+        raise to_http_error(exc) from exc
+
+
+@router.delete(
+    "/sessions/{session_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["Sessions"],
+)
+async def delete_session(
+        session_id: UUID,
+        service: AgentSessionService = Service[
+            AgentSessionService
+        ],
+        user: AuthenticatedUser = Depends(current_user),
+):
+    """
+    软删除一个会话：`status -> archived`。
+
+    ⚠️ 是归档，不是物理删除
+    ---------------------
+    行还在，消息、运行、checkpoint、记忆索引都保留；归档后默认列表不再
+    返回它（`?status=archived` 能查到），也不能再开新运行（409）。
+
+    ⚠️ 未终态运行会先被结束
+    --------------------
+    有进程内任务的 queued / running 交给调度器取消（异步受理）；没有任务
+    的（waiting_input、调度器尚未受理的 queued、进程重启后的孤儿）在事务
+    内直接记为 cancelled。取消正在执行的运行**不等它真正停下** —— 与
+    `POST /runs/{run_id}/cancel` 的“受理不等于完成”一致。
+
+    ⚠️ 只允许删除**严格本人**的会话
+    ---------------------------
+    别人的、以及 `user_id` 为 NULL 的存量公共会话都得到 404。这里传
+    `user.subject`，不是 `_owner_id(user)`：后者把空串归一成 None，查询会
+    变成 `IS NULL`，正好让空身份用户删到公共会话。
+
+    Raises:
+        NotFoundError: 会话不存在、不属于当前用户，或是 NULL 存量会话
+                       -> 404。
+    """
+
+    try:
+        await service.delete_session(
             session_id,
             user_id=user.subject,
         )
@@ -427,7 +563,9 @@ async def cancel_run(
         404: {"description": "运行不存在"},
         503: {
             "description": (
-                "事件流不可用：Redis 没起来，或并发订阅的 run 数已达上限"
+                "事件流不可用：Redis 没起来。"
+                "并发订阅达到 max_active_run_streams 时会排队等待，"
+                "不再返回 503。"
             )
         },
     },
@@ -475,8 +613,8 @@ async def stream_run_events(
     Raises:
         NotFoundError: 运行不存在，**或它所属的会话不属于当前用户**
                        -> 404（同一个响应，不泄露后者）。
-        HTTPException: Redis 没起来、或并发订阅的 run 数到上限 -> 503
-                       （而不是给一条永远空着的流）。
+        HTTPException: Redis 没起来 -> 503；并发订阅达到
+                       max_active_run_streams 时等待槽位，不返回 503。
     """
 
     # 1. 运行存在吗？—— 真相在库里，不在 Redis。
@@ -491,7 +629,7 @@ async def stream_run_events(
 
     try:
         async with factory.scope(AgentRunService) as service:
-            await service.get_run(run_id, user_id=user.subject)
+            run = await service.get_run(run_id, user_id=user.subject)
 
     except ValueError as exc:
         raise to_http_error(exc) from exc
@@ -513,20 +651,30 @@ async def stream_run_events(
 
     # 3. 挂上订阅者。
     #
-    # ⚠️ 这一步必须在**返回响应之前**做完（因此 attach 是同步的）：
-    #    上限检查一旦失败要给 503，而 StreamingResponse 一旦开始吐状态行
-    #    就再也改不成 503 了。
+    # ⚠️ 这一步必须在**返回响应之前**做完：一旦 StreamingResponse
+    #    开始吐状态行，就改不了状态码了。
+    #
+    # 并发订阅数达到 max_active_run_streams 时**等待**一个槽位，
+    # 而不是返回 503。等待的是活跃 run 数；同一个 run 的新订阅者
+    # 复用现有流，不占额度。
     try:
-        attachment = registry.attach(
+        attachment = await registry.attach_wait(
             run_id,
             start=request.headers.get("last-event-id") or "0",
         )
 
     except TooManyRunStreamsError as exc:
+        # attach_wait 本身不抛；保留这个分支作为接线保险。
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     return StreamingResponse(
-        _frames(attachment, request=request),
+        _frames(
+            attachment,
+            request=request,
+            run_id=run_id,
+            trace_id=run.trace_id,
+            session_id=run.session_id,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -541,6 +689,9 @@ async def _frames(
         attachment: RunStreamAttachment,
         *,
         request: Request,
+        run_id: UUID | None = None,
+        trace_id: str | None = None,
+        session_id: UUID | None = None,
 ) -> AsyncIterator[str]:
     """
     把广播端给的记录编成 SSE 帧。
@@ -576,7 +727,30 @@ async def _frames(
 
             if item is None:
                 # 阻塞到点了、还没有新记录 —— 发一个注释行当心跳。
+                #
+                # 这里也是**唯一能及时**发现客户端断开的地方（见
+                # run_stream.py 的 _iterate）。发现后按 trace 契约发一条
+                # run.client_disconnected —— 注意它是**每个 SSE 连接**
+                # 一条，不是"这个 run 的最后一个客户端走了"：一条 run 可以
+                # 有多个订阅者，服务端不知道哪个才是"客户端"。
                 if await request.is_disconnected():
+                    if run_id is not None:
+                        await publish_trace_event(
+                            EventType.RUN_CLIENT_DISCONNECTED,
+                            trace_id=trace_id,
+                            run_id=str(run_id),
+                            thread_id=(
+                                None
+                                if session_id is None
+                                else str(session_id)
+                            ),
+                            span_id=str(run_id),
+                            span_kind=SpanKind.RUN,
+                            span_name="run",
+                            payload={
+                                "disconnect_reason": "sse_client_gone"
+                            },
+                        )
                     return
 
                 yield HEARTBEAT

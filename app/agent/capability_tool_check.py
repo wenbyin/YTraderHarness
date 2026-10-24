@@ -27,7 +27,12 @@ from __future__ import annotations
 import asyncio
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
+
+import yaml
+
+from app.common.utils import expand_env
 
 from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
@@ -49,7 +54,23 @@ from app.services.tool.repository.tool_definition_impl import (
     ToolDefinitionRepositoryImpl,
 )
 
-DSN = "postgresql+asyncpg://postgres:123456@localhost:5432/ytrader_agent"
+def _dsn() -> str:
+    """
+    从数据源配置取 DSN。
+
+    以前这里写死了本地口令；DSN 属于部署事实，只应该有一份
+    （`app/config/datasource/postgre.yaml`），并用 `${POSTGRES_DSN}`
+    覆盖。
+    """
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "config" / "datasource" / "postgre.yaml"
+    )
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+    return str(expand_env(raw["config"])["dsn"])
 
 _failures: list[str] = []
 
@@ -95,7 +116,7 @@ async def main() -> int:
 
     import_all_models()
 
-    engine = create_async_engine(DSN)
+    engine = create_async_engine(_dsn())
 
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)

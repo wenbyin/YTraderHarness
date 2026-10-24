@@ -31,6 +31,27 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 
 # ============================================================
+# MCP（外部工具来源）
+# ============================================================
+#
+# 客户端 SDK。⚠️ 必须留在 1.x
+# -------------------------
+# tdx-link-mcp 0.22.0（当前最新）仍使用 mcp 1.x 的
+# `mcp.server.Server.list_tools()`；装 mcp 2.x 时它启动即崩：
+#
+#     AttributeError: 'Server' object has no attribute 'list_tools'
+#
+# 本仓库是 MCP **客户端**，1.30.0 的 ClientSession / stdio_client
+# 已够用。升级 mcp 之前先确认 tdx-link-mcp 已适配 2.x。
+#
+# tdx-link-mcp 本身是**外部 server**，不进这里：它是部署侧依赖，
+# 在 mcp.yaml 里用 command 指向它的可执行文件。没装时 MCP 相关
+# 功能会连接失败并记日志，不影响应用启动。
+mcp==1.30.0
+httpx-sse==0.4.3
+pydantic-settings==2.16.1
+
+# ============================================================
 # 数据库
 # ============================================================
 
@@ -168,6 +189,7 @@ click==8.5.0
 cachetools==7.1.8
 protobuf==7.36.1
 grpcio==1.83.1
+a2a-sdk==1.2.3
 tzdata==2026.3
 pytz==2026.3.post1
 

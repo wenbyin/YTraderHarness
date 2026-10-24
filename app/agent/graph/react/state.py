@@ -78,6 +78,24 @@ from app.agent.state import AgentClassification
 __all__ = ["ReactState", "ToolBranchPayload"]
 
 
+def _last_value(left: Any, right: Any) -> Any:
+    """
+    计划状态的 reducer：后合并的值赢。
+
+    ⚠️ 它存在的唯一原因是**并发写不报错**
+    ------------------------------------
+    普通 LastValue 通道在同一个 super-step 被两个 Send 分支写入时会抛
+    `InvalidUpdateError`。计划工具是扇出执行的：模型一次发了
+    enter + exit（或两个 enter）虽然罕见，但一旦发生，整轮对话会挂掉。
+
+    加上 reducer 之后，多个分支各写各的、最后合并的那个值生效 —— 语义
+    仍然是"最后写入者赢"，只是把"崩溃"换成了"以最后一次合并为准"。
+    正常路径（只有一个控制调用）与没有 reducer 时完全一样。
+    """
+
+    return right
+
+
 class ReactState(TypedDict):
     """
     一次 ReAct 运行的全部状态。
@@ -97,7 +115,7 @@ class ReactState(TypedDict):
 
     ⚠️ 其余通道都是"最后写入者赢"
     ---------------------------
-    它们没有 reducer。因此：
+    它们没有 reducer（`plan_*` 三个通道除外，见 `_last_value`）。因此：
 
         写入方只该是**决定它的人**（见下面每个字段的说明）
         节点**不要**每轮都重复写同一个值（那会让 channel 看起来一直在
@@ -236,6 +254,121 @@ class ReactState(TypedDict):
     classification: AgentClassification
 
     # ========================================================
+    # 计划模式（tools 节点写，路由读）
+    # ========================================================
+
+    #: 当前是否处于计划模式："off" | "plan"。
+    #:
+    #: **唯一权威来源**：路由函数只读它，不再看
+    #: `classification.execution_plan`。分类结果只是"提议进入"的输入，
+    #: 生效的是这里。
+    #:
+    #: 写入方是 **tools 节点**：它执行 enter / exit 工具后，按工具返回的
+    #: `plan_transition` 指令写状态。builder 与模型都只是**发出工具调用**，
+    #: 不直接写这里 —— 两条入口在 tools 节点汇合。
+    #:
+    #: ⚠️ **不要**在 `_initial_state` 里写它
+    #: 新一轮运行会把初始 state 合并到同一条 thread 的 checkpoint 上，
+    #: 写 `off` 会把正在进行的计划模式**每轮重置一次**。
+    #:
+    #: 带 `_last_value` reducer：多个 Send 分支并发写时以最后合并的值为准，
+    #: 而不是抛 `InvalidUpdateError`（见 `_last_value` 的说明）。
+    plan_status: Annotated[str, _last_value]
+
+    #: 计划快照：`{"tasks": [{"id": ..., "status": "pending" | "done", ...}]}`。
+    #:
+    #: planner 产出时**整体覆盖**（后写者赢）；进入计划模式时也会被清空，
+    #: 避免上一份计划的任务状态被误认为当前计划。
+    #:
+    #: 路由据 `tasks[].status` 判断是否该重新规划（没任务 / 全完成 ->
+    #: 进 planner）。形状与判据见 graph/react/plan_state.py。
+    plan: Annotated[dict[str, Any], _last_value]
+
+    #: 谁把模式推进来的："classifier" | "tool"。只在新进入时写。
+    #:
+    #: 分类器触发的调用由 builder 合成，Send payload 里带着
+    #: `plan_origin="classifier"`；模型自己调用时是 `"tool"`。
+    plan_origin: Annotated[str, _last_value]
+
+    #: 本次计划的任务列表（**A2A canonical dict**，见
+    #: `app/agent/plan/a2a.py` 的 `to_a2a_tasks`）。
+    #:
+    #: 形状是 `MessageToDict(Task)` 的普通 dict 列表，按拓扑序排列：
+    #: `[{"id": "<plan_id>:t1", "contextId": ..., "status": {...},
+    #:   "history": [...], "metadata": {...}}, ...]`。
+    #:
+    #: 为什么是 list 而不是 dict：前端 / 调度器按顺序渲染 DAG，
+    #: 顺序就是拓扑序；需要按 id 查时在调用点建索引即可。
+    #: planner 产出时**整体覆盖**；进入计划模式时清空。
+    tasks: Annotated[list[dict[str, Any]], _last_value]
+
+    #: 当前要执行的任务（A2A canonical dict），`{}` = 当前没有任务。
+    #:
+    #: **只在 claim 之后才有值**：planner 产出计划时恒为 `{}`（此时所有
+    #: 任务都还是 SUBMITTED、没有 claim），由 task listener 顺序 claim 或
+    #: subagent_dispatch 预 claim 时写入。不要把它当成「计划里的第一个
+    #: 任务」——那会让前端把排队中的任务画成正在执行。
+    #: 它与 `tasks` 里的某一条是同一份 dict，不是第二份副本 ——
+    #: 只是给"现在轮到谁"一个稳定指针。
+    current_task: Annotated[dict[str, Any], _last_value]
+
+    #: task 模式本次暴露的工具 key。
+    #:
+    #: SkillLoader 在上下文构建时算出，agent 节点写回 state；路由
+    #: （routing._tool_keys）在 current_task 非空时优先用它 —— 否则
+    #: 模型看到了 skill 的工具，tools 节点却按主 agent 的 tool_keys
+    #: 把它判成“未暴露”。任务结束后 current_task 清空，本通道被忽略。
+    task_tool_keys: Annotated[list[str], _last_value]
+
+    #: 是否启用 sub-agent 模式："off" | "pending" | "on" | "denied"。
+    #:
+    #: 写入方是 `create_team` 工具（审批通过、工具体真的执行之后）：
+    #: 它返回 `Command(goto="subagent_dispatch", update={"subagent_mode": "on"})`。
+    #: task_listener 据此选择数据源：`on` 时优先 Redis 任务板，其余用
+    #: graph state；计划结束 / 拒绝审批时回到 "off"。
+    #: 缺省（不存在）等同 "off"。
+    subagent_mode: Annotated[str, _last_value]
+
+    #: 本次派发的 worker 上限（`create_team(worker_num)` 写入）。
+    #:
+    #: subagent_dispatch 用它决定一次预 claim 多少个任务 / 发多少条 Send。
+    #: 计划结束、审批拒绝或退回顺序执行时清零。
+    subagent_workers: Annotated[int, _last_value]
+
+    #: 「要不要开子代理团队」这一轮决策的状态。
+    #:
+    #:     ""          没有待决策的并行任务
+    #:     "pending"   listener 发现并行 ready 任务，已回 main agent 等待决定
+    #:     "declined"  main agent 没有调用 create_team，回退顺序执行
+    #:
+    #: 写入方：
+    #:     task_listener   发现并行时不 claim，写 "pending"；
+    #:                     下一次回到 listener 时写 "declined" 并继续 claim
+    #:                     （防止 listener -> agent -> listener 空转）
+    #:     计划清空 / 重建 重置为 ""
+    #:
+    #: 它**不是**建模 subagent_mode 的一部分：后者决定数据源（Redis /
+    #: state），前者只决定「这一波要不要先问 main agent」。
+    team_decision: Annotated[str, _last_value]
+
+    #: 已经做过“任务汇总回合”的计划键集合。
+    #:
+    #: 键形如 `f"{plan_id}:{revision}"` —— 不能只用 plan_id：重新规划
+    #: 会复用 plan_id、只递增 revision，旧结果不能挡住新 revision 的
+    #: 汇总。
+    #:
+    #: 写入方：task_listener 第一次发现“全部任务终态”时追加；
+    #: 它同时是幂等闩：resume / re-entry 不会对同一份计划重复汇总。
+    hist_synthesis_keys: Annotated[list[str], _last_value]
+
+    #: 当前是否正处于“所有任务已完成、等待 main agent 汇总”的回合。
+    #:
+    #: 写入方：task_listener；清除方：agent 节点在汇总回答完成后。
+    #: TaskResolver / ContextResolver 用它决定是否注入任务结果，
+    #: agent 节点用它决定回答后是否清空 tasks。
+    synthesis_pending: Annotated[bool, _last_value]
+
+    # ========================================================
     # 主 agent 的职责提示词（派发写，builder 节点读）
     # ========================================================
 
@@ -262,7 +395,7 @@ class ToolBranchPayload(TypedDict):
     KeyError，而那个报错不会告诉你是因为 Send 的语义。
 
     反过来，**不该带的也别带**：payload 随 pending task 一起进
-    checkpoint，多一个字段就多一份被恢复的东西。下面三个字段都是
+    checkpoint，多一个字段就多一份被恢复的东西。下面几个字段都是
     "分支确实需要、且父状态里拿不到"的。
 
     为什么本图不需要 document 那种"路由屏障节点"
@@ -272,9 +405,10 @@ class ToolBranchPayload(TypedDict):
     分支状态。document 有 4 个扇出阶段串行，所以每两个之间必须夹一个
     屏障来"等所有分支跑完再发下一批"。
 
-    本图只有**一个**扇出阶段：`tools` 的下游是 `agent`，而分支写回的
-    `messages` 经 `add_messages` 汇进父状态，agent 因此在所有分支跑完
-    之后只执行一次、看得到全部结果。屏障在这里是多余的。
+    本图只有**一个**扇出阶段：`tools` 没有静态出边，下一跳由控制器
+    分支的 `Command.goto` 决定；分支写回的 `messages` 经 `add_messages`
+    汇进父状态，目标节点因此在所有分支跑完之后只执行一次、看得到
+    全部结果。屏障在这里是多余的。
     """
 
     #: 这个分支负责的**那一次**工具调用（`AIMessage.tool_calls` 里的一项：
@@ -288,6 +422,57 @@ class ToolBranchPayload(TypedDict):
     #: 哪些）是同一个纯函数、同一个输入，两个集合恒等是算出来的。
     #: 路由只搬运原文，不参与判定。
     tool_keys: list[str]
+
+    #: 调用发生**之前**的计划模式（`"off"` / `"plan"`）。
+    #:
+    #: enter / exit 工具靠它判断是不是一次真正的状态切换：已处于 plan
+    #: 时 enter 是幂等的，不能重置正在执行的计划；off 时 exit 同理。
+    #: 分支读不到父 state，因此由路由搬进 payload。
+    plan_status: str
+
+    #: 这次控制调用的来源："classifier" / "tool"。
+    #:
+    #: 分类器触发的那次调用由 builder 合成，路由从合成消息的
+    #: `additional_kwargs` 里搬过来；模型自己调用时是 "tool"。
+    plan_origin: str
+
+    #: 调用发生之前的计划快照（只读）。
+    #:
+    #: 控制工具在幂等判断里要用：已经在 plan 且任务未完成时，enter 的
+    #: `goto` 会从 planner 改回 agent，不重置现有计划。
+    plan: dict[str, Any]
+
+    #: 本次计划的任务列表（A2A canonical dict，拓扑序）。
+    #:
+    #: 给控制工具（`create_team`）用：判断有无待完成任务、检查依赖环、
+    #: 发布到任务板。普通工具不读它。
+    #:
+    #: ⚠️ 这是**整份列表的浅拷贝**，会随 pending task 一起进 checkpoint；
+    #: 一次 AIMessage 有 N 个工具调用就有 N 份。暂时接受这个冗余。
+    #: TODO(subagent): 对齐官方 `ToolRuntime.state`（`CONFIG_KEY_READ`
+    #: 从 channels 水合）之后，把这个字段从 payload 里去掉。
+    tasks: list[dict[str, Any]]
+
+    #: 普通工具执行完之后回到哪个节点。
+    #:
+    #: 主 agent 的调用是 "agent"；将来 planner 自己跑工具循环时是
+    #: "planner"（ask_user_question 就是给那条循环用的）。计划控制工具
+    #: 自己的 `Command.goto` 会覆盖它。
+    return_to: str
+
+    #: 这个分支是不是**本批调用的控制者**（本批的第一个调用）。
+    #:
+    #: 扇出的 N 个分支会同时结束。如果每个分支都返回 `Command`，同一
+    #: 个 super-step 会出现多个不同的 `goto`，多个节点都会被调度。
+    #:
+    #: 所以每批调用只让**第一个调用**当控制器：它的工具返回 `Command`
+    #: 时由它决定下一跳；其他分支只返回消息 / 状态更新。这条规则与
+    #: 具体工具无关 —— 任何工具都可以在第一个位置控制跳转。
+    #:
+    #: ⚠️ 限制：同一批多个工具时，只有第一个工具的 `Command` 会被采用。
+    #: 原版 ToolNode 在一次调用里可以返回多个 Command；本图是一调用
+    #: 一分支，完全对齐需要加汇总屏障（独立改动）。
+    is_controller: bool
 
     #: 这个分支的稳定身份，用来算观测的 `branch_key`
     #: （见 `infra/graph/ids.py` 的 `branch_scope_id`）。

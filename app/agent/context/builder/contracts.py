@@ -77,7 +77,7 @@ __all__ = [
 # 固定流水线
 # ============================================================
 
-#: 十一个阶段的**执行顺序**。
+#: 十三个阶段的**执行顺序**。
 #:
 #: ⚠️ 这是**显式字面量**，不是 `tuple(StageId)`
 #: -------------------------------------------------
@@ -88,8 +88,16 @@ __all__ = [
 #:
 #: 写成字面量的代价是"加了新阶段忘了往这里加"，那个由下面那段
 #: 启动期校验接住。
+#:
+#: ⚠️ TASK_RESOLVER / SKILL_LOADER 是 1.1.0 的**显式插入**
+#: ----------------------------------------------------
+#: 它们必须跑在 PROMPT_ASSEMBLER 之前，因此不是追加到末尾。这是一次
+#: 有意的流水线契约变更：所有 builder 的 enabled_stages 与测试一起
+#: 更新；不声明这两个阶段的 builder 会按 gate 跳过它们。
 PIPELINE_TEMPLATE: tuple[StageId, ...] = (
     StageId.CONTEXT_RESOLVER,
+    StageId.TASK_RESOLVER,
+    StageId.SKILL_LOADER,
     StageId.PROFILE_LOADER,
     StageId.SUMMARY_LOADER,
     StageId.HISTORY_SELECTOR,
@@ -145,9 +153,10 @@ def _assert_template_complete() -> None:
             "PIPELINE_TEMPLATE 与 StageId 不一致：\n"
             f"  枚举：{tuple(s.value for s in StageId)}\n"
             f"  模板：{tuple(s.value for s in PIPELINE_TEMPLATE)}\n"
-            "新增阶段请**追加**到两者末尾；顺序本身是对外契约"
-            "（规格里写明 stage order 由服务器定义且不可变），"
-            "重排会让所有实现的执行顺序静默改变。"
+            "新增阶段必须同时更新 StageId 与 PIPELINE_TEMPLATE；"
+            "顺序本身是对外契约（规格里写明 stage order 由服务器定义"
+            "且不可变）。1.1.0 的 TASK_RESOLVER / SKILL_LOADER 是为了"
+            "让 task 模式在 PROMPT_ASSEMBLER 之前生效而做的显式插入。"
         )
 
 
@@ -242,6 +251,12 @@ class ContextBuildRequest:
 
     #: 本次构建的外部依赖（缺省 = 进程级默认）。
     dependencies: "ContextDependencies | None" = None
+
+    #: 本次构建的 Trace 上下文（None = 未开启）。
+    #:
+    #: 它是 per-call 的，跟着请求进工作集 —— builder 实例是共享的，
+    #: 不能把这东西挂到 self 上（见类的说明）。
+    trace: Any = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -113,6 +113,16 @@ class AgentRun(BaseModel):
         ),
     )
 
+    trace_id: str | None = Field(
+        default=None,
+        description=(
+            "客户端传入的 Trace 聚合键。None = 这次运行没有开启 Trace。\n\n"
+            "为什么要落库：resume 时 handler 从库里重新加载运行行，"
+            "不能假设客户端会再传一次；而 trace 事件要求同一 trace 的"
+            "所有事件 trace_id 完全一致。"
+        ),
+    )
+
     created_at: datetime = Field(description="创建时间。")
 
     updated_at: datetime = Field(description="最后更新时间。")

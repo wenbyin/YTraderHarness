@@ -127,7 +127,32 @@ def serve(
         host: str = "localhost",
         port: int = 8080,
         reload: bool = False,
+        mock: bool | None = None,
 ) -> None:
+    """
+    启动服务。
+
+    ``mock``：
+        None  跟随 app/config/mock_model.yaml 的 enabled
+        True  强制启用进程内 mock（--mock）
+        False 强制关闭（--no-mock）
+
+    用环境变量而不是函数参数穿透：``uvicorn.Config("app.main:app")``
+    会在自己的导入路径里构造 app，lifespan 拿不到 CLI 参数；而环境变量
+    在子进程 / reload 路径上也会继承。
+    """
+
+    if mock is not None:
+        os.environ["MOCK_MODEL_ENABLED"] = "1" if mock else "0"
+
+    # 记忆链路在 mock 模式下**默认开启**：L0/L1 的后台抽取与预召回
+    # 都要真实跑一遍，才能验证任务链路。想把 agent 主链路和记忆任务
+    # 分开压测时，显式设成 0：
+    #
+    #     YTRADER_MEMORY_CONTEXT=0 YTRADER_MEMORY_EXTRACTION=0
+    #
+    # 两个开关在消费侧的默认值都是 1（见 agent_builder_node 与
+    # agent_run_dispatch），这里不再覆盖成 0。
 
     # ⚠️ 必须在建 uvicorn 之前 —— 见 `_configure_logging` 的说明。
     # 放在 `serve()` 里而不是模块级：测试与冒烟脚本 import `app.main`

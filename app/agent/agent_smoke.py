@@ -13,11 +13,13 @@ ReAct 图 + Agent Builder 节点的冒烟测试。
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from typing import Any
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.context.builder.contracts import ContextBuildRequest
@@ -27,7 +29,7 @@ from app.agent.graph.react import agent_builder_node as builder_module
 from app.agent.graph.react.context import ReactContext
 from app.agent.graph.react.graph import NODE_FUNCTIONS, build_react_graph
 from app.agent.graph.react.state import ReactState
-from app.agent.model import ModelRequest
+from app.agent.model import ModelRequest, ModelResponse
 from app.agent.prompt import (
     DefaultPromptProvider,
     get_prompt_provider,
@@ -77,13 +79,26 @@ class _FakeRecorder:
 class _FakeRuntime:
     """假的 ModelRuntime：ainvoke 直接回一段结构化 payload。"""
 
+    #: 最近一次请求 —— 用来断言主循环是否打开了思考。
+    last_request: Any = None
+
     def __init__(self, payload: Any) -> None:
         self._payload = payload
 
     async def ainvoke(self, request: Any, **kwargs: Any) -> Any:
-        return type(
-            "_R", (), {"message": type("_M", (), {"content": self._payload})()}
-        )()
+        type(self).last_request = request
+
+        content = (
+            self._payload
+            if isinstance(self._payload, str)
+            else json.dumps(self._payload, ensure_ascii=False)
+        )
+
+        return ModelResponse(
+            message=AIMessage(content=content),
+            provider="fake",
+            model="fake",
+        )
 
 
 class _FakeRegistry:
@@ -205,6 +220,8 @@ async def _run_graph(
         boom: bool = False,
         candidates: list[str] | None = None,
         duty_key: str | None = None,
+        agent_tool_calls: list[dict[str, Any]] | None = None,
+        initial_extra: dict[str, Any] | None = None,
 ) -> tuple[list[str], ReactState]:
     """
     跑一次真图，节点用桩，只有 builder 节点是真的。
@@ -237,13 +254,44 @@ async def _run_graph(
         ran.append("builder")
         return await builder_module.agent_builder_node(state, runtime)
 
+    agent_calls = {"n": 0}
+
     async def stub_agent(state: ReactState, runtime: Any) -> dict:
         ran.append("agent")
+        agent_calls["n"] += 1
+        # 第一轮可以模拟模型调用控制工具；之后正常收尾，避免图循环。
+        if agent_tool_calls and agent_calls["n"] == 1:
+            return {"messages": [AIMessage("", tool_calls=agent_tool_calls)]}
         return {"messages": [AIMessage("答复")]}
 
     async def stub_planner(state: ReactState, runtime: Any) -> dict:
         ran.append("planner")
         return {}
+
+    # task_listener 跑**真实实现**：它只从 state 的 tasks 里 claim。
+    # planner 桩返回 {}，所以这里通常 claim 不到任务；记一笔顺序即可。
+    from app.agent.graph.react.task_listener_node import (
+        task_listener_node as real_task_listener,
+    )
+
+    async def stub_task_listener(
+            state: ReactState,
+            runtime: Any,
+    ) -> dict:
+        ran.append("task_listener")
+        return await real_task_listener(state, runtime)
+
+    # tools 跑**真实实现**，只额外记一笔节点顺序 —— 控制工具的状态结算
+    # 就在这个节点里，这一节要验的正是它有没有写对。
+    from app.agent.graph.react.tools import tools_node as real_tools
+
+    async def stub_tools(
+            state: Any,
+            runtime: Any,
+            config: RunnableConfig,
+    ) -> dict:
+        ran.append("tools")
+        return await real_tools(state, runtime, config)
 
     try:
         # ⚠️ 必须在 build_react_graph() **之前**替换：
@@ -251,6 +299,8 @@ async def _run_graph(
         NODE_FUNCTIONS["builder"] = stub_builder
         NODE_FUNCTIONS["agent"] = stub_agent
         NODE_FUNCTIONS["planner"] = stub_planner
+        NODE_FUNCTIONS["task_listener"] = stub_task_listener
+        NODE_FUNCTIONS["tools"] = stub_tools
 
         graph = build_react_graph().compile(
             checkpointer=InMemorySaver()
@@ -271,6 +321,9 @@ async def _run_graph(
 
         if duty_key is not None:
             initial["duty_key"] = duty_key
+
+        if initial_extra:
+            initial.update(initial_extra)
 
         state = await graph.ainvoke(
             initial,
@@ -299,6 +352,12 @@ async def _run_graph(
 
 async def main() -> int:
 
+    # 控制工具是**真工具**：它们要经 tools 节点执行，而允许集与执行器
+    # 都从代码注册表取。脚本里没有 lifespan，这里手动扫一遍。
+    from app.services.tool.registry import get_tool_registry
+
+    get_tool_registry().scan()
+
     # --------------------------------------------------------
     section("专用 Context Builder：窄输入")
 
@@ -309,9 +368,10 @@ async def main() -> int:
         type(builder).__name__ == "ClassifierProcessorContextBuilder",
     )
     check(
-        "只声明三个阶段",
+        "声明四个阶段（含只读摘要注入）",
         {s.name for s in type(builder).enabled_stages} == {
-            "CONTEXT_RESOLVER", "HISTORY_SELECTOR", "PROMPT_ASSEMBLER",
+            "CONTEXT_RESOLVER", "SUMMARY_LOADER",
+            "HISTORY_SELECTOR", "PROMPT_ASSEMBLER",
         },
     )
     check(
@@ -403,24 +463,41 @@ async def main() -> int:
     )
 
     # --------------------------------------------------------
-    section("路由：execution_plan 决定去向")
+    section("路由：plan_status 决定去向（分类只负责提议）")
 
     ran, result = await _run_graph(payload=_payload(
         ExecutionPlan.REACT.value
     ))
     check("react -> 直接进 agent", ran == ["builder", "agent"])
-
-    ran, result = await _run_graph(payload=_payload(
-        ExecutionPlan.DIRECT.value
-    ))
-    check("direct -> 直接进 agent（direct/react 拓扑上没有分岔）",
-          ran == ["builder", "agent"])
+    check("react 不进入计划模式",
+          (result.get("plan_status") or "off") == "off")
 
     ran, result = await _run_graph(payload=_payload(
         ExecutionPlan.PLAN.value
     ))
-    check("plan -> 先过 planner 再进 agent",
-          ran == ["builder", "planner", "agent"])
+    check(
+        "plan -> builder 合成 EnterPlanTool -> tools -> planner -> listener",
+        ran == [
+            "builder", "tools", "planner", "task_listener", "agent",
+        ],
+    )
+    check("plan 写进 state（而不是只留在 classification）",
+          result["plan_status"] == "plan")
+    check("进入计划模式时清空旧 plan（交给 planner 覆盖）",
+          result["plan"] == {})
+    check("来源记成 classifier（来自合成消息的 additional_kwargs）",
+          result["plan_origin"] == "classifier")
+    check(
+        "合成了一条 enter_plan_mode 工具调用（不是直接改 state）",
+        any(
+            isinstance(m, AIMessage)
+            and any(
+                call.get("name") == "agent_enter_plan_mode"
+                for call in m.tool_calls
+            )
+            for m in result["messages"]
+        ),
+    )
 
     ran, result = await _run_graph(payload=_payload(
         ExecutionPlan.OTHER.value
@@ -430,12 +507,309 @@ async def main() -> int:
 
     # 没有分类结果也走 agent：那一轮可能压根没跑 builder（比如从旧
     # checkpoint 续跑），路由不能因此炸掉。
-    from app.agent.graph.react.routing import route_after_builder
+    from app.agent.graph.react.routing import (
+        route_after_agent,
+        route_after_builder,
+    )
 
     check(
         "state 里没有 classification -> 走 agent",
         route_after_builder({"messages": []}) == "agent",  # type: ignore[typeddict-item]
     )
+
+    check(
+        "plan 且任务未完成 -> agent（继续执行，不重置计划）",
+        route_after_builder({  # type: ignore[typeddict-item]
+            "messages": [],
+            "plan_status": "plan",
+            "plan": {"tasks": [{"id": "t1", "status": "pending"}]},
+        }) == "agent",
+    )
+
+    check(
+        "plan 且任务全部完成 -> planner（生成新任务）",
+        route_after_builder({  # type: ignore[typeddict-item]
+            "messages": [],
+            "plan_status": "plan",
+            "plan": {"tasks": [{"id": "t1", "status": "done"}]},
+        }) == "planner",
+    )
+
+    check(
+        "plan 且没有任务 -> planner",
+        route_after_builder({  # type: ignore[typeddict-item]
+            "messages": [],
+            "plan_status": "plan",
+        }) == "planner",
+    )
+
+    check(
+        "off -> agent（不论旧计划长什么样）",
+        route_after_builder({  # type: ignore[typeddict-item]
+            "messages": [],
+            "plan_status": "off",
+            "plan": {"tasks": [{"id": "t1", "status": "done"}]},
+        }) == "agent",
+    )
+
+    control_call = AIMessage(
+        "",
+        tool_calls=[{
+            "name": "agent_enter_plan_mode",
+            "args": {},
+            "id": "call_plan_1",
+        }],
+    )
+
+    sends = route_after_agent(
+        {"messages": [control_call]}, None,  # type: ignore[typeddict-item]
+    )
+    check(
+        "enter_plan_mode 也走 Send 扇出（是真工具）",
+        isinstance(sends, list)
+        and len(sends) == 1
+        and getattr(sends[0], "node", None) == "tools",
+    )
+
+    sends = route_after_builder({  # type: ignore[typeddict-item]
+        "messages": [control_call],
+        "plan_status": "off",
+    })
+    check(
+        "builder 合成的控制调用同样 Send 到 tools",
+        isinstance(sends, list)
+        and len(sends) == 1
+        and getattr(sends[0], "node", None) == "tools",
+    )
+
+    # 工具自己返回 Command，并从注入的 ToolRuntime.state 读当前状态。
+    from types import SimpleNamespace
+
+    from langgraph.types import Command
+
+    from app.agent.tools.plan_tool import enter_plan_mode, exit_plan_mode
+
+    def rt(state: dict) -> Any:
+        return SimpleNamespace(state=state)
+
+    enter_cmd = await enter_plan_mode.coroutine(runtime=rt({}), reason="x")
+    exit_cmd = await exit_plan_mode.coroutine(runtime=rt({}), reason="")
+
+    check(
+        "enter 工具返回 Command(goto=planner)",
+        isinstance(enter_cmd, Command) and enter_cmd.goto == "planner",
+    )
+    check(
+        "enter 在 Command.update 里直接写 plan_status",
+        isinstance(enter_cmd.update, dict)
+        and enter_cmd.update.get("plan_status") == "plan",
+    )
+    check(
+        "exit 工具返回 Command(goto=agent)",
+        isinstance(exit_cmd, Command) and exit_cmd.goto == "agent",
+    )
+
+    idle_enter = await enter_plan_mode.coroutine(runtime=rt({}), reason="")
+    busy_enter = await enter_plan_mode.coroutine(
+        runtime=rt({
+            "plan_status": "plan",
+            "plan": {"tasks": [{"id": "t1", "status": "pending"}]},
+        }),
+        reason="",
+    )
+    done_enter = await enter_plan_mode.coroutine(
+        runtime=rt({
+            "plan_status": "plan",
+            "plan": {"tasks": [{"id": "t1", "status": "done"}]},
+        }),
+        reason="",
+    )
+    plan_exit = await exit_plan_mode.coroutine(
+        runtime=rt({"plan_status": "plan"}), reason="",
+    )
+
+    check("enter 且当前 off -> planner", idle_enter.goto == "planner")
+    check(
+        "enter 且 plan 任务未完成 -> agent（幂等，不重置计划）",
+        busy_enter.goto == "agent"
+        and not (busy_enter.update or {}).get("plan"),
+    )
+    check(
+        "enter 且 plan 任务全完成 -> planner（重新规划）",
+        done_enter.goto == "planner",
+    )
+    check(
+        "exit 且当前 plan -> agent，并写回 off",
+        plan_exit.goto == "agent"
+        and (plan_exit.update or {}).get("plan_status") == "off",
+    )
+
+    # --------------------------------------------------------
+    section("主循环默认开启思考（真实 agent 节点）")
+
+    from app.agent.graph.react.agent_node import agent_node
+
+    async def stub_plain_builder(state: ReactState, runtime: Any) -> dict:
+        return {"context_policy": {"tool_keys": []}}
+
+    async def stub_plain_planner(state: ReactState, runtime: Any) -> dict:
+        return {}
+
+    NODE_FUNCTIONS["agent"] = agent_node
+    NODE_FUNCTIONS["builder"] = stub_plain_builder
+    NODE_FUNCTIONS["planner"] = stub_plain_planner
+
+    thinking_graph = build_react_graph().compile(
+        checkpointer=InMemorySaver()
+    )
+
+    thinking_context = ReactContext(
+        pipeline_run_id=uuid4(),
+        recorder=_FakeRecorder(),
+        model_registry=_FakeRegistry("答复"),
+        builder=_FakeBuilder(),
+        classifier_builder=_FakeBuilder(),
+    )
+
+    _FakeRuntime.last_request = None
+
+    await thinking_graph.ainvoke(
+        {"messages": [HumanMessage(USER_TEXT)]},
+        {"configurable": {"thread_id": f"thinking-{uuid4()}"}},
+        context=thinking_context,
+    )
+
+    check(
+        "react 主循环的 ModelRequest.enable_thinking=True",
+        _FakeRuntime.last_request is not None
+        and _FakeRuntime.last_request.enable_thinking is True,
+    )
+    check(
+        "主循环没有 response_format（JSON schema 才会关思考）",
+        _FakeRuntime.last_request.response_format is None,
+    )
+
+    # --------------------------------------------------------
+    section("计划模式工具：enter / exit 真的改变图状态")
+
+    ran, result = await _run_graph(
+        payload=_payload(ExecutionPlan.REACT.value),
+        agent_tool_calls=[{
+            "name": "agent_enter_plan_mode",
+            "args": {"reason": "需要先拆解"},
+            "id": "call_plan_enter",
+        }],
+    )
+    check(
+        "enter -> tools -> planner -> listener -> agent",
+        ran == [
+            "builder", "agent", "tools", "planner",
+            "task_listener", "agent",
+        ],
+    )
+    check("plan_status 被写成 plan", result["plan_status"] == "plan")
+    check("plan_origin 记成 tool", result["plan_origin"] == "tool")
+    check("进入时清空旧 plan（交给 planner 覆盖）",
+          result["plan"] == {})
+    check(
+        "控制工具真的执行了，并留下 ToolMessage（不留悬空 id）",
+        any(
+            isinstance(m, ToolMessage)
+            and "已进入计划模式" in str(m.content)
+            and m.tool_call_id == "call_plan_enter"
+            for m in result["messages"]
+        ),
+    )
+    check(
+        "控制工具常驻（exit 在进入后立即可见）",
+        "agent.exit_plan_mode"
+        in result["context_policy"]["tool_keys"],
+    )
+
+    ran, result = await _run_graph(
+        payload=_payload(ExecutionPlan.REACT.value),
+        initial_extra={
+            "plan_status": "plan",
+            "plan": {"tasks": [{"id": "t1", "status": "pending"}]},
+        },
+        agent_tool_calls=[{
+            "name": "agent_exit_plan_mode",
+            "args": {},
+            "id": "call_plan_exit",
+        }],
+    )
+    check(
+        "exit -> tools -> agent（不进 planner）",
+        ran == ["builder", "agent", "tools", "agent"],
+    )
+    check("plan_status 被写回 off", result["plan_status"] == "off")
+    check(
+        "退出是直接退出，不经过审批 / 中断",
+        any(
+            isinstance(m, ToolMessage)
+            and "已退出计划模式" in str(m.content)
+            for m in result["messages"]
+        ),
+    )
+    check(
+        "控制工具常驻（exit 不因模式切换从清单里消失）",
+        "agent.exit_plan_mode"
+        in result["context_policy"]["tool_keys"],
+    )
+
+    ran, result = await _run_graph(
+        payload=_payload(ExecutionPlan.REACT.value),
+        initial_extra={
+            "plan_status": "plan",
+            "plan": {"tasks": [{"id": "t1", "status": "pending"}]},
+        },
+        agent_tool_calls=[{
+            "name": "agent_enter_plan_mode",
+            "args": {},
+            "id": "call_plan_enter_again",
+        }],
+    )
+    check(
+        "重复 enter 幂等：仍在 plan，直接回 agent",
+        ran == ["builder", "agent", "tools", "agent"],
+    )
+    check(
+        "不重置正在执行的计划",
+        result["plan"]["tasks"][0]["status"] == "pending",
+    )
+
+    # 多个控制调用：两个分支都执行，但只有**控制器**返回 Command，
+    # 所以 planner 只跳一次。
+    ran, result = await _run_graph(
+        payload=_payload(ExecutionPlan.REACT.value),
+        agent_tool_calls=[
+            {
+                "name": "agent_enter_plan_mode",
+                "args": {},
+                "id": "call_enter_a",
+            },
+            {
+                "name": "agent_enter_plan_mode",
+                "args": {},
+                "id": "call_enter_b",
+            },
+        ],
+    )
+    check(
+        "两个控制分支都执行，但只跳一次 planner",
+        ran.count("tools") == 2
+        and ran[-3:] == ["planner", "task_listener", "agent"],
+    )
+    check(
+        "每个 tool_call 都有对应的 ToolMessage",
+        sum(
+            1
+            for m in result["messages"]
+            if isinstance(m, ToolMessage)
+            and m.tool_call_id in {"call_enter_a", "call_enter_b"}
+        ) == 2,
+    )
+    check("多分支并发写 plan_status 不冲突", result["plan_status"] == "plan")
 
     # --------------------------------------------------------
     section("分类结果写回 state，且不进对话历史")
@@ -807,9 +1181,15 @@ async def main() -> int:
         len(captured) == 1,
     )
     check(
-        "查回来的 tool_key 写进了 context_policy",
+        "查回来的 tool_key 写进了 context_policy，并并入了控制工具",
         result["context_policy"]["tool_keys"]
-        == ["t.financial", "t.document"],
+        == [
+            "t.financial",
+            "t.document",
+            "agent.enter_plan_mode",
+            "agent.exit_plan_mode",
+            "agent.ask_user_question",
+        ],
     )
     check(
         "人工说明覆盖按同一批 key 预载，并写进了 context_policy",

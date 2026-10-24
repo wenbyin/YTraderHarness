@@ -136,18 +136,26 @@ class StageId(str, Enum):
     规格里写明 stage order 由服务器定义、客户端必须当作不可变。
     这里用枚举的声明顺序承载那个顺序，因此：
 
-        允许    在末尾追加新阶段（老实现不受影响）
-        禁止    重排既有成员（会让所有实现的执行顺序静默改变）
+        默认    在末尾追加新阶段（老实现不受影响）
+        例外    需要插到 PROMPT_ASSEMBLER 之前的阶段 —— 必须同时更新
+                PIPELINE_TEMPLATE、所有 builder 与测试，并抬
+                ContextBuilderDefinition.version。1.1.0 的
+                TASK_RESOLVER / SKILL_LOADER 就是这种显式插入。
 
     真正驱动执行的是 `contracts.PIPELINE_TEMPLATE` —— 一份**显式
     写死**的元组，不是 `tuple(StageId)`。理由见那边的说明：从枚举
     推导会让"有人重排枚举"静默变成"重排流水线"，而显式元组至少
     让改动落在一个需要 review 的地方。
 
-    十一个阶段各自的职责
+    十三个阶段各自的职责
     --------------------
         CONTEXT_RESOLVER     读 builder_type + state，输出 skip 列表
                              与各阶段参数。**流水线的入口**。
+        TASK_RESOLVER        如果当前有 task，把任务信息注入 system
+                             并作为“当前输入”；无 task 时跳过。
+        SKILL_LOADER         按 task.metadata.skill_key 加载 skill，
+                             用统一 SkillSnapshot 渲染 system prompt，
+                             并把 skill + task 能力解析成 tool_keys。
         PROFILE_LOADER       加载用户 / 租户画像
         SUMMARY_LOADER       生成并注入对话摘要。**唯一会自己调 LLM 的
                              阶段**（见 contracts.LLM_INVOCATION_STAGES）
@@ -164,6 +172,8 @@ class StageId(str, Enum):
     """
 
     CONTEXT_RESOLVER = "context_resolver"
+    TASK_RESOLVER = "task_resolver"
+    SKILL_LOADER = "skill_loader"
     PROFILE_LOADER = "profile_loader"
     SUMMARY_LOADER = "summary_loader"
     HISTORY_SELECTOR = "history_selector"

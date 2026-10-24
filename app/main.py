@@ -41,6 +41,10 @@ from app.api.v1.router import (
 from app.common.llm import warmup_chat_models
 from app.common.model_factory import get_model_factory
 from app.common.openapi import pin_contract_component_names
+from app.mock.runtime import (
+    start_mock_server_if_enabled,
+    stop_mock_server,
+)
 from app.services.document.embedder.bge_small_zh_local import (
     register_preload as register_embedder_preload,
 )
@@ -86,7 +90,12 @@ from app.bootstrap.graph_runtime import (
     build_graph_runtime,
     start_graph_runtime,
 )
+from app.bootstrap.mcp import (
+    initialize_mcp_providers,
+    shutdown_mcp_providers,
+)
 from app.bootstrap.pipelines import build_pipelines
+from app.bootstrap.tool_cache import initialize_tool_cache
 from app.bootstrap.task import (
     aclose_task_infrastructure,
     build_task_infrastructure,
@@ -98,10 +107,20 @@ from app.agent.prompt import (
     get_prompt_provider,
     set_prompt_provider,
 )
-from app.common.factories import build_factories, get_service_factory
+from app.common.factories import (
+    build_factories,
+    build_redis_factory,
+    get_service_factory,
+)
 from app.common.loop_watchdog import LoopWatchdog
 from app.services.document.pipeline.catalog import (
     GRAPH_NAME as DOCUMENT_GRAPH_NAME,
+)
+from app.services.stress.application.http_runner import (
+    HttpStressRunner,
+)
+from app.services.stress.application.stress_reporter import (
+    StressRunReporter,
 )
 
 
@@ -224,6 +243,19 @@ async def lifespan(
     app.state.auth = initialize_auth()
 
     # ========================================================
+    # 0.6 Mock 模型服务（开发 / 前端联调）
+    # ========================================================
+    #
+    # 位置刻意在模型注册表装配与 warmup 之前：
+    #   - warmup 会在启动期预建 llm 客户端，mock 必须先 listen；
+    #   - 启动失败必须让应用起不来 —— 显式要求 mock 却悄悄退回真实模型，
+    #     比启动失败更糟（前端以为在测 mock，实际在花钱调云端）。
+    #
+    # 它在自己的守护线程里跑，不占用主事件循环；关闭时停止线程。
+
+    app.state.mock_model_server = start_mock_server_if_enabled()
+
+    # ========================================================
     # 1. 数据源
     # ========================================================
     #
@@ -241,6 +273,12 @@ async def lifespan(
 
     app.state.datasource_manager = datasource_manager
 
+    # Redis 客户端工厂：与 session_factory 同一形状 —— 数据源就绪后装配
+    # 一次，之后任何地方 `get_redis_factory().optional_client()` 取用。
+    # Redis 是 required: false，所以 source 可能是 None；调用方据此退回
+    # 进程内实现（例如 L2/L3 画像缓存）。
+    build_redis_factory(datasource_manager.get_optional("redis"))
+
     # ========================================================
     # 1.5 运行事件流（Redis Stream）
     # ========================================================
@@ -249,7 +287,25 @@ async def lifespan(
     # 装配与停摆见 app/bootstrap/event_stream.py（含"为什么发布端与读取端
     # 用两个不同的 client"、以及读取端为什么不共用业务查询池）。
 
-    await initialize_event_stream(datasource_manager)
+    await initialize_event_stream()
+
+    # 工具结果缓存：有 Redis 就用 Redis，没有就退回进程内。
+    # 位置同样要在图装配之前 —— 节点第一次跑工具就要拿到最终实现。
+    initialize_tool_cache()
+
+    # ========================================================
+    # 1.6 MCP provider（外部工具来源）
+    # ========================================================
+    #
+    # 必须在第一次模型调用之前完成：`select_specs` 只读进程级注册表，
+    # 晚一步注册，那一轮对话就看不到 MCP 工具。
+    #
+    # 这里只负责**连接 + 注册**，不写 tool_definition —— 那是管理接口
+    # `POST /tools/discovery/sync` 的事（快照与运行时分开，本地工具
+    # 也是同一套）。provider 连不上只记 ERROR，不阻断启动，理由见
+    # app/bootstrap/mcp.py。
+
+    app.state.mcp_tools = await initialize_mcp_providers()
 
     # ========================================================
     # 2. Initialize PostgreSQL schema
@@ -346,6 +402,21 @@ async def lifespan(
     # 的构造参数名（对不上的由"按类型匹配"兜底，见
     # ServiceFactory._build_kwargs）。
 
+    # 真实压测 Driver：独立守护线程 + Reporter 回主 loop 写库。
+    # 创建在这里（而不是 build_factories 内部）是为了 lifespan 关闭时
+    # 能直接 stop 它，且能复用当前的 running loop。
+    redis_source = datasource_manager.get_optional("redis")
+    redis_url = getattr(redis_source, "url", None)
+
+    stress_runner = HttpStressRunner(
+        StressRunReporter(
+            session_factory,
+            asyncio.get_running_loop(),
+        ),
+        redis_url=redis_url,
+    )
+    app.state.stress_runner = stress_runner
+
     build_factories(
         session_factory,
         pool={
@@ -366,6 +437,10 @@ async def lifespan(
             # 它由 pipeline.catalog 定义、运行期不变，因此直接给值，
             # 而不是像上面几个那样从 app.state 上摸。
             "graph_name": DOCUMENT_GRAPH_NAME,
+            # 真实压测 Driver：通过 HTTP/SSE 驱动被测 Agent。
+            # 它在独立守护线程里跑，DB 写入由 StressRunReporter
+            # 投回当前主 loop（见 services/stress/application/http_runner.py）。
+            "stress_runner": stress_runner,
             # 任务运行时的两个单例（handler_registry / task_dispatcher），
             # 键名与各自的作用见 app/bootstrap/task.py::pool_entries。
             **task_infrastructure.pool_entries,
@@ -570,6 +645,18 @@ async def lifespan(
         # 每个 aclose_* 都是"没装配过则无操作"—— 上面的装配可能没走到
         # 它们就失败了，而那时最需要安静收场。
 
+        # 压测 Driver 独立于主 loop，但它的 Reporter 还要写库；必须在
+        # 数据源关闭之前停掉。先发取消信号，让 Campaign 尽量落
+        # incomplete 快照，再 join 线程。
+        try:
+            stress_runner = getattr(app.state, "stress_runner", None)
+
+            if stress_runner is not None:
+                stress_runner.stop()
+
+        except Exception:
+            logger.exception("Failed to stop stress driver.")
+
         try:
             await aclose_task_infrastructure()
         except Exception:
@@ -580,6 +667,13 @@ async def lifespan(
         except Exception:
             logger.exception("Failed to stop graph dispatcher.")
 
+        # MCP 是外部子进程：图停了之后它不会再有新调用，放在这里
+        # 关闭。必须在数据源之前 —— 它的调用栈可能还会碰 session。
+        try:
+            await shutdown_mcp_providers()
+        except Exception:
+            logger.exception("Failed to stop MCP providers.")
+
         try:
             await aclose_event_stream()
         except Exception:
@@ -589,6 +683,14 @@ async def lifespan(
             await model_factory.aclose()
         except Exception:
             logger.exception("Failed to close model factory.")
+
+        # Mock 只被模型客户端使用；客户端收掉之后再停它。
+        try:
+            stop_mock_server(
+                getattr(app.state, "mock_model_server", None)
+            )
+        except Exception:
+            logger.exception("Failed to stop mock model server.")
 
         try:
             await loop_watchdog.aclose()
@@ -657,6 +759,21 @@ if __name__ == "__main__":
     # uvicorn 自己的 loop_factory，在 Windows 上拿到
     # ProactorEventLoop，checkpointer 直接连不上。
     # 启动逻辑统一在 app/serve.py。
+    import argparse
+
     from app.serve import serve
 
-    serve(host="localhost", port=8080)
+    parser = argparse.ArgumentParser(
+        description="YTrader Agent backend server"
+    )
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument(
+        "--mock",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="启用进程内 mock 模型服务；默认跟随 mock_model.yaml。",
+    )
+    args = parser.parse_args()
+
+    serve(host=args.host, port=args.port, mock=args.mock)

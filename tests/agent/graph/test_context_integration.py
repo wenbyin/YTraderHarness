@@ -42,6 +42,7 @@ from __future__ import annotations
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from fakes import FakeAdapter, Outcome, make_definition, make_registry
 
@@ -112,6 +113,9 @@ class _RunContext:
         # 给 None 即可 —— 但**必须有这个属性**：runtime 的 context_factory
         # 按契约直接取它（见 infra/graph/registry.py 的 duty_key）。
         self.duty_key = None
+        # Trace 聚合键。本文件不测 trace，给 None 即可 —— 但必须有这个
+        # 属性：context_factory 按契约直接取它。
+        self.trace_id = None
 
 
 def _build_graph(adapter, *, tool_node) -> tuple:
@@ -186,7 +190,9 @@ def tools_node(monkeypatch):
             if extra_state:
                 result.update(extra_state)
 
-            return result
+            # tools 节点没有静态出边（见 graph.py）：下一跳由 Command 指定。
+            # 假节点同样要显式回 agent，否则第一轮工具之后图就收尾了。
+            return Command(goto="agent", update=result)
 
         monkeypatch.setitem(graph_module.NODE_FUNCTIONS, "tools", fake_tools_node)
 

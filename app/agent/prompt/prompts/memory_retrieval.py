@@ -190,8 +190,9 @@ def render_blocks(
         管理端预览      要一个整串 -> `render_user_message` 把它拼回去
         主模型上下文    每层各占一段 system 分节，标题由
                         `add_section(label=...)` 给，再由
-                        `system_message()` 套上 `## {label}`
-                        （见 context/processor/context.py）
+                        `system_message()` 渲染成不可信引用数据块
+                        `<ref:memory desc="{label}, …">`（见
+                        context/processor/reference.py）
 
     若正文里自带标题，注入时就渲染成两层 `## 用户画像` —— 所以分节注入的
     那条路**必须**用本函数而不是 `render_user_message`。

@@ -40,7 +40,7 @@ config:
 
   # **短命令**池的上限（业务读写、health_check）。
   # Redis 执行命令是单线程的，连接开大并不会更快。
-  max_connections: 10
+  max_connections: "${REDIS_MAX_CONNECTIONS:-50}"
 
   # **长连接**池的上限（事件流订阅专用，独立于上面那个）。
   #
@@ -54,7 +54,13 @@ config:
   #
   # ⚠️ 必须严格大于 event_stream.yaml 的 max_active_run_streams：redis-py
   #    的池满时是立刻抛异常、不排队，取等号时一次重试就能撞出来。
-  stream_max_connections: 20
+  stream_max_connections: "${STREAM_MAX_CONNECTIONS:-480}"
+
+  # **同步写线程池**的上限（事件发布端）。
+  #
+  # 每个写线程各占一条连接；必须 ≥ event_stream.yaml 的 write_workers。
+  # 池满时 redis-py 立刻抛 MaxConnectionsError，不排队。
+  sync_max_connections: "${REDIS_SYNC_MAX_CONNECTIONS:-32}"
 
   # 命令读写超时 / 建连超时（秒）。
   # 不设时 redis-py 会无限等，卡住的 Redis 会把调用方协程永久挂起。

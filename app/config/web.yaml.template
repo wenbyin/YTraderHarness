@@ -1,0 +1,44 @@
+# DeepSeek Search & Fetch API 的连接配置。
+#
+# 复制成 web.yaml 再改（真文件已 gitignore）：
+#
+#     cp app/config/web.yaml.template app/config/web.yaml
+#
+# 端点（2026-10 DeepSeek 官方 Search & Fetch API）：
+#
+#     POST https://api.deepseek.com/v1/tools/search
+#     POST https://api.deepseek.com/v1/tools/fetch
+#     Authorization: Bearer <DEEPSEEK_API_KEY>
+#
+# ⚠️ 不要把 llm.yaml 的 base_url（https://api.deepseek.com/v1）直接拼进来：
+# 那个是 chat 端点，Search / Fetch 的路径挂在站点根上。实现会自己还原
+# origin，所以这里写站点根或带 /v1 都行。
+#
+# 没配 web.yaml 时，实现会从 llm.yaml 的 deepseek provider 兜底
+# （api_key 与站点根同源），最后再回落环境变量 DEEPSEEK_API_KEY。
+
+web:
+  #: 站点根；实现会还原 origin 后拼 /v1/tools/search 或 /v1/tools/fetch。
+  base_url: "${DEEPSEEK_SEARCH_BASE_URL:-https://api.deepseek.com}"
+
+  #: 与 LLM 共用同一把 DeepSeek key。
+  api_key: "${DEEPSEEK_API_KEY}"
+
+  #: 单次 HTTP 的墙钟上限（毫秒）。
+  timeout_ms: 20000
+
+  #: 429 / 5xx / 网络错误的重试次数（不含首次）。
+  max_retries: 1
+
+  #: 搜索不传 count 时的默认条数。
+  default_count: 5
+
+  #: 搜索允许返回的最大条数（DeepSeek 上限 50；这里默认收紧到 20，
+  #: 避免把整页结果塞进上下文）。
+  max_count: 20
+
+  #: Search 的 need_content=true 时每条结果正文的截断长度（字符）。
+  max_content_chars: 4000
+
+  #: Fetch 返回的 Markdown 正文截断长度（字符）。
+  max_fetch_chars: 12000

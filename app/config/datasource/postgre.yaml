@@ -13,10 +13,24 @@ config:
   # LangGraph checkpointer 用 psycopg 直连，不吃 +asyncpg 的方言后缀。
   # 留空则由 dsn 自动去掉方言后缀推导，一般不需要显式配置。
   #  dsn_psycopg: "postgresql://postgres:123456@localhost:5432/ytrader_agent"
-  checkpointer_pool_size: 5
+  checkpointer_pool_size: "${CHECKPOINTER_POOL_SIZE:-60}"
 
-  pool_size: 10
-  max_overflow: 20
+  # 业务池 + checkpointer 池要留在 PostgreSQL max_connections 以内。
+  #
+  # 默认 max_connections=100：
+  #     业务池  30 + 30 = 60
+  #     checkpointer 30
+  #     合计 90（留 10 给管理连接/其它客户端）
+  #
+  # 为什么把 checkpointer 从 60 降到 30：
+  #   压测的瓶颈在业务请求（create session / create run），而不是
+  #   LangGraph checkpoint。业务池从 30 提到 60，给高并发轮次留出余量；
+  #   checkpointer 30 对本地压测足够。
+  #
+  # 要同时把两者都调得更大，必须提高 PG max_connections（需要重启
+  # PostgreSQL），并同步检查操作系统的连接上限。
+  pool_size: "${POSTGRES_POOL_SIZE:-60}"
+  max_overflow: "${POSTGRES_MAX_OVERFLOW:-60}"
   pool_timeout: 30
   pool_recycle: 1800
   echo: false

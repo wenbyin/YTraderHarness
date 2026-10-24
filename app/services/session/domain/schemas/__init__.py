@@ -5,7 +5,7 @@ domain/schemas/
 ├── enum.py
 │   └── SessionStatus / RunStatus / MessageRole / MessageKind / MessageStatus
 ├── session.py
-│   └── CreateSessionRequest / Session
+│   └── CreateSessionRequest / Session / SessionPage
 ├── run.py
 │   └── RunInput / CreateRunRequest / Run / ResumeAnswer / ResumeRequest
 └── agent_message.py
@@ -59,7 +59,7 @@ from .run import (
     Run,
     RunInput,
 )
-from .session import CreateSessionRequest, Session
+from .session import CreateSessionRequest, Session, SessionPage
 
 __all__ = [
     "AgentMessage",
@@ -77,6 +77,7 @@ __all__ = [
     "RunInput",
     "RunStatus",
     "Session",
+    "SessionPage",
     "SessionStatus",
     "decode_cursor",
     "encode_cursor",

@@ -30,7 +30,7 @@ maxlen: 10000
 #   但被裁空的键**仍然存在**（下次 XADD 会复用同一个键）。
 # 一个 run 一条 stream，跑一万次就是一万个键 —— 光靠 maxlen 止不住
 # 键数量的增长，那是内存泄漏，而且症状很隐蔽（每条流都很短，看着没问题）。
-ttl_seconds: 86400
+ttl_seconds: 600
 
 # ---- 读取端（SSE 订阅）----
 
@@ -68,13 +68,18 @@ idle_probe_after_reads: 5
 # 内存封住。
 subscriber_queue_size: 2000
 
-# 同时在订阅的 **run** 数上限。达到之后新订阅拿到一个说明原因的 503，而不是
-# 等连接池到 redis-py 内部才炸出 MaxConnectionsError（那个异常继承自
-# ConnectionError，很容易被误当成"网络抖动"）。
+# 同时在订阅的 **run** 数上限。
+#
+# HTTP SSE 路由达到上限时**等待**槽位（attach_wait），不再返回 503；
+# 同一个 run 的新订阅者复用现有流，不占额度。
 #
 # ⚠️ 必须**严格小于** app/config/datasource/redis.yaml 的 stream_max_connections ——
 #    池满时 redis-py 是立刻抛、不排队，取等号时一次重试就能撞出来。
-max_active_run_streams: 16
+#
+# ⚠️ Windows 的 SelectorEventLoop 还受 select() 约 512 socket 限制；
+#    这个值不能贴满 512，Driver 侧还会按 stress_eval.yaml 的
+#    concurrency_safety_ratio 再留余量。
+max_active_run_streams: "${MAX_ACTIVE_RUN_STREAMS:-300}"
 
 # 连续读失败**达到**这个次数，就把异常抛给订阅方（含第一次，也就是最多
 # 重试 N-1 次）。没到就重发一个心跳节拍继续读（见 reader.py）。
@@ -117,4 +122,13 @@ read_max_consecutive_errors: 3
 # maxlen 与 subscriber_queue_size **没跟着动**：那两处是互相咬合的
 # （subscriber_queue_size 要装得下一次补发，按 maxlen 定），只加 maxlen
 # 会让"重连后补发"更容易把订阅者顶掉。要调就两处一起调，并且先有观察。
-write_queue_size: 20000
+write_queue_size: 50000
+
+# 写线程数（分片数）。
+#
+# 事件按 stream key 哈希到固定分片；**同一条 run 的事件始终落在同一个
+# 分片**，因此 run 内的顺序仍然由该分片的 FIFO 保证。多个分片并行写，
+# 用来缓解单写线程在 GIL / Redis 往返上的队头阻塞。
+#
+# ⚠️ 必须 ≤ redis.yaml 的 sync_max_connections（每个线程一条同步连接）。
+write_workers: "${EVENT_WRITE_WORKERS:-4}"

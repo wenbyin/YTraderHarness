@@ -46,6 +46,13 @@ providers:
     adapter: langchain
     label: qwen（阿里千问）
 
+  #: 开发用的进程内 mock（openai run_server.py --mock）。
+  #: 与 qwen 同一条：llm.yaml 的 providers 里也要有 mock，且
+  #: app/common/llm.py 的 `_INIT_PROVIDERS` 要映射到 openai 适配器。
+  mock:
+    adapter: langchain
+    label: Mock Model（开发 / 前端联调）
+
 # ============================================================
 # credential_ref -> 环境变量名
 # ============================================================
@@ -103,7 +110,7 @@ models:
       structured_output: true
       streaming: true
       vision: false
-      reasoning: false
+      reasoning: true
 
     #: ⚠️ 该端点默认跑在**思考模式**下，而思考模式拒绝带强制 tool_choice
     #: 的请求 —— 那正是结构化输出（`with_structured_output` 的
@@ -144,10 +151,14 @@ models:
     #:
     #: 于是策略回到**形状判据**（见 `thinking_off_extra_body`）：
     #:
-    #:     带工具 / 带结构化输出   关思考 —— 这两类正是会撞出 400 或 DSML 的
-    #:                             形状，一个都不放过
-    #:     纯文本调用              开思考 —— 用户能看到推理；代价是那个泄漏
-    #:                             形状可能回来
+    #:     结构化输出              关思考 —— 会撞 400 / 截断 JSON
+    #:     带工具（未显式开启）    关思考 —— 防 DSML 泄漏
+    #:     纯文本调用              开思考 —— 用户能看到推理
+    #:
+    #: 2026-10-20 追加：ReAct 主循环的 `ModelRequest.enable_thinking=True`
+    #: 会**覆盖"带工具"这一条**（结构化输出仍然关）。也就是说主循环现在
+    #: 带工具也思考；代价是纯文本形状的 DSML 泄漏风险也适用于工具轮，
+    #: 由 leaked_tool_call 的两道闸兜底（可见的重试 / 报错）。
     #:
     #: ⚠️ 那个代价由**出口的闸**兜底，不是"应该不会发生"
     #: -------------------------------------------------
@@ -323,6 +334,25 @@ models:
     aliases:
       - qwen-flash
 
+  #: 开发用的 mock 模型。进程内 mock 服务与它同名（mock-chat）。
+  #: 它在 model.yaml 里始终存在，但只有 --mock 启动时才会被绑定到
+  #: 各 (agent_type, model_role)：见 catalog.get_model_registry 的
+  #: mock binding 覆盖。
+  - provider: mock
+    model: mock-chat
+    display_name: Mock Chat
+    context_window: 65536
+    capabilities:
+      tool_calling: true
+      structured_output: true
+      streaming: true
+      vision: false
+      reasoning: false
+    config:
+      max_tokens: 4096
+    aliases:
+      - mock-chat
+
 # ============================================================
 # Model Profile（规格 §4.3 / §5）
 # ============================================================
@@ -402,6 +432,23 @@ profiles:
       fallback_enabled: true
       retry_backoff: 0.2
 
+  #: 开发用 mock 档。--mock 启动时，所有 binding 都会被改指向这里
+  #: （见 catalog.get_model_registry 的 mock overlay）。
+  #:
+  #: ⚠️ 不重试、不降级：mock 自己会有首 token 延迟和抖动，
+  #: 一旦触发重试/降级就会打到真实云模型 —— 那会污染压测、还会花钱。
+  #: 超时给宽一些，覆盖 mock_model.yaml 里配置的最坏 TTFT + 输出时长。
+  mock_default:
+    display_name: Mock（开发）
+    description: 开发 / 前端联调的随机回复模型；不重试、不降级。
+    primary: mock-chat
+    fallbacks: []
+    policy:
+      timeout: 120
+      max_retries: 0
+      total_timeout: 180
+      fallback_enabled: false
+
 # ============================================================
 # 别名（规格 §4.3）
 # ============================================================
@@ -455,6 +502,14 @@ bindings:
     model_role: classification
     profile: classification_default
     description: Agent Builder 对用户输入做的分类（走千问 flash）。
+
+  # 子代理 / worker 的任务执行调用。agent_type 用 `subagent` 而不是
+  # `react`：它要能单独换模型（worker 常常是长工具循环，与主对话的
+  # 取舍不同），而 role 仍是 reasoning（这次调用干的就是推理）。
+  - agent_type: subagent
+    model_role: reasoning
+    profile: reasoning_default
+    description: 子代理 / worker 执行单个任务时的推理调用。
 
   - agent_type: planner
     model_role: reasoning

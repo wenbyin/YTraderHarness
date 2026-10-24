@@ -7,12 +7,12 @@ Context Builder：访问 LLM 之前的上下文构建。
 Summary、决策门…… 区别只在"流水线的哪些阶段参与、参数是什么"，
 不在有没有这一层。
 
-    BaseContextBuilder     契约 + 固定 11 步的调度（builder/base.py）
+    BaseContextBuilder     契约 + 固定 13 步的调度（builder/base.py）
     contracts.py           执行期数据形状（ModelRequest 就是 Model 模块那一个）
     registry.py            按 ContextBuilderType 反射发现实现
     updater.py             调用**之后**的上下文回写（本次仅保留接口）
     processor/             Processor 流水线：自描述依赖 + 统一 State 解析
-    builder/agent_invoke.py 生产实现：把 11 个阶段委托给流水线
+    builder/agent_invoke.py 生产实现：把 13 个阶段委托给流水线
 
 分工（谁决定什么）
 ----------------

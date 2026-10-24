@@ -21,6 +21,7 @@ tool 模块有过一次相反的取舍（分类树与关联表合成一个契约
 from __future__ import annotations
 
 from abc import abstractmethod
+from datetime import datetime
 from uuid import UUID
 
 from app.common.repository.base import BaseRepository
@@ -60,11 +61,16 @@ class AgentSessionRepository(BaseRepository):
 
         ⚠️ user_id 是**必填**，不是"None 表示不过滤"
         ----------------------------------------
-        默认不过滤意味着"谁忘了传就静默把别人的会话读出来"，而本仓储
-        是读会话的**唯一**入口（三个调用点全在 HTTP 路径上）。将来若真
-        出现"没有用户"的读（后台派发今天完全不读会话），**另加一个名字
-        不同的方法**（如 get_any）并在那里写明为什么可以不过滤，
-        不要在这里开一个默认口子。
+        默认不过滤意味着"谁忘了传就静默把别人的会话读出来"。本仓储读会话
+        有几种口径，各自名字不同，别混用：
+
+            get / get_for_update        本人或 NULL（按 id 读）
+            get_any                     后台无身份读，不做过滤
+            get_owned_for_update        严格本人 + 行锁（删除）
+            list_page / archive         严格本人（列表 / 归档）
+
+        将来若再出现"没有用户"的读，**另加一个名字不同的方法**并在那里写明
+        为什么可以不过滤，不要在这里开一个默认口子。
         """
 
         raise NotImplementedError
@@ -97,6 +103,111 @@ class AgentSessionRepository(BaseRepository):
         Raises:
             无 —— 取不到返回 None（会话可能已经不存在，见调用方对
             "会话没了"的处理：宁可整轮不索引，也不写出无归属的行）。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_for_update(
+            self,
+            session_id: UUID,
+            *,
+            user_id: str,
+    ) -> AgentSession | None:
+        """
+        按 id 取会话并**锁住这一行**，可见性与 `get` 相同（本人或 NULL）。
+
+        谁用：`create_run` / `resume_run`。它们要在“会话是否已归档”这个
+        判断上与会话删除串行化 —— 只读一次再写，归档可能恰好插在中间：
+
+            create_run 读到 active  ->  归档提交  ->  create_run 插入运行
+
+        结果是给一个已归档的会话开了新运行。`SELECT ... FOR UPDATE` 让两边
+        在会话行上排队：先拿到锁的那一方先完成，后一方重读时看到的是新状态。
+
+        ⚠️ 必须在事务里调用（请求级 `Service[...]` 会开）。离开事务的
+        `FOR UPDATE` 没有意义，锁随语句结束就放掉了。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_owned_for_update(
+            self,
+            session_id: UUID,
+            *,
+            user_id: str,
+    ) -> AgentSession | None:
+        """
+        **严格本人**地取会话并锁行，供 DELETE 使用。
+
+        与 `get_for_update` 唯一的差别是**不含** `user_id IS NULL`：存量公共
+        会话不属于任何人，因此不能被任何一个用户删除。取不到一律 None，
+        调用方按 404 处理 —— 别人的、无主的、不存在的共用同一个响应。
+
+        ⚠️ 空 user_id 不应该在这里被“宽容处理”：空串与 `user_id = ''`
+        比较的结果是什么都匹配不到（写路径把空串归一成了 NULL），因此自然
+        404。绝不能把空串换成 None 交给仓储 —— 那会变成 `IS NULL`，正好把
+        存量公共会话变成可删除的。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_page(
+            self,
+            *,
+            user_id: str,
+            status: str | None,
+            agent_id: str | None,
+            updated_after: datetime | None,
+            updated_before: datetime | None,
+            offset: int,
+            limit: int,
+    ) -> tuple[list[AgentSession], int]:
+        """
+        取当前用户的一页会话，并返回满足条件的总数。
+
+        ⚠️ 是**严格本人**，不是 `get` 的“本人或 NULL”
+        --------------------------------------------
+        列表回答的是“**我的**会话”。无主的存量会话不属于任何人，混进每个人
+        的列表会让分页与 total 失去意义；而如果允许它们出现却又不允许删除，
+        又会形成“看得见、删不掉”的不一致。
+
+        ⚠️ 一个方法返回两者，而不是 list + count 两个方法
+        ---------------------------------------------
+        分页**总是**两个都要（否则前端画不出页码）。拆开会让每个调用方都写
+        两遍筛选条件，还容易只改一处 —— 那会让 total 与 items 对不上。条件
+        在本方法内部构造一次、两条语句共用，见实现里的 `_conditions`。
+
+        Args:
+            status: 会话状态精确匹配；None 表示不过滤（默认值由服务层决定，
+                    仓储不替业务做“默认 active”）。
+            agent_id: Agent 类型精确匹配；None 表示不过滤。
+            updated_after / updated_before: 最后活动时间的**闭区间**；
+                    None 表示该侧不过滤。调用方负责时区归一。
+            offset / limit: 已经换算好的偏移与条数。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    async def archive(
+            self,
+            session_id: UUID,
+            *,
+            user_id: str,
+    ) -> bool:
+        """
+        把**本人**的会话置为 archived，并把 updated_at 推到当下。
+
+        归属条件进 SQL（`WHERE session_id = ... AND user_id = ...`），因此
+        即使服务层忘了先校验归属，这里也不会改到别人的行。返回是否改到了
+        行（False = 不存在或不归本人）。
+
+        ⚠️ 已经是 archived 时调用方应**跳过本方法**：重复归档会把
+        updated_at 推前，让一条早已删除的会话跳到列表顶部。幂等判断在服务
+        层做（它已经拿到了锁住的会话行）。
         """
 
         raise NotImplementedError

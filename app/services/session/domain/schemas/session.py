@@ -2,7 +2,7 @@
 会话的对外契约。
 
 逐字段对应 session.yaml 的 components/schemas：
-    CreateSessionRequest / Session
+    CreateSessionRequest / Session / SessionPage
 
 ⚠️ 三处刻意的**不对称**，都是照规格来的，不是漏写
 -----------------------------------------------
@@ -36,6 +36,7 @@ from app.common.schemas import APIModel
 __all__ = [
     "CreateSessionRequest",
     "Session",
+    "SessionPage",
 ]
 
 
@@ -87,7 +88,32 @@ class Session(APIModel):
             " agent_message 表，会话这一行本身没有字段变动，所以是"
             " create_run 显式把这一列推到当下"
             "（见 repository/agent_session.py 的 touch）。\n\n"
-            "新建时它等于创建时刻，之后每次发送都刷新。前端按"
-            "「最后活动」排序就用它（会话列表接口还没有，这一列先备着）。"
+            "新建时它等于创建时刻，之后每次发送都刷新。"
+            "`GET /sessions` 就按这一列倒序，因此它同时是列表的排序键。"
+        ),
+    )
+
+
+class SessionPage(APIModel):
+    """
+    `GET /sessions` 的一页结果。
+
+    ⚠️ 与消息那套的分页形状**不同**，别混用
+    ------------------------------------
+    会话列表是 page/page_size + total（与 documents / tasks 一致），
+    消息历史是游标分页（见 agent_message.py 的解释）。理由在各自的
+    契约里：会话列表的头部会因“刚发过消息”而换位置，但调用方通常只是
+    一页页翻，total 对画页码仍然有用；而聊天历史是尾部持续追加的，
+    页码会重复/漏行。
+    """
+
+    items: list[Session] = Field(
+        description="当前页的会话，按 updated_at 倒序（同一时刻按 session_id 倒序）。",
+    )
+
+    total: int = Field(
+        description=(
+            "满足筛选条件的总数（不只是当前页的条数）。"
+            "与 items 在同一个请求事务里查询。"
         ),
     )

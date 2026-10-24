@@ -18,9 +18,25 @@ config:
   derive_from: postgresql
 
   # checkpointer 的连接池与业务池相互独立（驱动不同、生命周期不同）。
-  # 一次运行期间会反复写 checkpoint，但不能占太多连接。
-  pool_min_size: 1
-  pool_max_size: 5
+  # 一次运行期间会反复写 checkpoint。
+  #
+  # ⚠️ 上限要覆盖**并发 run 数**，不是"看起来够用"就行：压测是 102 并发，
+  #    而 langgraph 的 saver 原本还有一个全局锁（见下面关掉的开关），
+  #    60 条连接 + 那把锁一起把 pre-node 空档拖到 6 秒级。
+  #
+  # ⚠️ PostgreSQL 的 max_connections（本机默认 100）必须同时调大：
+  #    本池 + 业务池（10 + max_overflow 20）+ store 共用，120 时
+  #    至少要 200。只改这里不改 PG，连接会在建连阶段报
+  #    "too many clients already"。
+  pool_min_size: "${CHECKPOINTER_POOL_MIN:-2}"
+  pool_max_size: "${CHECKPOINTER_POOL_MAX:-60}"
+
+  # langgraph 的 AsyncPostgresSaver 用一个 asyncio.Lock 串行化**所有**
+  # cursor 操作（读和写都算）。单连接时必须；连接池下只会把整个进程的
+  # checkpoint I/O 排成一条队。false = 关闭它，让池真正并发。
+  #
+  # 回退开关：设成 true 就退回旧行为（用于怀疑并发导致数据错乱时对照）。
+  parallel_cursor_operations: "${CHECKPOINTER_PARALLEL_CURSORS:-true}"
 
   # 同一个池上的 LangGraph store（跨轮存储）。目前唯一的消费者是审批
   # 拦截器的批准账本（app/agent/tools/processor/interceptor/approval.py）

@@ -18,7 +18,7 @@
 
 ---
 
-## 四个核心能力
+## 五个核心能力
 
 ### 一、工具定义与拦截器链**运行时**可改
 
@@ -341,17 +341,82 @@ Graph 检索**端到端未实现**（`embed()` 抛 `NotImplementedError`，容�
 
 ---
 
+### 五、规划与多代理：先把活拆成 DAG，再决定谁来干
+
+**主张：复杂请求先变成「可调度的任务图」，再按"能并行就并行"决定用主 agent 顺序跑、还是开子代理团队。**
+
+这两件事是**分开的两层**，混在一起就没法排查：
+
+| 层 | 做什么 | 谁负责 | 手册 |
+|---|---|---|---|
+| **规划** | 把请求拆成带依赖的 A2A 任务，写进 state | `planner` 子图（`agent_planner`） | [`README_PLAN.md`](README_PLAN.md) |
+| **执行** | claim 任务、跑任务、回写结果 | 主 `agent`（顺序）或 `subagent_worker` 子图（并行） | [`README_SUB_AGENT.md`](README_SUB_AGENT.md) |
+
+#### 计划就是一张 DAG
+
+模型只输出 `PlanDraft`：`id` + `message` + `metadata{skill_key, blocked_by, block_policy, capabilities}`。
+**执行态字段一个都不写**（`status` / `claim` / `blocked` / `messageId` 全由转换器补齐）——
+模型写它们只会制造第二份真相。
+
+```
+PlanDraft  ──validate_plan()──▶  Kahn 拓扑排序  ──to_a2a_tasks()──▶  A2A Task
+             DAG / 体积 / id 格式               id = <plan_id>:<local_id>
+             自依赖 / 悬空依赖 / 环              blocked_by ↔ blocked 正反边
+```
+
+校验是**拒绝制**，不是裁剪制：`message` 或 `metadata` 超过 **64 KiB**、有环、引用不存在的依赖 —— 整份计划作废（`PlanValidationError`）。
+只有"`skill_key` 不在目录里""未知 capability code"这类才降级成 `plan.notes` 里的 warning。
+
+#### 规划失败不会污染执行
+
+| 失败 | 处置 |
+|---|---|
+| ReAct 探索段抛异常 | 降级成一条"请基于当前对话直接生成计划"的 AIMessage，继续走 `task_generator` |
+| `task_generator` 抛异常 | `return {}` —— **保留旧计划**，不炸整轮 |
+| planner 调用了会跳父图的工具 | 拦下，转成一条模型可读的错误 ToolMessage，让它换个做法 |
+
+#### 什么时候开子代理
+
+**不是有任务就并行**。判据是"当前有 **≥2 个 ready task**"（依赖都已 `COMPLETED`），
+且本次运行**确实暴露了 `create_team`**；满足时 `task_listener` **不 claim**，写
+`team_decision="pending"` 回主 agent 做一次决策。
+
+这个询问是**一次性**的：主 agent 那一轮结束后若仍是 `pending`（没调 `create_team`），
+listener 写 `declined` 并继续顺序 claim —— 否则 `listener → agent → listener` 会无限空转。
+
+#### 三条并发正确性保证
+
+| 保证 | 做法 | 不这么做 |
+|---|---|---|
+| **谁跑哪个任务是确定的** | 父图 `subagent_dispatch` 先 CAS 预 claim，再按 `Send` 分发（`owner={run_id}:worker:{i}`） | 多个 worker 各自读板抢同一批 ready，重复执行 |
+| **任务板是执行态权威** | Redis（TTL 7 天，按 `plan_id` 索引）；graph state 只是投影 | `Send` payload 取代 state，worker 根本看不到父图 `tasks` |
+| **结果只走任务板** | worker 写 `artifacts` + `result_summary`；父图在全部终态后起一次**汇总回合** | worker transcript 串进主对话，多 worker 并发写 `messages` |
+
+**fail-closed 是默认姿态**：没有 Redis 任务板 → `subagent_dispatch` **不派发**，退回主 agent 顺序执行；
+读板失败 → 直接抛错让整轮 failed，不假装"没有 ready task"。
+
+#### 两条必须知道的边界
+
+1. **计划任务没有 HTTP 端点** —— 只活在 graph state / Redis 任务板 / 事件流里（`/api/v1/tasks` 是另一套异步作业）。
+2. **claim 的 lease 只写不续租** —— `lease_expires_at` 写进 claim，但没有回收逻辑；worker 崩溃后任务会停在 `WORKING`。
+
+---
+
 ## 其他值得注意的机制
 
-除上面四项外，这些也是本仓库区别于"裸用 LangGraph"的地方：
+除上面五项外，这些也是本仓库区别于"裸用 LangGraph"的地方：
 
 | 机制 | 一句话 | 详见 |
 |---|---|---|
 | **模型选择拒绝兜底** | `(agent_type, model_role, attributes)` 等值匹配；匹配不到**报错**，平局**也报错** —— `bindings` 刻意无通配 `*` | [`README_MODEL.md`](README_MODEL.md) |
-| **上下文是固定 11 段流水线** | 顺序写死在 `PIPELINE_TEMPLATE`，**import 期断言**枚举与模板一致；12 个处理器 | [`README_CONTEXT.md`](README_CONTEXT.md) |
+| **上下文是固定 13 段流水线** | 顺序写死在 `PIPELINE_TEMPLATE`，**import 期断言**枚举与模板一致；14 个处理器（任务模式多出 `TASK_RESOLVER` / `SKILL_LOADER` 两段，跑不跑由 gate 决定） | [`README_CONTEXT.md`](README_CONTEXT.md) |
 | **处理器不能改对话** | 只能 `add_section` / `add_history` / 声明工具；回写 state 走白名单，**只有 `summary` 与 `memory` 两个键** | [`README_CONTEXT.md`](README_CONTEXT.md) |
 | **HITL 审批 + 持久化账本** | `interrupt()` 挂起图，"始终允许"落 LangGraph store，**重启不重复问**；代码里显式标注了「少调一次 `interrupt()` 会让后面的中断错位」 | [`README_TOOL.md`](README_TOOL.md) |
 | **模型私有标记的字符流闸** | deepseek 思考模式把工具调用写成 DSML 标记当正文吐出，**全程不报错**；用有状态闸跨分片拦截（含全角/半角竖线） | `app/agent/model/leaked_tool_call.py` |
+| **规划与执行分离** | planner 只产出 A2A 任务、**不发布任务板**；发布在 `create_team`（审批通过后才执行）—— 规划失败不会留下半张任务板 | [`README_PLAN.md`](README_PLAN.md) |
+| **任务板是执行态权威** | 一旦引入 worker，graph state 只是投影：`Send` payload 取代 state、多 worker 并发、跨 run 恢复都要求一个共享权威（Redis，TTL 7 天，幂等 upsert 不覆盖运行态） | [`README_SUB_AGENT.md`](README_SUB_AGENT.md) |
+| **预 claim，不是 worker 抢** | 父图 CAS 好再按 `Send` 分发，谁跑哪个任务是确定的；**没有任务板就退回顺序执行**（fail-closed），不假装并行 | [`README_SUB_AGENT.md`](README_SUB_AGENT.md) |
+| **子代理结果只走任务板** | worker transcript **永不**进主对话；全部终态后父图起一次汇总回合，把结果渲染成一条 HumanMessage 交主 agent | [`README_SUB_AGENT.md`](README_SUB_AGENT.md) |
 | **四层记忆，可重建性不同** | L0 是索引（可重建），**L1 是权威数据（不可重建）**；L2/L3 由 L1 抽象 | [`README_MEMORY.md`](README_MEMORY.md) |
 | **SSE 遇审批主动关流** | **跨仓库前端契约**：前端须自行 `resume` 后重开；"所有 interrupt 到齐"的权威信号是 **DB 状态**，不是事件批次 | [`README_STARTUP.md`](README_STARTUP.md) |
 | **契约先行** | 19 份 OpenAPI 规格**运行时不加载**；契约名与类名可不同，有专门的翻译函数（`AgentMessage`→`Message`） | [`README_STARTUP.md`](README_STARTUP.md) |
@@ -380,9 +445,12 @@ app/
 ├── bootstrap/         # 装配层：auth / event_stream / graph_runtime / pipelines / task
 ├── api/v1/            # HTTP 路由（契约实现）+ router.py（public / protected 两棵树）
 ├── agent/             # LLM 运行时（图侧，不做业务持久化）
-│   ├── graph/react/   # ReAct 图：nodes / state / routing / catalog / runtime
+│   ├── graph/react/   # 父图：builder / agent / tools / task_listener / subagent_dispatch
+│   ├── graph/planner/ # 规划子图：planner_llm / planner_tool / task_generator
+│   ├── graph/subagent/# worker 子图：task_listener / llm_node / tool_node
+│   ├── plan/          # 计划层：契约校验 / A2A 转换 / 任务板 / claim（**不 import LangGraph**）
 │   ├── state/         # AgentClassification 与枚举
-│   ├── context/       # ContextBuilder 流水线（11 段 + 12 处理器）
+│   ├── context/       # ContextBuilder 流水线（13 段 + 14 处理器）
 │   ├── model/         # ModelRegistry / resolver / adapters / runtime
 │   ├── prompt/        # 节点功能提示词（分类、记忆、摘要）
 │   ├── tools/         # 处理器链契约（interceptor / observer / transformer）+ @tool
@@ -406,33 +474,75 @@ app/
 └── config/            # 运行时配置（casdoor / llm / model / event_stream / datasource/*）
 ```
 
-### 两张 LangGraph 图
+### 四个图身份、两个注册图
 
 都在 `app/bootstrap/pipelines.py` 装配，注册进同一个 `GraphRegistry`，由同一个
 `InProcessGraphDispatcher` 运行（一个 asyncio 队列 + 一个串行 worker；每个 run spawn 子任务，
 **因此取消针对的是 run，不是 worker**）。
 
-**图 A · 文档摄入管线** — `document_ingestion_pipeline`（见"核心能力四"）
+**注册的是两个图，但 agent 这张图里还编译进了两个子图** —— 两张子图各有自己的 catalog
+（节点目录 / 版本 / tool scope 命名空间）与**独立 state schema**，但**不单独进 registry**：
 
-**图 B · Agent ReAct 图** — `agent_react` v1.3.0：
+> ⚠️ 它们的 `GRAPH_NAME`（`agent_planner` / `agent_subagent`）目前**只做声明与再导出**，
+> 没有任何运行期消费者 —— 只有 `agent_react` 与 `document_ingestion_pipeline` 的图名进了
+> `GraphDefinition(name=...)`。子图的运行期观测靠的是**节点 id**（`node_span`），不是图名。
+
+| 图 | `GRAPH_NAME` | 版本 | 形态 |
+|---|---|---|---|
+| 文档摄入管线 | `document_ingestion_pipeline` | `1.0.0` | **独立注册**（见"核心能力四"） |
+| Agent ReAct | `agent_react` | **`1.12.0`** | **独立注册**，父图 |
+| ↳ Planner | `agent_planner` | `0.1.0` | `build_planner_graph().compile()` 作为节点 `planner` |
+| ↳ Sub-Agent worker | `agent_subagent` | `0.1.0` | `build_subagent_graph().compile()` 作为节点 `subagent_worker` |
+
+> 子图 `compile()` **不带 checkpointer**，会继承父图的；`interrupt` 由父 Pregel 循环管理（冒泡 / resume），
+> 子图的 custom 事件也进父运行的事件流。代价是子图输出会按**同名 channel** 合并回父 state ——
+> 已用空 `output_schema` 隔掉（见下）。
+
+**图 B · Agent ReAct 图** — `agent_react` v1.12.0：
 
 ```
-START → builder → (execution_plan == plan ? planner → agent : agent)
-agent → (有 tool_calls ? 每个 tool_call 一个 Send 扇出到 tools → agent : END)
+START → builder
+builder --(分类判要规划)--> tools            # 合成一条 enter_plan_mode 调用，与模型自己调用同一条路径
+builder --(plan 且没有任务 / 任务全完成)--> planner
+builder --(其余)--------> agent
+
+planner --> task_listener --> agent         # 默认；YTRADER_PLAN_STOP_AFTER_PLANNER=1 时 planner -> END
+agent --(有 tool_calls)--> tools ×N         # 一个 tool_call 一个 Send 分支
+agent --(无 tool_calls，还有任务)--> task_listener
+agent --(无 tool_calls，没有任务)--> END
+tools --(Command.goto)--> agent | planner | subagent_dispatch
+
+subagent_dispatch --(预 claim，Send ×N)--> subagent_worker ×N
+subagent_worker   --(join)--------------> subagent_dispatch   # 下一波
+subagent_dispatch --(没有 ready task)----> task_listener      # 收尾
 ```
 
 | 节点 | 职责 | 用哪类模型 |
 |---|---|---|
-| `builder` | 输入分类 + **能力选择 → 工具集**（每 run 一次） | 快模型 |
-| `agent` | 主循环 | 推理模型 |
-| `planner` | ⚠️ 占位（plan-and-execute 待做） | — |
+| `builder` | 输入分类 + **能力选择 → 工具集**（每 run 一次） | 快模型（`CLASSIFICATION`） |
+| `agent` | 主循环 | 推理模型（`REASONING`） |
+| `planner` | **编译子图**：ReAct 探索 → 严格 JSON 的 `PlanDraft` → A2A 任务 | 推理（`agent_type=planner`） |
 | `tools` | 扇出：每个 tool_call 一个分支，各自过处理器链 | — |
+| `task_listener` | 完成上一个任务（落 `COMPLETED`）→ claim 下一个；全终态时触发**汇总回合** | — |
+| `subagent_dispatch` | 从任务板**预 claim** 最多 `subagent_workers` 个 ready task，动态 `Send` 扇出；没有就回 listener | — |
+| `subagent_worker` | **编译子图**：一个分支执行一个已 claim 的任务 | 推理（`agent_type=subagent`） |
 
 `ReactState` 是 `TypedDict`（**刻意不用 Pydantic**）：`messages` 用 `add_messages` reducer，其余是
 "最后写入者胜出"的通道。路由函数是**纯函数**。
 
 > **为什么要扇出成"一个 tool_call 一个分支"**：HITL 的 resume 语义依赖它 ——
 > 一分支一个中断，审批账本跳过时才不会让后面的中断错位。
+
+**三条子图隔离规则**（都是踩过坑之后写死的）：
+
+| 规则 | 不这么做会怎样 |
+|---|---|
+| planner 用 `input_schema=PlannerInput` / `output_schema=PlannerOutput` | 父图 `context_policy` 漏进规划阶段，主 agent 的职责提示词与工具集污染规划；`messages` 漏回父图，工具循环被当成用户可见回复 |
+| worker 用**空** `output_schema=SubAgentOutput` | worker transcript 追加进主对话；多 worker 并发写 `tasks`/`plan` → 最后写者赢或 `InvalidUpdateError` |
+| 两张子图各自一个 tool scope uuid5 命名空间 | 与主图算出同一个 `branch_key`，观测行被合并成一行 |
+
+> 为什么 planner 必须是子图：它要做工具循环，中间推理一旦进主对话 `messages`，会污染用户可见回复、
+> 被 `message_recorder` 落库、被前端时间线渲染。详见 [`README_PLAN.md`](README_PLAN.md)。
 
 ### 一次对话的完整链路
 
@@ -441,12 +551,19 @@ POST /sessions/{id}/runs
   → 存消息、建 run 记录（session 域）
   → InProcessGraphDispatcher.dispatch()（入队 → 子任务）
   → builder 节点：从 DB 现读能力候选 → 一次分类 LLM 调用 → capability_needs → tool_keys
-  → agent 节点：ContextBuilder 跑 11 段流水线
+       └─ 判要规划 → 合成一条 enter_plan_mode 调用 → tools 节点 → 图跳到 planner
+  → planner 子图（可选）：ReAct 探索（查技能/能力目录）→ task_generator 产出 A2A 任务
+       └─ 只发 plan.published 事件 + 写父图 state；**不发布任务板**
+  → task_listener：claim 第一个 ready task（或发现 ≥2 个 ready 时先问 main agent 要不要开团队）
+  → agent 节点：ContextBuilder 跑 13 段流水线
        → 拼出一条 SystemMessage（各处理器 section 按序注入）
        → ModelResolver：「(agent_type, model_role, attributes)」→ profile
        → ModelRuntime：候选链 / 重试 / 超时 / fallback
        → 流式产出 → leaked_tool_call 字符流闸 → 事件发布
   → 有 tool_calls？ → tools 扇出 → 处理器链（auth → approval[可能 interrupt] → cache → 真正调）
+       └─ create_team 审批通过 → 发布任务板 → subagent_dispatch 预 claim → Send ×N
+            → subagent_worker 执行 → join 回 dispatch → 下一波 或 收尾
+  → 全部任务终态 → task_listener 起**汇总回合**（结果从任务板 artifact 取，不取 worker transcript）
   → 事件经 Redis Stream → SSE 下发；遇审批**主动关流**（前端自行 resume 后重开）
 ```
 
@@ -527,26 +644,53 @@ POST /sessions/{id}/runs
 | 逻辑删除 | **不清外部索引** —— 删了文档，chunk 仍可被召回 |
 | 成本估算 | `model.yaml` 的 `pricing:` 段全部被注释 → `estimated_cost` 恒为 `None` |
 | 结构化输出不能流式 | `_can_stream` 要求 `response_format is None` |
+| **计划任务没有 HTTP 端点** | A2A 计划任务只活在 graph state / Redis 任务板 / 事件流；`/api/v1/tasks` 是**异步作业**，另一套东西（名字撞车，别混） |
+| **4 个任务工具是占位** | `create_task` / `claim_task` / `update_task` / `complete_task` 全返回 `not_implemented=true`；只有 `create_team` 接了真实副作用 |
+| **claim lease 只写不续租** | `lease_expires_at` 写进 claim，但 `app/agent/plan/` 下**没有续租 / 过期回收**；`is_ready` 也不看 lease → worker 崩溃后任务永久停在 `WORKING` |
+| **worker 不是独立进程** | 是同一进程内的 `Send` 分支（Pregel super-step 并发），**不能跨机扩容** |
+| **`subagent_mode` 只写 `on`/`off`** | `pending` / `denied` 仅存在于 `ReactState` 注释；团队决策用的是另一个字段 `team_decision` |
+| **`block_policy` 只有一种** | `all_succeeded`；其他值直接拒绝（`contracts.py`） |
 | Context 的三个 Source 端口 | `ProfileSource` / `KnowledgeSource` / `MemorySource` **全仓零实现** |
 | L2 / L3 消费侧 | 场景与画像**只有写入方**，还没有检索/注入 |
 | L1 背景对话 | 只喂增量，从对话中间开始时指代没有先行词（漏抽或猜，**两类都不报错**） |
-| `planner` 节点 | 占位，plan-and-execute 未实现 |
 | Neo4j | 已接为 DataSource 但**尚未被消费** |
 | `tool_span` | react 图的节点级 span **只打日志不落库**（文档管线才落表） |
 | 契约一致性 | 只有 document 域有 `spec_check` 自动闸，其余域靠人守 |
 
-更大的方向性未做项（多 agent 协作、sandbox、agent eval、trace）见仓库根 `todolist`。
+更大的方向性未做项（sandbox、agent eval、trace、比 orchestrator-worker 更复杂的协作拓扑）见仓库根 `todolist`。
+多 agent 协作已落地到 **orchestrator-worker** 形态（`create_team` + worker 子图，见 [`README_SUB_AGENT.md`](README_SUB_AGENT.md)）。
 
 ---
 
 ## 阅读建议
 
+### 子系统手册索引
+
+九份手册都按"事实 + 已知缺口"写，**没有一份是设计愿景**。
+
+| 手册 | 回答什么问题 |
+|---|---|
+| [`README_STARTUP.md`](README_STARTUP.md) | 怎么跑起来、配置在哪、启动失败怎么查、SSE 与前端契约 |
+| [`README_DOCUMENT.md`](README_DOCUMENT.md) | 文档摄入流水线 + RAG 检索：配置是 DB 行、加组件放手即用 |
+| [`README_EVAL.md`](README_EVAL.md) | 检索评测：金标怎么来、指标怎么算、"金标死在哪一段" |
+| [`README_CONTEXT.md`](README_CONTEXT.md) | 上下文怎么拼出来：固定段序、处理器能改什么、白名单回写 |
+| [`README_MODEL.md`](README_MODEL.md) | 模型怎么选：等值匹配、匹配不到就报错、为什么没有通配兜底 |
+| [`README_TOOL.md`](README_TOOL.md) | 工具定义、处理器链洋葱模型、HITL 审批账本 |
+| [`README_MEMORY.md`](README_MEMORY.md) | L0–L3 四层记忆，以及哪一层可重建、哪一层是权威 |
+| [`README_PLAN.md`](README_PLAN.md) | **计划模式**：请求怎么拆成 DAG、计划怎么变成 A2A 任务、谁发布任务板 |
+| [`README_SUB_AGENT.md`](README_SUB_AGENT.md) | **子代理**：worker 怎么被派发、任务板怎么保证不重复执行、结果怎么回流 |
+
+### 推荐顺序
+
 第一次读这个仓库，建议的顺序：
 
-1. **本文的「四个核心能力」** → 拿到它和别的 harness 的差异面
+1. **本文的「五个核心能力」** → 拿到它和别的 harness 的差异面
 2. **[`README_STARTUP.md`](README_STARTUP.md)** → 把它跑起来，知道配置在哪
-3. **挑一个你关心的子系统手册**，并且**先读它的「已知缺口与注释失真」章节** —— 那节列的是当前**不能**工作的能力，比正面描述更能校准预期
+3. **挑一个你关心的子系统手册**，并且**先读它的「已知缺口」章节** —— 那节列的是当前**不能**工作的能力，比正面描述更能校准预期
 4. 再回到代码，从 `app/main.py` 的 lifespan 往下走 —— 它是组合根，每一步的位置都有注释解释理由
+
+> 只想看**新增的规划 / 多代理能力**：直接读 [`README_PLAN.md`](README_PLAN.md) 与
+> [`README_SUB_AGENT.md`](README_SUB_AGENT.md)，两份都自带"端到端时序 + 失败矩阵"。
 
 > 本仓库的注释密度很高，而且**大量注释在解释"为什么"，包括"为什么不是另一种写法"**。
 > 这不是装饰 —— 它是这个项目最主要的交付物之一。

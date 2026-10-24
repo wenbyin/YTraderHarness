@@ -70,7 +70,8 @@ def blocks_from(preview: Any) -> list[dict[str, Any]]:
     后者是"四段拼成一整串"的结果，管理端的预览端点在用它。主模型这边四段
     各占一段 system 分节、标题由 `add_section(label=...)` 给 —— 若用那个串，
     每段会自带一个 `## 标题`，再被 `system_message()` 套一层，渲染成两层
-    标题。
+    标题。（这四段按不可信引用数据注入，`system_message()` 现在渲染成
+    `<ref:memory desc="标题, …">` 而不是 `## 标题`；排版仍然只来自本函数。）
 
     两个消费者共用同一处排版（`render_blocks`），所以管理端看到的与主模型
     看到的**不会漂**。
@@ -118,7 +119,8 @@ def inject(
     把分节铺成 system 片段。
 
     各段共用 section 名（见 `SECTION_NAME`），标题走 label ——
-    `system_message()` 会把每段渲染成 `## {label}`。
+    `system_message()` 会把每段渲染成 `<ref:memory desc="{label}, …">`
+    的引用数据块（规则在块尾）。
     """
 
     counter = dependencies_of(context).resolved_token_counter()
@@ -137,6 +139,9 @@ def inject(
             # 重算而不是把存下来的那份也带上：计数器是纯函数（同一段
             # 文本永远同一个数），而少存一个字段就少一处会失配的形状。
             token_estimate=counter.count_text(text),
+            # 四段全部来自记忆（L0 原话 / L1 原子 / L2 场景 / L3 画像），
+            # 都可能被用户历史或模型提炼污染，一律按引用数据定界。
+            untrusted=True,
         )
 
 

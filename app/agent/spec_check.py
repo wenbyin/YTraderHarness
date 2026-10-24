@@ -25,7 +25,11 @@ from typing import Any
 
 import yaml
 
-SPEC_DIR = Path("app/services/document")
+from app.common.app_config import load_app_config
+
+#: 取值：`app/config/app.yaml` 的 `paths.spec_dir`
+#: （环境变量 `SPEC_DIR` 可覆盖）。
+SPEC_DIR = Path(load_app_config().paths.spec_dir)
 SPECS = (
     "document.yaml",
     "document_type_definition.yaml",

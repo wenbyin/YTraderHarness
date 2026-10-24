@@ -48,6 +48,8 @@ class AgentRun(Base):
             user_id VARCHAR(255);
         ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS
             caller_identity JSONB NOT NULL DEFAULT '{}'::jsonb;
+        ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS
+            trace_id VARCHAR(255);
 
     症状各不相同：没有 error_* 两列，失败路径的写回会报 column does
     not exist；没有 user_id，则**每一次运行查询都 500** —— ORM 一旦
@@ -155,6 +157,16 @@ class AgentRun(Base):
             "之所以存下来而不是各处理解一次：同一轮运行里「用的哪份职责」"
             "必须只有一个答案，否则运行行、提示词、消息三处可能对不上。\n\n"
             "存量运行为 NULL —— 那时还没有这个概念，主循环会回落到默认职责。"
+        ),
+    )
+
+    # ⚠️ 后加的列，已有库要手动补（DDL 见 models.sql 末尾）。
+    trace_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment=(
+            "客户端传入的 Trace 聚合键。NULL = 这次运行未开启 Trace。"
+            "trace 事件的 Redis 键是 trace:<trace_id>:events。"
         ),
     )
 

@@ -110,11 +110,18 @@ CREATE INDEX idx_tool_classification_relation_classification
 
 
 -- ============================================================
--- 工具执行记录：幂等判重与审计
+-- 工具执行尝试：守卫计数与审计（一次执行一行，append-only）
 --
 -- ⚠️ create_all 不读本文件，约束必须同时写在 ORM 的 __table_args__
 --    （见 models/sqlalchemy/tool_execution.py）。本文件是给人看的
 --    契约 + 手工建库脚本，两处必须同步。
+--
+-- ⚠️ 沿用 tool_execution 表名，在原表上扩展：
+--    删掉旧的 UNIQUE(session_id, run_id, tool_key, param_hash)，
+--    增加 scope / execution / counted / tool_call_id 等列，用
+--    UNIQUE(run_id, tool_call_id) 做 replay/resume 去重。
+--    迁移脚本见 app/services/tool/tool_execution_migration.sql，
+--    需**手工执行** —— create_all 只建缺失的表，不改已存在的表。
 --
 -- ⚠️ 刻意**没有** run_id 的外键：本表要在 agent_run 的生命周期之外
 --    活着。级联删除会删掉「副作用发生过」的证据，NO ACTION 会让一条
@@ -124,25 +131,36 @@ CREATE INDEX idx_tool_classification_relation_classification
 CREATE TABLE tool_execution (
     id                  UUID PRIMARY KEY,
 
-    -- 哪条会话、哪一次运行
-    -- ⚠️ session_id 是 agent_session.session_id（会话行主键），
-    --    不是 langgraph 的 thread_id —— 后者是 langgraph 内部键，
-    --    而会话详情页 / 消息 / 运行列表全按前者关联。
-    session_id          UUID NOT NULL,
-    run_id              UUID NOT NULL,
-
-    -- 调了什么，参数是什么（sha256 摘要，不是原文）
+    -- 调了什么
     tool_key            VARCHAR(255) NOT NULL,
-    param_hash          VARCHAR(64) NOT NULL,
+    tool_id             UUID,
+
+    -- 哪条会话、哪一次运行、谁发起的
+    -- ⚠️ session_id 是 agent_session.session_id（会话行主键），
+    --    不是 langgraph 的 thread_id。
+    session_id          UUID,
+    run_id              UUID,
+    user_id             VARCHAR(255),
+
+    -- 守卫的维度：scope + execution + 参数摘要
+    scope_type          VARCHAR(16) NOT NULL,
+    scope_key           VARCHAR(255) NOT NULL,
+    execution_type      VARCHAR(16) NOT NULL,
+    param_hash          VARCHAR(64) NOT NULL DEFAULT '',
+    match_key           VARCHAR(64) NOT NULL,
 
     -- PENDING / RUNNING / SUCCESS / FAILED / UNKNOWN /
-    -- CANCELLED / REJECTED / INTERRUPT
-    -- 每个取值的「能不能重跑」见 domain/schemas/enum.py
+    -- BLOCKED / CANCELLED / REJECTED / INTERRUPT
     status              VARCHAR(16) NOT NULL DEFAULT 'PENDING',
+
+    -- 是否占用额度。拒绝 / 中断 / 取消 / 守卫拦下为 FALSE。
+    counted             BOOLEAN NOT NULL DEFAULT TRUE,
+
+    -- 模型给的调用 id；与 run_id 一起做 replay/resume 去重。
+    tool_call_id        VARCHAR(255),
 
     -- 返回值（规范化后的 JSON 形态）。⚠️ 是**脱敏之后**的那一份：
     -- 写库发生在处理器链跑完之后，privacy_transformer 已生效。
-    -- 可空列必须带 none_as_null —— 见 ORM 的说明。
     result              JSONB,
 
     -- {"type": 异常类名, "message": 给模型看的文案}
@@ -154,17 +172,29 @@ CREATE TABLE tool_execution (
 
     CONSTRAINT ck_tool_execution_status
         CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED',
-                          'UNKNOWN', 'CANCELLED', 'REJECTED',
+                          'UNKNOWN', 'BLOCKED', 'CANCELLED', 'REJECTED',
                           'INTERRUPT')),
+
+    CONSTRAINT ck_tool_execution_scope
+        CHECK (scope_type IN ('SESSION', 'RUN', 'USER', 'GLOBAL')),
+
+    CONSTRAINT ck_tool_execution_execution
+        CHECK (execution_type IN ('METHOD', 'INVOKE')),
 
     CONSTRAINT ck_tool_execution_error_object
         CHECK (error IS NULL OR jsonb_typeof(error) = 'object')
 );
 
--- 判重与抢锁都落在这条上：并发同键靠 INSERT ... ON CONFLICT 串行化，
--- 不是先查再插（那样两个并发分支会都执行）。
-CREATE UNIQUE INDEX uq_tool_execution_identity
-    ON tool_execution(session_id, run_id, tool_key, param_hash);
+-- replay / resume 去重：同一次模型调用在图中重跑时复用同一行。
+-- 部分索引：没有 tool_call_id 的图外直调不参与去重。
+CREATE UNIQUE INDEX uq_tool_execution_call_id
+    ON tool_execution(run_id, tool_call_id)
+    WHERE tool_call_id IS NOT NULL AND run_id IS NOT NULL;
+
+-- 守卫计数：按维度 + 时间窗口。只覆盖 counted 的行。
+CREATE INDEX idx_tool_execution_match
+    ON tool_execution(match_key, created_at)
+    WHERE counted;
 
 -- 运行详情页：这一次运行调了哪些工具
 CREATE INDEX idx_tool_execution_run_created
@@ -174,7 +204,7 @@ CREATE INDEX idx_tool_execution_run_created
 CREATE INDEX idx_tool_execution_tool_key
     ON tool_execution(tool_key, created_at);
 
--- 只覆盖「没有走到终态的行」：崩溃遗留的、以及将来重试扫描要看的
+-- 只覆盖「没有走到终态的行」：崩溃遗留的、以及将来 reaper 要看的
 CREATE INDEX idx_tool_execution_unsettled
     ON tool_execution(created_at)
     WHERE status IN ('PENDING', 'RUNNING');

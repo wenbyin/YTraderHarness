@@ -34,6 +34,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from .event import RunEvent
+from .trace import TraceEvent
 
 __all__ = ["EventPublisher"]
 
@@ -61,7 +62,7 @@ class EventPublisher(Protocol):
 
         ...
 
-    async def publish(self, event: RunEvent) -> bool:
+    async def publish(self, event: RunEvent | TraceEvent) -> bool:
         """
         投递一条事件，返回是否**已接收**。**绝不抛异常。**
 

@@ -1,7 +1,17 @@
 """
 Document 服务共用的常量。
 
-**模型身份集中在这里 —— 换模型只改这一个文件。**
+**模型身份集中在 `app/config/app.yaml`；这里只做读取与再导出。**
+
+为什么取值不在代码里
+--------------------
+模型路径、落盘目录是**部署事实**（哪台机器、哪块盘），容器与开发机
+不同。它们仍**不进** `config/*.yaml` 的业务配置区（会被冻结进
+PipelineConfigSnapshot），而是放 `app/config/app.yaml`，用
+`${VAR:-default}` 覆盖。读取器见 `app/common/app_config.py`。
+
+下面各常量的注释仍然描述**模型身份本身** —— 那些约束不因取值搬了家
+而改变。
 
 为什么需要它
 ------------
@@ -26,22 +36,32 @@ Document 服务共用的常量。
     - 且它们的取值与 dimensions 绑定，各自留在实现里更清楚
       （见 embedder/sparse.py 的 _ENCODING_MODEL）
 
-服务器地址为什么也不该做成配置
-------------------------------
-放在这里是为了集中，但**不要**把它挪进 config/*.yaml ——
-服务器地址是**部署事实**，一旦进配置就会被冻结进
-PipelineConfigSnapshot，以后换地址时历史快照还指着旧地址。
-（embedder/ollama.py 的模块说明也写了同一条理由。）
+部署事实为什么不能进业务配置
+--------------------------
+模型路径、服务器地址都是**部署事实**。它们不能进 `config/*.yaml` 的
+业务配置区 —— 那里会被冻结进 PipelineConfigSnapshot，以后换机器时
+历史快照还指着旧路径 / 旧地址。
+
+所以取值统一放 `app/config/app.yaml`（读取器见
+`app/common/app_config.py`）：它**不进快照**，只在进程启动时读一次。
 """
 
 from __future__ import annotations
 
+from app.common.app_config import load_app_config
+
 __all__ = [
     "OLLAMA_HOST",
     "BGE_SMALL_ZH_LOCAL_MODEL",
+    "BGE_SMALL_ZH_LOCAL_DIMENSIONS",
     "BGE_RERANKER_MODEL",
     "QA_OUTPUT_DIR",
 ]
+
+#: 部署事实的读取结果（`app/config/app.yaml`）。
+_CONFIG = load_app_config()
+
+_PATHS = _CONFIG.paths
 
 
 #: Ollama 服务地址。
@@ -85,7 +105,18 @@ OLLAMA_HOST = "http://127.0.0.1:11434"
 #:            tokenizer.json / tokenizer_config.json / vocab.txt /
 #:            special_tokens_map.json / sentence_bert_config.json /
 #:            modules.json / config_sentence_transformers.json
-BGE_SMALL_ZH_LOCAL_MODEL = r"G:\models\bge-small-zh-v1.5"
+#: 取值：`app/config/app.yaml` 的 `paths.embedding_model`
+#: （环境变量 `BGE_EMBEDDING_MODEL` 可覆盖）。
+BGE_SMALL_ZH_LOCAL_MODEL = _PATHS.embedding_model
+
+
+#: 取值：`app/config/app.yaml` 的 `models.embedding.dimensions`
+#: （环境变量 `BGE_EMBEDDING_DIMENSIONS` 可覆盖）。
+#:
+#: ⚠️ 模型、本维度、Milvus collection 的 schema、已入库向量 —— 四处
+#: 必须一致。改维度而不重建索引，检索会照常返回结果，只是没有意义，
+#: 且**不报错**。
+BGE_SMALL_ZH_LOCAL_DIMENSIONS = _CONFIG.models.embedding.dimensions
 
 
 #: 精排模型（**HuggingFace 模型名**，不是 Ollama 模型名）。
@@ -104,7 +135,9 @@ BGE_SMALL_ZH_LOCAL_MODEL = r"G:\models\bge-small-zh-v1.5"
 #:
 #: 国内下载不动的话设 HF_ENDPOINT=https://hf-mirror.com，或先把模型
 #: 拉到本地再把这里改成目录路径。
-BGE_RERANKER_MODEL = r"G:\models\bge-reranker-v2-m3"
+#: 取值：`app/config/app.yaml` 的 `paths.reranker_model`
+#: （环境变量 `BGE_RERANKER_MODEL` 可覆盖）。
+BGE_RERANKER_MODEL = _PATHS.reranker_model
 
 
 #: QA 测试数据集的落盘目录。
@@ -117,4 +150,6 @@ BGE_RERANKER_MODEL = r"G:\models\bge-reranker-v2-m3"
 #: 适合"中间产物"，不适合"我要在资源管理器里打开 G:\QA 看一眼"这种用法。
 #: 数据集是给人用、给外部工具（ragas）读的，需要一个稳定、可预期的
 #: 文件名。
-QA_OUTPUT_DIR = r"G:\QA"
+#: 取值：`app/config/app.yaml` 的 `paths.qa_output_dir`
+#: （环境变量 `QA_OUTPUT_DIR` 可覆盖）。
+QA_OUTPUT_DIR = _PATHS.qa_output_dir

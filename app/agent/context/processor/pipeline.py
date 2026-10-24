@@ -387,6 +387,7 @@ class ContextProcessorPipeline:
             )
         )
 
+
         if spec.optional:
 
             message = f"{spec.name} 失败（已按可选处理）：{error}"

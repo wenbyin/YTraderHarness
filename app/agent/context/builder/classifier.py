@@ -4,6 +4,7 @@
 它只声明三个阶段
 ----------------
     CONTEXT_RESOLVER    （required）解析策略与预算
+    SUMMARY_LOADER               注入 state 里已生成的对话摘要（只读）
     HISTORY_SELECTOR             选出当前这一轮
     PROMPT_ASSEMBLER    （required）产出 ModelRequest
 
@@ -44,11 +45,21 @@ system 就算"非空"。于是分类模型会对着一个没有问题的提示�
     CONTEXT_COMPACTOR  超预算时压历史窗口与摘要的重叠。窄上下文（一轮、
                        零重叠）没有可压的东西；而它所在阶段的 gate 也
                        已被基线关掉（allow_compaction=False）。
-    SUMMARY_LOADER     ⚠️ 现在是**唯一会再调一次 LLM** 的阶段（生成摘要）。
-                       分类调用带上它就是"为了分类先做一次摘要" ——
-                       延迟与成本都翻倍。绝不声明。
     CONTEXT_VALIDATOR  校验的是"发给主模型的上下文能不能用"。窄分类调用
                        的输入由我们自己拼，这一层是给主调用兜底的。
+
+⚠️ 为什么 SUMMARY_LOADER 要声明，但不能让它生成摘要
+------------------------------------------------
+分类需要**历史概览**来理解当前输入的指代（"那再查一下昨天的"），
+但不需要为了分类先花一次模型调用去重写摘要。SummaryProcessor 的
+生成分支受 `policy.allow_compaction` 门控；调用方（agent_builder_node
+的 `_graph_state`）把 `allow_compaction=False` 钉死，同时打开
+`include_summary=True`。
+
+于是这个阶段只做 `_inject`：把 state 里**已经存在**的摘要作为
+「历史摘要」system 分节注入，绝不调模型。没有摘要时它是 no-op。
+如果只声明阶段却不钉 `allow_compaction`，主 agent 的 context_policy
+可能带着 True，分类阶段就会意外再压一次历史 —— 延迟与成本都翻倍。
 
 ⚠️ 副作用：本实现的 ModelRequest 不带上下文快照
 ---------------------------------------------
@@ -79,6 +90,9 @@ __all__ = ["ClassifierProcessorContextBuilder"]
 #: 本实现声明参与的阶段。见模块 docstring 逐条理由。
 _CLASSIFIER_STAGES: frozenset[StageId] = frozenset({
     StageId.CONTEXT_RESOLVER,
+    # 只读注入 state 里已有的摘要；生成分支由 allow_compaction=False
+    # 关掉（见模块 docstring）。
+    StageId.SUMMARY_LOADER,
     StageId.HISTORY_SELECTOR,
     StageId.PROMPT_ASSEMBLER,
 })
@@ -108,9 +122,9 @@ class ClassifierProcessorContextBuilder(
     version = "1.0.0"
     display_name = "分类 / 路由上下文构建（窄输入）"
     description = (
-        "只带当前这一轮用户输入的最小上下文："
-        "策略解析 -> 当前轮 -> 组装。不含画像 / 记忆 / 资料 / 工具，"
-        "也不做预算裁剪与压缩。"
+        "当前这一轮用户输入 + 已有历史摘要（只读）的最小上下文："
+        "策略解析 -> 摘要注入 -> 当前轮 -> 组装。"
+        "不含画像 / 记忆 / 资料 / 工具，也不做预算裁剪与新摘要生成。"
     )
 
     enabled_stages: ClassVar[frozenset[StageId]] = _CLASSIFIER_STAGES

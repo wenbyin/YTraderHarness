@@ -7,7 +7,10 @@ __pycache__/
 /.pytest_cache/
 /app/config/llm.yaml
 /app/config/rerank.yaml
+/app/config/web.yaml
+/app/config/mcp.yaml
 /app/config/casdoor.yaml
 /app/config/cert.pem
 /milvus_flush_probe.py
 /todolist
+/clear_runtime_data.py

@@ -214,6 +214,21 @@ class CapabilityServiceImpl(CapabilityService):
                 "只想让它不再被使用的话，改用 is_active=false 停用。"
             )
 
+        # Skill 绑定这一关 force 也解不开：skill_capability 的外键是
+        # ON DELETE RESTRICT，而且删掉绑定会让对应 Skill 的工具可见性
+        # 无声缩小。先让用户显式解除绑定，比 force 之后再解释为什么
+        # 某个 Skill 突然没工具了要好。
+        skill_links = await self._capabilities.count_skill_links(
+            [capability_id]
+        )
+
+        if skill_links:
+            raise ConflictError(
+                f"能力 {current.code} 正被 {skill_links} 个 Skill 绑定；"
+                "先解除绑定（PUT /skills/{skill_id}/capabilities）"
+                "再删除，或改用 is_active=false 停用。"
+            )
+
         # 工具引用这一关 force 可以放行，但必须由调用方显式确认 ——
         # 关联行随 CASCADE 无声消失，不提示就等于悄悄把工具变成未关联。
         if not force:

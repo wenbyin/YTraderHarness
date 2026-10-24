@@ -156,6 +156,7 @@ from .redaction import REDACTED, redact_mapping, redact_text
 from .registry import DefaultModelRegistry, ModelRegistry
 from .resolver import CatalogModelResolver, ModelResolver, ModelRoleBinding
 from .runtime import ModelRuntime
+from .trace import ModelTrace
 from .types import (
     ModelAttempt,
     ModelCallSummary,
@@ -181,6 +182,7 @@ __all__ = [
     "ModelRequest",
     "ModelResponse",
     "ModelResolveContext",
+    "ModelTrace",
     "ModelRole",
     "ModelCapabilities",
     #: 流式调用的增量回调类型（LLM Node 用它标注 on_delta）。

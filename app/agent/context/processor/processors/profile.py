@@ -25,6 +25,10 @@ from typing import Any
 from app.common.context import StageId
 from app.common.factories import get_service_factory
 from app.services.memory.application import MemoryQueryService
+from app.services.memory.application.profile_cache import (
+    get_cached_profile_blocks,
+    put_cached_profile_blocks,
+)
 from app.services.memory.domain.schemas.query import (
     MemoryPreviewLayers,
     MemoryPreviewLimits,
@@ -128,6 +132,8 @@ class UserProfileProcessor(ContextProcessor):
             text=text,
             source_ids=(f"user:{user_id}",),
             token_estimate=counter.count_text(text),
+            # 画像值来自租户 / 用户配置，按引用数据定界。
+            untrusted=True,
         )
 
         return context
@@ -172,7 +178,10 @@ class MemoryProfileProcessor(ContextProcessor):
             "user_id": StateBinding("user_id", required=False),
         },
         optional=True,
-        description="注入 L3 长期画像与 L2 场景索引（每轮现读，纯 SQL）。",
+        description=(
+            "注入 L3 长期画像与 L2 场景索引"
+            "（Redis 缓存 + 未命中时查库；两层分别缓存/失效）。"
+        ),
     )
 
     async def process(
@@ -196,12 +205,43 @@ class MemoryProfileProcessor(ContextProcessor):
             # 了" —— 画像是每轮都带的东西，与"要不要召回"无关。
             return context
 
-        preview = await self._preview(agent_id=agent_id, user_id=user_id)
+        target = RetrievalTarget(agent_id=agent_id, user_id=user_id)
+        scope = target.to_scope()
 
-        blocks = blocks_from(preview)
+        # L2（场景索引）与 L3（画像）**分开缓存**：两者的更新时机不同
+        # （L2 每次整合、L3 只在 L2 举手或首次创建时），合成一个键会让
+        # L2 的一次变化白丢 L3 的缓存。
+        #
+        # 注入顺序保持 persona -> scenes，与 render_blocks 的排版一致。
+        l3_hit, l3_blocks = await get_cached_profile_blocks(scope, "l3")
 
-        if blocks:
-            inject(context, blocks)
+        if not l3_hit:
+            preview = await self._preview(
+                target=target,
+                l2=False,
+                l3=True,
+            )
+            l3_blocks = blocks_from(preview)
+            await put_cached_profile_blocks(scope, "l3", l3_blocks)
+
+        l2_hit, l2_blocks = await get_cached_profile_blocks(scope, "l2")
+
+        if not l2_hit:
+            preview = await self._preview(
+                target=target,
+                l2=True,
+                l3=False,
+            )
+            l2_blocks = blocks_from(preview)
+            await put_cached_profile_blocks(scope, "l2", l2_blocks)
+
+        # 空列表也缓存：这个 scope 还没有画像 / 场景是有效结果，
+        # 建出来时对应的写路径会把它删掉。
+        if l3_blocks:
+            inject(context, l3_blocks)
+
+        if l2_blocks:
+            inject(context, l2_blocks)
 
         return context
 
@@ -210,11 +250,14 @@ class MemoryProfileProcessor(ContextProcessor):
     @staticmethod
     async def _preview(
             *,
-            agent_id: str,
-            user_id: str,
+            target: RetrievalTarget,
+            l2: bool,
+            l3: bool,
     ) -> Any:
         """
-        取这一份 scope 的画像与场景清单。
+        取这一份 scope 的**指定层**（缓存未命中时才会走到这里）。
+
+        调用方按层分别调用：L2 与 L3 有各自的缓存键与失效时机。
 
         ⚠️ 走 `retrieval_preview`，与 `memory.py` / 管理端**同一条实现**
         --------------------------------------------------------
@@ -230,8 +273,13 @@ class MemoryProfileProcessor(ContextProcessor):
         """
 
         request = MemoryRetrievalRequest(
-            target=RetrievalTarget(agent_id=agent_id, user_id=user_id),
-            retrieve=MemoryPreviewLayers(l0=False, l1=False),
+            target=target,
+            retrieve=MemoryPreviewLayers(
+                l0=False,
+                l1=False,
+                l2=l2,
+                l3=l3,
+            ),
             limits=MemoryPreviewLimits(l2=_L2_LIMIT),
         )
 

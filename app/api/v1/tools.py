@@ -107,6 +107,13 @@ async def list_tools(
             default=None,
             description="来源种类过滤。",
         ),
+        source_ref: str | None = Query(
+            default=None,
+            description=(
+                "来源对象过滤：MCP 场景下是 provider 名"
+                "（见 GET /mcp/providers）。"
+            ),
+        ),
         classification_code: str | None = Query(
             default=None,
             description="按分类的稳定标识过滤。",
@@ -130,6 +137,7 @@ async def list_tools(
         return await service.list_tools(
             keyword=keyword,
             source_type=source_type,
+            source_ref=source_ref,
             classification_code=classification_code,
             source_state=source_state,
             page=page,

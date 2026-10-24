@@ -33,6 +33,7 @@ from .schema import (
     extract_parameter_descriptions,
     output_schema_of,
     resolve_request_model,
+    strip_injected_args,
     synthesize_schema,
 )
 from .spec import (
@@ -361,15 +362,43 @@ def _import_base_tool() -> type | None:
 
 def _args_schema_of(value: Any) -> dict[str, Any]:
     """
-    取 langchain 工具的参数 schema。
+    取 langchain 工具**给模型看**的参数 schema。
 
-    args_schema 有三种形态，都要认：
+    ⚠️ 优先用 `tool_call_schema`，不是 `args_schema`
+    --------------------------------------------
+    `args_schema` 是**执行侧**的完整模型，包含 `ToolRuntime` /
+    `InjectedState` 这类注入参数；它甚至无法生成 JSON Schema
+    （ToolRuntime 内部有 Callable 字段，pydantic 会直接抛）。
+
+    `tool_call_schema` 是 LangChain 为"模型调用"准备的那一份，
+    已经剔除了直接注入参数。这里再做一次 `strip_injected_args` 兜底
+    （例如 service 方法的合成 schema），保证落库 / 展示的那份
+    里没有 `runtime`。
+
+    schema 有三种形态，都要认：
         pydantic 模型类   -> model_json_schema()
-        dict              -> 原样用（有人直接写 JSON Schema）
+        dict              -> 原样用
         None              -> 空对象（无参数工具）
     """
 
-    schema = getattr(value, "args_schema", None)
+    func = (
+        getattr(value, "func", None)
+        or getattr(value, "coroutine", None)
+    )
+
+    schema = _schema_dict(getattr(value, "tool_call_schema", None))
+
+    if schema is None:
+        schema = _schema_dict(getattr(value, "args_schema", None))
+
+    if schema is None:
+        return {}
+
+    return strip_injected_args(schema, func) if func else schema
+
+
+def _schema_dict(schema: Any) -> dict[str, Any] | None:
+    """pydantic 模型类 / dict -> JSON Schema dict；认不出返回 None。"""
 
     if isinstance(schema, dict):
         return schema
@@ -378,6 +407,6 @@ def _args_schema_of(value: Any) -> dict[str, Any]:
         try:
             return schema.model_json_schema()
         except Exception:
-            return {}
+            return None
 
-    return {}
+    return None

@@ -23,9 +23,12 @@ tools/processor/runtime/events.py 的模块 docstring。
 跟着一起停摆；更糟的是读取端那边的读超时定时器会在循环恢复的**瞬间**
 先到期，把"回复早就到了"谎报成网络故障（见 reader.py 的说明）。
 
-所以写入离开循环，落进一条常驻线程：
+所以写入离开循环，落进一个**按 stream key 分片的写线程池**：
 
-    事件循环 ── put_nowait ──▶ 有界队列 ──▶ 写线程（同步客户端）──▶ Redis
+    事件循环 ── put_nowait ──▶ 分片队列 ──▶ 写线程（同步客户端）──▶ Redis
+
+同一 stream key 恒定落在同一个分片，因此**单条 run 的事件顺序不变**；
+不同 run 之间并行写。分片数见 event_stream.yaml 的 `write_workers`。
 
 ⚠️ `publish()` 体内**不许出现 `await`**
 --------------------------------------
@@ -68,6 +71,8 @@ import asyncio
 import logging
 import queue
 import threading
+import time
+import zlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, runtime_checkable
 
@@ -77,6 +82,7 @@ from app.common.event import (
     RunEventType,
     stream_key,
 )
+from app.common.event.trace import TraceEvent
 
 from .config import StreamConfig, load_stream_config
 
@@ -209,6 +215,24 @@ class _Write:
     ttl_seconds: int | None
 
 
+@dataclass(slots=True)
+class _Shard:
+    """
+    一个写分片：一条有界队列 + 一条写线程。
+
+    事件按 stream key 哈希到固定分片，因此**同一条 run 的事件永远在
+    同一个分片里**，顺序由该分片的 FIFO 保证；不同 run 之间并发写。
+    """
+
+    queue: queue.Queue
+
+    thread: threading.Thread | None = None
+
+    #: 这一分片的丢弃期。与旧实现的全局 `_dropping` 同义，只是粒度变成
+    #: "这个分片一旦丢，就丢到它自己排空为止"。
+    dropping: bool = False
+
+
 class RedisEventPublisher:
     """
     把事件交给写线程，最终落到 `<key_prefix>:<topic_id>` 这条 Stream。
@@ -227,20 +251,32 @@ class RedisEventPublisher:
             config: StreamConfig | None = None,
             *,
             queue_size: int | None = None,
+            workers: int | None = None,
     ) -> None:
 
         self._sink = sink
 
         self._config = config or load_stream_config()
 
-        #: 有界 —— 理由见模块 docstring。queue_size 只给测试用
-        #: （要构造"队列满"这个状态，真按配置的几千条灌太慢）。
-        self._queue: queue.Queue[_Write] = queue.Queue(
-            maxsize=queue_size or self._config.write_queue_size,
+        #: 分片数。每个分片一条有界队列 + 一条写线程。
+        #: queue_size 只给测试用（构造"队列满"这个状态，真按配置灌太慢）。
+        worker_count = max(
+            1,
+            int(workers or self._config.write_workers),
         )
 
-        #: 写线程。None = 还没 start()（或已经 aclose()）。
-        self._thread: threading.Thread | None = None
+        self._shards: list[_Shard] = [
+            _Shard(
+                queue=queue.Queue(
+                    maxsize=queue_size or self._config.write_queue_size,
+                )
+            )
+            for _ in range(worker_count)
+        ]
+
+        #: 是否已 start()。没起线程时入队等于排进一个没人消费的队列，
+        #: 所以 publish() 会明确拒收。
+        self._started = False
 
         #: 停止位。**不是**往队列里塞哨兵 —— 队列满时 put 会阻塞，而
         #: 调用 aclose() 的是事件循环线程，堵在那里就是同步阻塞循环。
@@ -255,11 +291,6 @@ class RedisEventPublisher:
         self._failures = 0
         self._rejected = 0
 
-        #: 是否处于"丢弃期"。只由事件循环线程读写（写线程不碰它），
-        #: 因此不需要锁 —— 这正是 publish() 里不许有 await 换来的。
-        #: 见模块 docstring：一旦开始丢，丢到队列排空为止，好让写出去的
-        #: 那段始终是连续前缀。
-        self._dropping = False
 
     # ========================================================
     # 生命周期
@@ -277,67 +308,86 @@ class RedisEventPublisher:
 
     def start(self) -> None:
         """
-        起写线程（幂等）。由 start_event_publisher 调用。
+        起写线程池（幂等）。由 start_event_publisher 调用。
 
         daemon=True 是兜底：收尾时 join 有上界，真的排不空（Redis 一直
         不可用、队列还很长）也不能让进程退不出去 —— 代价是那种情况下
         队列里剩下的事件随进程消失，这一点写在模块 docstring 的代价里。
         """
 
-        if self._thread is not None:
+        if self._started:
             return
 
         self._stopping.clear()
 
-        self._thread = threading.Thread(
-            target=self._consume,
-            name="event-publisher",
-            daemon=True,
-        )
+        for index, shard in enumerate(self._shards):
 
-        self._thread.start()
+            shard.thread = threading.Thread(
+                target=self._consume,
+                args=(shard,),
+                name=f"event-publisher-{index}",
+                daemon=True,
+            )
+
+            shard.thread.start()
+
+        self._started = True
 
     async def aclose(
             self,
             timeout: float = 10.0,
     ) -> None:
         """
-        停写线程：**先排空**已接收的，再退出。
+        停写线程池：**先排空**已接收的，再退出。
 
-        timeout 要大于 socket_timeout（redis.yaml: 5 秒），否则正常收尾
-        也会被误判成"排不空"；但也不能按"队列长度 × 5 秒"去算，那会让
-        关停假死几分钟。取一个固定上界，超了就认账。
+        timeout 是**所有**分片共用的上界（不是每个分片都等满 timeout）。
         """
 
-        thread, self._thread = self._thread, None
-
-        if thread is None:
+        if not self._started:
             return
 
-        # 置停止位 → 写线程把手上的和队列里剩下的写完就退出。
+        threads = [
+            shard.thread
+            for shard in self._shards
+            if shard.thread is not None
+        ]
+
+        for shard in self._shards:
+            shard.thread = None
+
+        self._started = False
         self._stopping.set()
 
-        # join 是阻塞调用，包进 to_thread —— 它不该占住事件循环。
-        # wait_for 只兜底：to_thread 里的线程没法被取消，超时了我们只是
-        # 不再等它（daemon 线程会随进程结束）。
+        def _join() -> None:
+
+            deadline = time.monotonic() + timeout
+
+            for thread in threads:
+                thread.join(
+                    max(0.0, deadline - time.monotonic())
+                )
+
         try:
             await asyncio.wait_for(
-                asyncio.to_thread(thread.join, timeout),
+                asyncio.to_thread(_join),
                 timeout + 1,
             )
 
         except Exception:       # noqa: BLE001 —— 排不空不是异常路径
             logger.warning(
-                "事件写线程未能在 %.0f 秒内退出，剩余 %d 条未写出。"
-                "它是 daemon 线程，会随进程结束 —— 那部分事件就丢了。",
+                "事件写线程池未能在 %.0f 秒内全部退出，剩余 %d 条未写出。"
+                "它们是 daemon 线程，会随进程结束 —— 那部分事件就丢了。",
                 timeout,
                 self.pending,
             )
             return
 
-        if thread.is_alive():       # pragma: no cover - 竞态兜底
+        alive = [thread for thread in threads if thread.is_alive()]
+
+        if alive:       # pragma: no cover - 竞态兜底
             logger.warning(
-                "事件写线程仍在运行，剩余 %d 条未写出。",
+                "仍有 %d 条事件写线程在运行，剩余 %d 条未写出。",
+                len(alive),
                 self.pending,
             )
 
@@ -361,7 +411,7 @@ class RedisEventPublisher:
 
         return self._config.enabled
 
-    async def publish(self, event: RunEvent) -> bool:
+    async def publish(self, event: RunEvent | TraceEvent) -> bool:
         """
         把事件交给写线程，返回**是否已接收**（入队成功）。**从不抛异常。**
 
@@ -378,22 +428,26 @@ class RedisEventPublisher:
         if not config.enabled:
             return False
 
-        # 没起线程 = 装配没走完；已置停止位 = 正在收尾。
+        # 没起线程池 = 装配没走完；已置停止位 = 正在收尾。
         # 两种情况入队都等于排进一个没人消费的队列 —— 那正是最难查的
         # 静默丢失，所以宁可直接拒收（调用方拿到 False）。
-        if self._thread is None or self._stopping.is_set():
+        if not self._started or self._stopping.is_set():
             return False
 
         key = stream_key(event.topic, event.topic_id)
 
-        # 丢弃期：一直丢到队列排空为止（见模块 docstring 关于"连续前缀"）。
-        # 队列空了这个判断自然翻转，不需要谁去重置一个状态位。
-        if self._dropping:
-            if not self._queue.empty():
+        shard = self._shards[
+            zlib.crc32(key.encode("utf-8")) % len(self._shards)
+        ]
+
+        # 丢弃期：一直丢到这个分片排空为止（见模块 docstring 关于
+        # "连续前缀"）。分片空了这个判断自然翻转，不需要额外的状态位。
+        if shard.dropping:
+            if not shard.queue.empty():
                 self._record_rejection(key)
                 return False
 
-            self._dropping = False
+            shard.dropping = False
 
         try:
             # 序列化在入队这一刻完成（见 _Write）。data 不可序列化之类
@@ -410,10 +464,10 @@ class RedisEventPublisher:
             return False
 
         try:
-            self._queue.put_nowait(write)
+            shard.queue.put_nowait(write)
 
         except queue.Full:
-            self._dropping = True
+            shard.dropping = True
             self._record_rejection(key)
             return False
 
@@ -423,9 +477,10 @@ class RedisEventPublisher:
     # 写线程
     # ========================================================
 
-    def _consume(self) -> None:
+    def _consume(self, shard: _Shard) -> None:
         """
-        写线程主循环：取一条、写一条，直到"停止位已置**且**队列已空"。
+        一个分片的写线程主循环：取一条、写一条，直到"停止位已置**且**
+        该分片队列已空"。
 
         ⚠️ 单条失败**不能**让循环退出（同 dispatcher_impl.py 的立场）：
         线程一退，队列就成了只进不出的黑洞，症状又是静默丢失。
@@ -434,7 +489,7 @@ class RedisEventPublisher:
         while True:
 
             try:
-                item = self._queue.get(timeout=0.2)
+                item = shard.queue.get(timeout=0.2)
 
             except queue.Empty:
                 # 空了才看停止位：这样"会退"的标准是"排空了"，而不是
@@ -457,7 +512,7 @@ class RedisEventPublisher:
 
             finally:
                 # task_done 是 drain() 能等到人的前提。
-                self._queue.task_done()
+                shard.queue.task_done()
 
     async def drain(
             self,
@@ -471,8 +526,12 @@ class RedisEventPublisher:
         这里只是不再等（测试会看到断言失败，正是它该有的样子）。
         """
 
+        def _join_all() -> None:
+            for shard in self._shards:
+                shard.queue.join()
+
         await asyncio.wait_for(
-            asyncio.to_thread(self._queue.join),
+            asyncio.to_thread(_join_all),
             timeout,
         )
 
@@ -549,9 +608,9 @@ class RedisEventPublisher:
 
     @property
     def pending(self) -> int:
-        """队列里还没写出去的条数（探活用）。"""
+        """所有分片队列里还没写出去的条数（探活用）。"""
 
-        return self._queue.qsize()
+        return sum(shard.queue.qsize() for shard in self._shards)
 
 
 class NullEventPublisher:
@@ -574,7 +633,7 @@ class NullEventPublisher:
 
         return False
 
-    async def publish(self, event: RunEvent) -> bool:
+    async def publish(self, event: RunEvent | TraceEvent) -> bool:
         """永远 False（没有通道）。绝不抛。"""
 
         return False

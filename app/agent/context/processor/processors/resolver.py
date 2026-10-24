@@ -29,9 +29,11 @@ warning + 快照里注明来源。
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from app.agent.model import ModelError, ModelRole
+from app.agent.plan.checks import has_pending_tasks
 from app.common.context import ContextBuilderType, StageId
 
 from ..base import ContextProcessor
@@ -61,6 +63,18 @@ class ContextResolveProcessor(ContextProcessor):
             "agent_type": StateBinding("run.agent_type", required=False),
             "builder_type": StateBinding("run.builder_type", required=False),
             "model_role": StateBinding("run.model_role", required=False),
+            # task 模式的唯一开关：有 current_task 就进入任务执行上下文。
+            # TaskResolver / SkillLoader 都以 overlay 里的 task_mode 为 gate。
+            "current_task": StateBinding(
+                "current_task", required=False
+            ),
+            # 没有 current_task 时，待办任务列表决定要不要进入「团队决策」
+            # 回合（task_context 的另一个分支）。
+            "tasks": StateBinding("tasks", required=False),
+            # 所有任务已完成、等待 main agent 汇总的回合。
+            "synthesis_pending": StateBinding(
+                "synthesis_pending", required=False
+            ),
         },
         description=(
             "解析 Context Policy（基线 ⊕ 覆盖）与 token 预算，"
@@ -111,6 +125,41 @@ class ContextResolveProcessor(ContextProcessor):
         context.policy = effective
         context.model_role = model_role
         context.agent_type = agent_type
+
+        # 有 task 就进入任务执行模式。这个 bool 是 SkillLoader 的 gate，
+        # 也是“main agent 不再以回复用户为主”的唯一判断点。
+        current_task = inputs.get("current_task")
+        has_current = (
+            isinstance(current_task, Mapping)
+            and bool(current_task)
+        )
+
+        tasks = inputs.get("tasks")
+        has_pending = (
+            isinstance(tasks, (list, tuple))
+            and has_pending_tasks([
+                task for task in tasks
+                if isinstance(task, Mapping)
+            ])
+        )
+
+        context.set("task_mode", has_current)
+
+        # task_context 比 task_mode 宽一档：
+        #   - 没有 current_task、但还有待办任务 -> 团队决策提示；
+        #   - 所有任务已完成、等待 main agent 汇总 -> 任务结果提示。
+        synthesis_pending = (
+            bool(inputs.get("synthesis_pending"))
+            and isinstance(tasks, (list, tuple))
+            and bool(tasks)
+        )
+
+        context.set("task_pending", bool(has_pending) and not has_current)
+        context.set("synthesis_pending", synthesis_pending)
+        context.set(
+            "task_context",
+            has_current or bool(has_pending) or synthesis_pending,
+        )
 
         window, source, model_id = _context_window(
             deps, agent_type=agent_type, model_role=model_role, context=context

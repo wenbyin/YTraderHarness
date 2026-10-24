@@ -379,12 +379,17 @@ def test_real_cache_processor() -> None:
     CALLS.clear()
 
     async def loader(_tool_id):
+        # AROUND 在链上是两条记录（先进 + 后出），执行期只调一次。
         return [
-            Row("cache_interceptor", ProcessorHook.BEFORE, sequence=1),
-            Row("cache_interceptor", ProcessorHook.AFTER, sequence=2),
+            Row("cache_interceptor", ProcessorHook.AROUND, sequence=1),
+            Row("cache_interceptor", ProcessorHook.AROUND, sequence=2),
         ]
 
     executor = executor_for(EchoServiceImpl, loader)
+
+    from app.agent.tools.processor.runtime.cache import get_tool_cache
+
+    asyncio.run(get_tool_cache().clear())
 
     first = asyncio.run(
         executor.execute(

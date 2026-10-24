@@ -4,6 +4,8 @@
 
     python reset_data.py              # 演练：只报告 + 校验外键图，一个字节都不删
     python reset_data.py --yes        # 真删
+    python reset_data.py --keep document --keep file --yes
+                                      # 只清文档与文件以外的运行数据
 
 默认是演练而不是真删
 --------------------
@@ -189,10 +191,20 @@ CLEAR_TABLES: dict[str, tuple[str, ...]] = {
         "file",
     ),
 
+    # ---- 压测 ----
+    # stress_run_metrics 通过 run_id 外键指向 stress_runs；同一条 TRUNCATE
+    # 里一起列出即可。它们是压测产生的运行数据，不属于定义/配置。
+    "压测": (
+        "stress_runs",
+        "stress_run_metrics",
+    ),
+
     # ---- 工具 ----
     # 只有执行账本。tool_definition / tool_documentation /
     # tool_parameter_documentation / tool_processor /
     # tool_definition_classification 是定义，一律不动。
+    #
+    # 沿用 tool_execution 表名（在原表上扩展为一次执行一行）。
     "工具": (
         "tool_execution",
     ),
@@ -243,6 +255,22 @@ KEEP_TABLES: frozenset[str] = frozenset({
 })
 
 
+#: `--keep` 用的稳定分组名。
+#:
+#: CLEAR_TABLES 的键是中文、适合报告；命令行参数改用 ASCII，省得
+#: 在不同终端编码下踩坑。值是 CLEAR_TABLES 里对应的组名。
+GROUP_SLUGS: dict[str, str] = {
+    "session": "会话与消息",
+    "memory": "记忆",
+    "document": "文档",
+    "eval": "检索评测",
+    "file": "文件",
+    "tool": "工具",
+    "task": "任务",
+    "langgraph": "LangGraph",
+}
+
+
 # ============================================================
 # Redis
 # ============================================================
@@ -258,6 +286,9 @@ KEEP_TABLES: frozenset[str] = frozenset({
 
 REDIS_PREFIXES: tuple[str, ...] = (
     "agent_run:",
+    # trace:{trace_id}:events，见 app/common/event/trace.py。
+    # 压测的 trace_id 形如 stress:<run_id>:<n>。
+    "trace:",
     "probe:",
 )
 
@@ -277,6 +308,20 @@ def _parse_args() -> argparse.Namespace:
         "--yes",
         action="store_true",
         help="真的执行删除。不加这个参数 = 演练。",
+    )
+
+    parser.add_argument(
+        "--keep",
+        action="append",
+        default=[],
+        choices=sorted(GROUP_SLUGS),
+        metavar="GROUP",
+        help=(
+            "保留一组运行数据，可重复。可选：%s。"
+            "保留 document 会连带跳过 Elasticsearch / Milvus / Neo4j，"
+            "保留 file 会连带跳过 data/files。"
+            % ", ".join(sorted(GROUP_SLUGS))
+        ),
     )
 
     # 各个后端可以单独跳过 —— 只想清库、留着文件盘上的东西时有用。
@@ -301,6 +346,26 @@ def _parse_args() -> argparse.Namespace:
     )
 
     return parser.parse_args()
+
+
+def _split_tables(keep_slugs: list[str]) -> tuple[list[str], list[str]]:
+    """
+    按 `--keep` 把运行表分成 (要清, 要留)。
+
+    保留的单位是**组**而不是单表：组内的表之间存在外键（document →
+    document_version → document_chunk），只留一半会让保留下来的数据
+    引向被清空的父行。
+    """
+
+    kept_groups = {GROUP_SLUGS[slug] for slug in keep_slugs}
+
+    cleared: list[str] = []
+    retained: list[str] = []
+
+    for group, tables in CLEAR_TABLES.items():
+        (retained if group in kept_groups else cleared).extend(tables)
+
+    return cleared, retained
 
 
 # ============================================================
@@ -403,11 +468,14 @@ def _truncate_sql(tables: list[str]) -> str:
     return f"TRUNCATE TABLE {joined} RESTART IDENTITY"
 
 
-def reset_postgres(configs: dict, *, execute: bool) -> None:
+def reset_postgres(
+    configs: dict,
+    *,
+    execute: bool,
+    tables: list[str],
+) -> None:
 
     import psycopg
-
-    tables = [t for tables in CLEAR_TABLES.values() for t in tables]
 
     with psycopg.connect(_postgres_dsn(configs)) as connection:
 
@@ -447,10 +515,16 @@ def reset_postgres(configs: dict, *, execute: bool) -> None:
                 )
 
 
-def report_postgres(configs: dict) -> None:
+def report_postgres(
+    configs: dict,
+    *,
+    retained_tables: list[str],
+) -> None:
     """演练时把每张表的行数打出来 —— 删之前总该看一眼删的是什么。"""
 
     import psycopg
+
+    retained = set(retained_tables)
 
     with psycopg.connect(_postgres_dsn(configs)) as connection:
 
@@ -463,6 +537,13 @@ def report_postgres(configs: dict) -> None:
             total = 0
 
             for group, tables in CLEAR_TABLES.items():
+
+                # --keep 保留下来的组不列进"将被清空"，免得演练报告
+                # 与真删行为对不上。
+                tables = tuple(t for t in tables if t not in retained)
+
+                if not tables:
+                    continue
 
                 print(f"\n  [{group}]")
 
@@ -480,7 +561,19 @@ def report_postgres(configs: dict) -> None:
 
             print(f"\n  合计 {total} 行")
 
-            print("\n  PostgreSQL（保留，不动）")
+            if retained_tables:
+
+                print("\n  PostgreSQL（运行数据保留，不动）")
+
+                for table in sorted(retained_tables):
+
+                    cursor.execute(
+                        f'SELECT count(*) FROM "{table}"'
+                    )
+
+                    print(f"  {table:<40} {cursor.fetchone()[0]:>8}")
+
+            print("\n  PostgreSQL（配置，不动）")
 
             for table in sorted(KEEP_TABLES):
 
@@ -786,6 +879,10 @@ def main() -> int:
 
     execute = args.yes
 
+    kept_groups = {GROUP_SLUGS[slug] for slug in args.keep}
+
+    cleared_tables, retained_tables = _split_tables(args.keep)
+
     print(
         "\n=== 数据恢复：%s ===\n"
         % ("真删" if execute else "演练（什么都不删）")
@@ -794,18 +891,38 @@ def main() -> int:
     if not execute:
         print("  加 --yes 才会真的删。\n")
 
+    if kept_groups:
+        print("  保留分组：%s\n" % "、".join(sorted(kept_groups)))
+
+    # 保留某一组运行数据时，与它对应的外部存储也要一起保留 ——
+    # 否则 postgres 里留着 document_chunk、ES / Milvus 却被清空，
+    # 检索会安静地召回 0 条（不报错，看起来像检索退化）。
+    auto_skip: dict[str, str] = {}
+
+    if "文档" in kept_groups:
+        auto_skip["Elasticsearch"] = "保留 document 组（外部索引属于文档数据）"
+        auto_skip["Milvus"] = "保留 document 组（外部向量库属于文档数据）"
+        auto_skip["Neo4j"] = "保留 document 组（文档图属于文档数据）"
+
+    if "文件" in kept_groups:
+        auto_skip["本地文件"] = "保留 file 组（data/files 属于文件数据）"
+
     configs = _load_configs()
 
     # 演练时先把每张表的行数摊开 —— 删之前总该看一眼删的是什么。
     if not execute and not args.skip_postgres:
         try:
-            report_postgres(configs)
+            report_postgres(configs, retained_tables=retained_tables)
         except Exception:
             logger.exception("PostgreSQL：行数报告失败。")
 
     for label, skipped, action in (
         ("PostgreSQL", args.skip_postgres,
-         lambda: reset_postgres(configs, execute=execute)),
+         lambda: reset_postgres(
+             configs,
+             execute=execute,
+             tables=cleared_tables,
+         )),
         ("Redis", args.skip_redis,
          lambda: reset_redis(configs, execute=execute)),
         ("Elasticsearch", args.skip_elasticsearch,
@@ -817,6 +934,10 @@ def main() -> int:
         ("本地文件", args.skip_files,
          lambda: reset_files(Path(args.files_root), execute=execute)),
     ):
+
+        if label in auto_skip:
+            logger.info("%s：跳过（%s）。", label, auto_skip[label])
+            continue
 
         if skipped:
             logger.info("%s：已按参数跳过。", label)

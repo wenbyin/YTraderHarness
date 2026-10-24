@@ -187,8 +187,11 @@ REAL_KEYS = frozenset({
     "cache_interceptor",
     "auth_interceptor",
     "event_observer",
+    "execution_guard_interceptor",
     "metrics_observer",
     "privacy_transformer",
+    "retry_interceptor",
+    "timeout_interceptor",
 })
 
 
@@ -1009,8 +1012,14 @@ async def main() -> int:
         hook=ProcessorHook.AROUND
     )
     check(
-        "按 hook 过滤（AROUND 现在只有缓存一个）",
-        {i.key for i in by_hook.items} == {"cache_interceptor"},
+        "按 hook 过滤（AROUND：缓存 + 执行守卫 + 超时 + 重试）",
+        {i.key for i in by_hook.items}
+        == {
+            "cache_interceptor",
+            "execution_guard_interceptor",
+            "retry_interceptor",
+            "timeout_interceptor",
+        },
     )
 
     by_mode = await catalog.list_definitions(
@@ -1035,7 +1044,8 @@ async def main() -> int:
     check(
         "分页：total 是过滤后的总数，不是页长",
         paged.total == len(REAL_KEYS)
-        and len(paged.items) == len(REAL_KEYS) - 4,
+        # 第 2 页最多 page_size 条；条目总数不一定刚好填满两页。
+        and len(paged.items) == min(4, len(REAL_KEYS) - 4),
     )
     check(
         "TRANSFORMER 这个 type 现在有真实实现（之前是空枚举值）",
@@ -1340,20 +1350,25 @@ async def main() -> int:
         tool_key="smoke.tool", arguments={"q": "x"}
     )
 
-    await cache.before(invocation, config={"ttl_seconds": 60})
-    await cache.after(
-        invocation, await work(), config={"ttl_seconds": 60}
-    )
-    hit = await cache.before(invocation, config={"ttl_seconds": 60})
+    await get_tool_cache().clear()
 
-    check("缓存命中时短路成 ToolOutcome", isinstance(hit, ToolOutcome))
-    check("并且标记了 cached", hit.cached is True)
+    first = await cache.around(
+        invocation, work, config={"ttl_seconds": 60}
+    )
+    second = await cache.around(
+        invocation, work, config={"ttl_seconds": 60}
+    )
+
+    check("第一次未命中、真的执行", first.ok and not first.cached)
+    check("第二次命中缓存", second.cached is True)
+    check("命中时短路成 ToolOutcome", isinstance(second, ToolOutcome))
     check("底层只执行了一次", calls["n"] == 1)
+
+    await get_tool_cache().put("k", 1, ttl_seconds=0)
 
     check(
         "ttl=0 等于不缓存",
-        get_tool_cache().put("k", 1, ttl_seconds=0) is None
-        and get_tool_cache().get("k") == (False, None),
+        await get_tool_cache().get("k") == (False, None),
     )
 
     metrics_observer = ToolMetricsObserver()

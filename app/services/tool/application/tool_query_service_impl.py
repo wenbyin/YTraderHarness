@@ -59,6 +59,7 @@ class ToolQueryServiceImpl(ToolQueryService):
             *,
             keyword: str | None = None,
             source_type: SourceType | None = None,
+            source_ref: str | None = None,
             classification_code: str | None = None,
             source_state: SourceState | None = None,
             page: int = 1,
@@ -70,6 +71,7 @@ class ToolQueryServiceImpl(ToolQueryService):
         definitions, total = await self._definitions.list_paged(
             keyword=keyword,
             source_type=source_type,
+            source_ref=source_ref,
             classification_code=classification_code,
             source_state=source_state,
             offset=offset,

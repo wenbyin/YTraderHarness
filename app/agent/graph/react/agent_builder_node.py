@@ -8,7 +8,8 @@ app/agent/state/agent_state.py 的 AgentClassification）：
 
     ① 行为分类      干什么（chat / qa / analysis / ...）
     ② modules       业务域分类 —— **本次恒空**，见下
-    ③ 执行方案      怎么执行（direct / react / plan）—— **驱动路由**
+    ③ 执行方案      怎么执行（react / plan）—— **只是提议**：
+                    plan 用来请求进入计划模式，生效的是 `plan_status`
     ④ capability_needs
                     完成它要用到哪些能力（候选来自数据库的能力 code）
                     —— **驱动工具选择**，见下
@@ -16,10 +17,15 @@ app/agent/state/agent_state.py 的 AgentClassification）：
 
 ⚠️ 这次 LLM 对话**不进对话历史**
 --------------------------------
-返回值里**没有 `messages` 键**，这就是实现方式：`add_messages` 只在返回
-字典里出现该键时才归约（见 graph/react/state.py）。分类是内部步骤，
-它的问题是"给这句话分个类"，与用户看到的对话无关 —— 把它塞进 messages
-会让主模型、以及下一轮的历史选择器都看见一段莫名其妙的问答。
+分类是内部步骤，它的问题是"给这句话分个类"，与用户看到的对话无关 ——
+把它塞进 messages 会让主模型、以及下一轮的历史选择器都看见一段莫名其
+妙的问答。所以正常情况下返回值里**没有 `messages` 键**（`add_messages`
+只在返回字典出现该键时才归约，见 graph/react/state.py）。
+
+唯一的例外是**进入计划模式**：那时会合成一条 `enter_plan_mode` 的
+AIMessage（见 `_plan_enter_message`）。它不是分类的问答，而是一次真实
+的控制动作 —— 与模型自己调用工具走同一条 tools 执行路径。下一轮
+主模型看到它和它的 ToolMessage，正是我们想要的记录。
 
 ⚠️ 失败一律降级，不抛异常 —— 与 agent_node 的立场**刻意不同**
 ------------------------------------------------------------
@@ -85,39 +91,55 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, Field
 
 from app.agent.context.builder.contracts import ContextBuildRequest
 from app.agent.context.processor.dependencies import ContextDependencies
+from app.agent.context.trace import ContextTrace
 from app.agent.model import (
     ModelResolveContext,
+    ModelTrace,
     required_capabilities_for,
 )
 from app.agent.prompt import get_prompt_provider
 from app.agent.prompt.prompts.classification import BEHAVIORS, PLANS
+from app.agent.tools.plan_tool import ENTER_PLAN_TOOL_KEY
 from app.agent.state import (
     MODULE_OTHER,
     AgentClassification,
+    ExecutionPlan,
     coerce_behavior,
     coerce_execution_plan,
     empty_classification,
 )
+from app.common.event import EventType, SpanKind
 from app.common.factories import get_service_factory
 from app.infra.graph import execution_ids, node_span
 from app.services.capability.application import CapabilityService
 from app.services.tool.application import ToolQueryService
+from app.services.tool.registry import wire_name
 
+from .capability_defaults import (
+    default_capability_codes,
+    parent_codes_of,
+    resolve_capability_exposure,
+    resolve_mode,
+)
 from .catalog import (
     AGENT_TYPE,
     CLASSIFIER_BUILDER_TYPE,
     CLASSIFIER_MODEL_ROLE,
     NODE_SPECS,
 )
+from .plan_state import PLAN_ACTIVE, PLAN_OFF, plan_tool_keys
+from .trace import node_trace
 from .context import ReactContext
 from .state import ReactState
 
@@ -176,7 +198,11 @@ class _ClassificationOutput(BaseModel):
     )
 
     execution_plan: str = Field(
-        description=f"执行方案，取值之一：{PLANS}。判不出来用 other。",
+        description=(
+            f"执行方案，取值之一：{PLANS}。plan 表示建议**先进入计划模式**"
+            "拆解任务（它只是提议，已处于计划模式时不会重置当前计划）。"
+            "判不出来用 other。"
+        ),
     )
 
     capability_needs: list[str] = Field(
@@ -222,6 +248,10 @@ class _ModuleCandidate:
     但**模型判断该选哪个**靠的是名称与描述。只给 code 等于让它按字符串
     相似度猜 —— 而这两个字段的区别（业务域 / 能力域接口）恰恰只能从
     名称与描述里读出来。
+
+    id / parent_id 给默认能力策略用：plan 模式要按 `AGENT_RUNTIME`
+    递归展开整棵子树（见 capability_defaults.py）。提示词渲染只用
+    code / name / description，这两项不会进模型。
     """
 
     code: str
@@ -229,6 +259,10 @@ class _ModuleCandidate:
     name: str
 
     description: str | None = None
+
+    id: UUID | None = None
+
+    parent_id: UUID | None = None
 
 
 # ⚠️ 提示词的正文与排版（`_render_candidate` / `_system_prompt`，以及
@@ -298,6 +332,66 @@ async def agent_builder_node(
             notes=notes,
         )
 
+        # ③ 分类只做一件事：**决定要不要调 EnterPlanTool**。
+        #
+        # 它不写 plan_status —— 进入动作由 tools 节点在**执行工具之后**
+        # 统一结算（与模型自己调用 enter_plan_mode 走同一条路径）。这里
+        # 合成的是一条 AIMessage 工具调用：route_after_builder 把它 Send
+        # 到 tools，工具返回 Command(goto="planner")，tools 节点写
+        # plan_status / 清空旧 plan，图直接跳到 planner。
+        #
+        # ⚠️ 当前已是 plan 时不调用（幂等）：不能重置正在执行的计划。
+        # 只有计划的任务全部完成后，再次调用才会触发重新规划 —— 那个
+        # 判断在 tools._plan_goto 里做（工具看不到 state）。
+        current_status = str(state.get("plan_status") or PLAN_OFF)
+
+        plan_enter_requested = (
+            current_status != PLAN_ACTIVE
+            and classification["execution_plan"]
+            == ExecutionPlan.PLAN.value
+        )
+
+        plan_status = current_status
+
+        # 模式默认能力 ⊕ 分类器选中的能力。
+        #
+        # 默认能力解决的是「分类器没选中，但这个模式本来就该有」：
+        # plan 模式下 create_team / task 控制工具 / enter/exit 等属于
+        # 运行时编排能力，不应该依赖模型有没有在 capability_needs 里
+        # 点名。策略表在 capability_defaults.py，改那里即可。
+        selected_capabilities = [
+            *classification["modules"],
+            *classification["capability_needs"],
+        ]
+
+        capability_mode = resolve_mode(
+            execution_plan=classification["execution_plan"],
+            plan_status=current_status,
+            plan_enter_requested=plan_enter_requested,
+        )
+
+        default_capabilities = default_capability_codes(
+            capability_mode,
+            codes=[candidate.code for candidate in candidates],
+            parent_of=_parent_codes(candidates),
+        )
+
+        # 全局暴露策略：agent（duty_key）看到哪些能力。
+        #
+        #     最终 = 该 agent 的全局能力 ∪ 模式默认能力
+        #            ∪ 本次分类识别出的能力
+        #
+        # 前两项是**地板**（默认永远可见）；分类器识别的是本次增量，
+        # 默认并入（capability_defaults.ALLOW_CLASSIFIER_CAPABILITIES）。
+        # 关掉它时 requested 只进 clipped 供观测。
+        exposure = resolve_capability_exposure(
+            _agent_key(state, context),
+            mode_defaults=default_capabilities,
+            requested=selected_capabilities,
+            codes=[candidate.code for candidate in candidates],
+            parent_of=_parent_codes(candidates),
+        )
+
         # 能力 code -> 本次可用的工具。判出分类之后才做：这些 code 是
         # 模型给的，顺序反了我们就是拿上一轮的结果在查工具。
         #
@@ -306,11 +400,40 @@ async def agent_builder_node(
         # 体系加上区分字段之后 ② 就会开始有值，那时这条路不用改；
         # 而现在多传一个空列表的代价是零。
         tool_keys, tool_notes = await _tool_keys_for_capabilities(
-            [
-                *classification["modules"],
-                *classification["capability_needs"],
-            ]
+            list(exposure.effective)
         )
+
+        if exposure.clipped:
+            # 被策略裁掉的能力必须看得见：否则表现成「分类器明明选了
+            # 却没生效」，而两边的日志都正常。
+            tool_notes.append(
+                "能力暴露策略裁剪："
+                + ", ".join(exposure.clipped)
+            )
+
+        if (
+                capability_mode == "plan"
+                and "AGENT_RUNTIME" not in {
+                    candidate.code for candidate in candidates
+                }
+        ):
+            # 默认根不可用（目录没同步 / 根被停用）：不要静默变成
+            # 「plan 模式没有任何编排工具」，让降级在 notes 里看得见。
+            tool_notes.append(
+                "plan 默认能力根 AGENT_RUNTIME 不在能力目录里。"
+            )
+
+        # 图控制工具并进同一份 tool_keys。
+        #
+        # ⚠️ 不能单独加到 tools 节点的白名单里：`tool_keys` 是"给模型看
+        # 什么"与"允许执行什么"的**唯一**来源（见 routing._tool_keys）。
+        # 这里并进去，模型看得到、Send payload 也带着它们；控制调用由
+        # route_after_agent 提前截走，不进执行链。
+        #
+        # 三个控制工具（enter / exit / ask）与当前模式无关，始终暴露
+        # —— 理由见 plan_state.plan_tool_keys 的 docstring。
+        control_tool_keys = plan_tool_keys(plan_status)
+        exposed_tool_keys = _dedupe([*tool_keys, *control_tool_keys])
 
         # 人工写的工具说明覆盖（预载）。**必须与 tool_keys 同一轮取**：
         # 覆盖是按 tool_key 索引的，而这一轮选中的 key 刚刚才定下来。
@@ -344,7 +467,24 @@ async def agent_builder_node(
         span.set_metrics({
             "degraded": classification["degraded"],
             "module_candidates": len(candidates),
+            # 默认能力策略的命中情况：模式、默认能力数、分类器显式
+            # 选中的能力数。三者分开记，才能分清「分类器没选」与
+            # 「默认策略没生效」。
+            "capability_mode": capability_mode,
+            "capability_agent": exposure.agent_key,
+            "default_capabilities": len(default_capabilities),
+            "classifier_capabilities": len(selected_capabilities),
+            "allowed_capabilities": len(exposure.allowed),
+            "effective_capabilities": len(exposure.effective),
+            "clipped_capabilities": len(exposure.clipped),
+            # 能力工具数（不含图控制工具）—— 两个数分开记，
+            # "这一轮没有能力工具"与"计划工具消失了"才分得开。
             "tool_keys": len(tool_keys),
+            "control_tools": len(control_tool_keys),
+            "plan_status": plan_status,
+            # 这一轮要不要发起 enter_plan_mode。与 plan_status 分开：
+            # 发起时状态还没变（切换在 tools 节点里发生）。
+            "plan_enter_requested": plan_enter_requested,
             # 这一轮有几个工具带人工说明覆盖。它是"人在 BE 改的说明
             # 到底有没有进这一轮"的唯一观测信号 —— 没有它，"改完没生效"
             # 只能靠对着请求体看。
@@ -366,17 +506,69 @@ async def agent_builder_node(
             "modules": classification["modules"],
             "capability_needs": classification["capability_needs"],
             "execution_plan": classification["execution_plan"],
-            "tool_keys": tool_keys,
+            # execution_plan 是**提议**，plan_status 是生效值 —— 两个都留，
+            # 才能看出"分类说要规划，但已经处于计划模式所以没重置"。
+            "plan_status": plan_status,
+            "plan_origin": state.get("plan_origin") or "",
+            "plan_enter_requested": plan_enter_requested,
+            "capability_mode": capability_mode,
+            "capability_agent": exposure.agent_key,
+            "default_capabilities": default_capabilities,
+            "classifier_capabilities": selected_capabilities,
+            "effective_capabilities": list(exposure.effective),
+            "clipped_capabilities": list(exposure.clipped),
+            "tool_keys": exposed_tool_keys,
             "memory_retrieve": memory_retrieve,
         })
 
-        return {
+        result: dict[str, Any] = {
             "classification": classification,
             "context_policy": _merged_policy(
-                state, tool_keys, system_prompt, tool_overrides,
+                state, exposed_tool_keys, system_prompt, tool_overrides,
                 memory_retrieve,
             ),
         }
+
+        # 分类判定要规划 -> 发一条 EnterPlanTool 调用，交给 tools 节点
+        # 执行并结算模式切换。**不在这里改 plan_status**。
+        if plan_enter_requested:
+            result["messages"] = [_plan_enter_message(context)]
+
+        return result
+
+
+def _plan_enter_message(context: ReactContext) -> AIMessage:
+    """
+    分类判定要规划时，合成的**进入计划模式**工具调用。
+
+    ⚠️ 为什么合成消息而不是直接写 state
+    ---------------------------------
+    进入计划模式只有一个执行入口：`tools` 节点。模型自己调用工具时
+    走那条路，分类器触发时也必须走同一条 —— 两条路各写一份的话，
+    "清空旧 plan / 记 plan_origin / 路由去 planner"早晚漂移。
+
+    ⚠️ id 由 run_id 派生
+    --------------------
+    同一次运行重放时消息身份稳定，`add_messages` 会按 id 覆盖而不是
+    追加两条；否则重跑会留下两条一模一样的计划调用。
+
+    `origin` 放在消息的 `additional_kwargs` 里：`route_after_builder`
+    把它搬进 Send payload，`tools` 节点据此把 `plan_origin` 记成
+    `"classifier"` 而不是 `"tool"` —— 后者是模型主动调用的来源。
+    """
+
+    call_id = f"classifier-plan-{context.pipeline_run_id}"
+
+    return AIMessage(
+        content="",
+        id=call_id,
+        additional_kwargs={"plan_origin": "classifier"},
+        tool_calls=[{
+            "name": wire_name(ENTER_PLAN_TOOL_KEY),
+            "args": {"reason": "分类判定：当前请求需要先规划"},
+            "id": call_id,
+        }],
+    )
 
 
 # ============================================================
@@ -400,6 +592,18 @@ async def _classify(
     理由见模块 docstring。
     """
 
+    trace, node_span_id = node_trace(runtime)
+
+    build_span = trace.start(
+        EventType.CONTEXT_BUILD_STARTED,
+        span_kind=SpanKind.CONTEXT,
+        span_name="context.build",
+        end_type=EventType.CONTEXT_BUILD_COMPLETED,
+        failed_type=EventType.CONTEXT_BUILD_FAILED,
+        parent_span_id=node_span_id,
+        payload={},
+    )
+
     request = ContextBuildRequest(
         builder_type=CLASSIFIER_BUILDER_TYPE,
         thread_id=execution_ids(runtime).thread_id,
@@ -411,14 +615,32 @@ async def _classify(
         dependencies=ContextDependencies(
             model_registry=context.model_registry,
         ),
+        trace=(
+            ContextTrace(
+                emitter=trace,
+                parent_span_id=build_span.span_id,
+            )
+            if build_span is not None
+            else None
+        ),
     )
 
     try:
         # classifier_builder 是启动期解析好的实例（见 context.py）——
         # 与 agent 节点用 context.builder 是同一种形状。
-        model_request = await context.classifier_builder.build(
-            request
-        )
+        try:
+            model_request = await context.classifier_builder.build(
+                request
+            )
+
+        except BaseException as exc:
+            if build_span is not None:
+                build_span.fail(exc)
+            raise
+
+        else:
+            if build_span is not None:
+                build_span.complete(payload={})
 
         model_runtime = context.model_registry.get_runtime(
             agent_type=AGENT_TYPE,
@@ -430,7 +652,13 @@ async def _classify(
             ),
         )
 
-        response = await model_runtime.ainvoke(model_request)
+        response = await model_runtime.ainvoke(
+            model_request,
+            trace=ModelTrace(
+                emitter=trace,
+                parent_span_id=node_span_id,
+            ),
+        )
 
         return _parse(
             response.message,
@@ -472,9 +700,17 @@ def _parse(
     这里曾经只认后两种，于是**每一次分类都被降级**：实例既没有
     `.content`、也不是 dict，直接落到下面那个"类型意外"分支，模型答对了
     也全被丢掉 —— 症状是 `modules=[]`、`tool_keys=[]`、模型一个工具都
-    看不到，而 state 里只留一句 notes。所以 `BaseModel` 判在最前：
+    看不到，而 state 里只留一句 notes。所以结构化实例判在最前：
     顺序反过来时，将来 `_ClassificationOutput` 多一个叫 `content` 的字段
     就会被上面那句 `.content` 悄悄吞掉。
+
+    ⚠️ `BaseMessage` 是例外
+    ----------------------
+    langchain 的 `AIMessage` 也是 pydantic `BaseModel`。如果把它当结构化
+    实例 `model_dump()`，拿到的是整条消息（`content` 等字段），而不是
+    分类结果。真有 provider 把结构化结果包在消息里时，必须走
+    `message.content` 那条路。因此这里排除 `BaseMessage`，只把**非消息**
+    的 BaseModel 当成结构化实例。
 
     ⚠️ 这里**不抛异常**，也不试图"修好"模型的话：它给了什么就收什么，
     收不进取值域的落 other。一段以解析失败告终的分类，其价值与
@@ -484,7 +720,7 @@ def _parse(
     合法地产出它们，那属于 provider 违约，就该降级。
     """
 
-    if isinstance(message, BaseModel):
+    if isinstance(message, BaseModel) and not isinstance(message, BaseMessage):
         payload = message.model_dump()
 
     else:
@@ -607,9 +843,39 @@ async def _module_candidates() -> tuple[list[_ModuleCandidate], list[str]]:
             code=c.code,
             name=c.name,
             description=c.description,
+            id=c.id,
+            parent_id=c.parent_id,
         )
         for c in capabilities
     ], []
+
+
+def _agent_key(
+        state: ReactState,
+        context: ReactContext,
+) -> str:
+    """
+    暴露策略的 key：业务 agent 身份（`duty_key`）。
+
+    与 `_memory_retrieve` / `_duty_prompt` 同一个来源：state 里的
+    `duty_key` 优先；缺失时退回运行上下文（派发方填的同一个值）。
+    两处都空 -> 空串，策略层会落到 `"*"` 兜底。
+    """
+
+    value = str(state.get("duty_key") or "").strip()
+
+    if value:
+        return value
+
+    return str(getattr(context, "duty_key", "") or "").strip()
+
+
+def _parent_codes(
+        candidates: list[_ModuleCandidate],
+) -> dict[str, str | None]:
+    """`code -> 父 code`，给默认能力策略展开子树用。"""
+
+    return parent_codes_of(candidates)
 
 
 # ============================================================
@@ -652,6 +918,20 @@ async def _tool_keys_for_capabilities(
 
     两个维度共用这一个哨兵值，所以这里过滤一次就够；不需要按维度分开。
     """
+
+    # --mock：忽略真实 capability -> tool 的数据库关联。
+    #
+    # 前端联调不保证 capability/tool_definition 的种子数据齐全；没有映射
+    # 时主模型一个工具都看不到，后面"随机 tool_calls"那条链路就永远不触发。
+    # mock 解析器从固定工具池里选 N 个，code 只作为上下文，不参与选工具。
+    from app.mock.settings import is_mock_enabled
+
+    if is_mock_enabled():
+        from app.mock.capability import select_mock_tool_keys
+
+        keys = select_mock_tool_keys(codes)
+
+        return keys, [f"mock capability resolver：{len(keys)} 个固定工具"]
 
     usable = [
         str(code) for code in codes
@@ -813,6 +1093,14 @@ def _merged_policy(
         "memory_retrieve": memory_retrieve or {},
     }
 
+    # 压测/诊断开关：关闭后 L0~L3 的召回与注入全部跳过
+    # （`memory` 与 `memory_profile` 两个处理器的 gate）。
+    # 默认开启，mock 模式同样开启；要压测主链路时显式设为 0。
+    if os.environ.get(
+            "YTRADER_MEMORY_CONTEXT", "1",
+    ).strip().lower() in {"0", "false", "no", "off"}:
+        merged["include_memory"] = False
+
     if system_prompt:
         merged["system_prompt"] = system_prompt
 
@@ -910,14 +1198,24 @@ def _graph_state(
     """
     交给 ContextBuilder 的图 state 快照 + 本次的策略覆盖。
 
-    ⚠️ `context_policy` 里那两项是**必须**的，不是调优：
-    CLASSIFIER 的策略基线把 history 关掉了（include_history=False），
-    而用户这句话只有 history 处理器会送进 prompt（见
-    context/builder/classifier.py 的说明）。不覆盖它，模型看到的提示词
-    里就没有问题本身。
+    ⚠️ `context_policy` 里那几项是**必须**的，不是调优：
 
-    `min/max_recent_turns=1` = 只留当前这一轮（"最后一轮永不裁"）——
-    窗口宽度是 `clamp(未覆盖轮数, min, 上限)`，两者都钉成 1 就没有余地。
+    include_history=True
+        CLASSIFIER 的策略基线把 history 关掉了（include_history=False），
+        而用户这句话只有 history 处理器会送进 prompt（见
+        context/builder/classifier.py 的说明）。不覆盖它，模型看到的
+        提示词里就没有问题本身。
+
+    min/max_recent_turns=1
+        只留当前这一轮（"最后一轮永不裁"）—— 窗口宽度是
+        `clamp(未覆盖轮数, min, 上限)`，两者都钉成 1 就没有余地。
+
+    include_summary=True / allow_compaction=False
+        把 state 里已有的摘要作为「历史摘要」注入，供模型理解当前输入
+        的指代；但**绝不**在分类阶段生成新摘要。主 agent 的
+        context_policy 可能带着 allow_compaction=True，这里必须显式
+        钉掉 —— 否则一次分类会先多调一次摘要模型。
+        摘要只是背景，分类对象永远是最后一条用户输入（见分类提示词）。
     """
 
     snapshot: dict[str, Any] = {}
@@ -934,6 +1232,12 @@ def _graph_state(
         "min_recent_turns": 1,
         "max_recent_turns": 1,
         "max_history_tokens": 0,
+        # 摘要只读注入：SUMMARY_LOADER 已声明在 classifier 的阶段集里。
+        # include_summary 打开才会注入 state 里已有的那份；allow_compaction
+        # 必须钉成 False，否则主 agent 的 True 会漏进来，分类阶段会先
+        # 调一次摘要模型再分类。
+        "include_summary": True,
+        "allow_compaction": False,
         # 分类提示词：**经 PromptProvider 取**（正文在
         # app/agent/prompt/prompts/classification.py）。键用的就是本次调用
         # 的 model_role（CLASSIFIER_MODEL_ROLE = ModelRole.CLASSIFICATION）

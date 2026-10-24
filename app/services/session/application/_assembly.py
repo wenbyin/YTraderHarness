@@ -1,9 +1,9 @@
 """
 实体 -> 对外契约的组装。
 
-纯函数、不碰数据库。放在这里而不是各服务里各写一份：会话与运行各只有一个
-读点，但"契约长什么样"仍然只该有一处 —— 将来加了列表接口，两处各拼一份
-必然会漂移（一个带 status 一个不带那种）。
+纯函数、不碰数据库。放在这里而不是各服务里各写一份：会话有“按 id 取”与
+“列表”两个读点，但"契约长什么样"只该有一处 —— 各拼一份必然会漂移
+（一个带 status 一个不带那种）。列表的分页壳同样只在这里拼。
 
 消息那一组已经印证了这条：读路径在 MessageService（列表）与将来的
 "按 id 取单条"之间共享同一个 build_message，改字段只改这里。
@@ -23,6 +23,7 @@ from ..domain.schemas import (
     Pagination,
     Run,
     Session,
+    SessionPage,
     encode_cursor,
 )
 
@@ -31,6 +32,7 @@ __all__ = [
     "build_message_page",
     "build_run",
     "build_session",
+    "build_session_page",
 ]
 
 
@@ -53,6 +55,23 @@ def build_session(entity: AgentSessionEntity) -> Session:
     )
 
 
+def build_session_page(
+        entities: Sequence[AgentSessionEntity],
+        total: int,
+) -> SessionPage:
+    """
+    一页会话实体 -> 契约。
+
+    排序由仓储保证（updated_at 倒序、session_id 倒序），这里**不重排** ——
+    组装层再排一次会让“仓储的排序”与“接口的排序”变成两份，迟早漂移。
+    """
+
+    return SessionPage(
+        items=[build_session(entity) for entity in entities],
+        total=total,
+    )
+
+
 def build_run(entity: AgentRunEntity) -> Run:
     """
     运行实体 -> 契约。同样丢掉 input / meta / 时间戳 / caller_identity，见上。
@@ -67,6 +86,9 @@ def build_run(entity: AgentRunEntity) -> Run:
         run_id=entity.run_id,
         session_id=entity.session_id,
         status=entity.status,
+        # 客户端自己传过的值；回显它是为了让"这次运行有没有开 trace"
+        # 在运行详情里可见，不引入新信息。
+        trace_id=entity.trace_id,
     )
 
 

@@ -44,11 +44,24 @@ from .documentation import (
     ToolDocumentationUpdate,
 )
 from .enum import (
+    ExecutionDecision,
+    ExecutionMatch,
     ExecutionMode,
+    ExecutionScope,
+    GuardAction,
     ProcessorHook,
     ProcessorType,
     SourceState,
     SourceType,
+)
+from .execution import (
+    ExecutionGuardRequest,
+    ExecutionReservation,
+    ExecutionStatusLimit,
+)
+from .mcp import (
+    MCPProviderListResponse,
+    MCPProviderSummary,
 )
 from .processor import (
     CreateToolProcessorRequest,
@@ -70,7 +83,16 @@ from .tool import (
 
 __all__ = [
     "CreateToolProcessorRequest",
+    "ExecutionDecision",
+    "ExecutionGuardRequest",
+    "ExecutionMatch",
     "ExecutionMode",
+    "ExecutionReservation",
+    "ExecutionScope",
+    "ExecutionStatusLimit",
+    "GuardAction",
+    "MCPProviderListResponse",
+    "MCPProviderSummary",
     "PagedProcessorDefinitionResponse",
     "PagedToolSummaryResponse",
     "ParameterDocumentation",

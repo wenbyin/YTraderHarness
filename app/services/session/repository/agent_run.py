@@ -3,16 +3,15 @@ Repository contract for AgentRun.
 
 只管 agent_run 一张表。与 AgentSessionRepository 分开的理由见那个文件。
 
-⚠️ 现在只有写与单条读，**没有** list_for_session
+⚠️ 现在有写、单条读，以及会话删除需要的一条窄查询
 ----------------------------------------------
-"某个会话发生过什么"迟早要查（表上那条
-`idx_agent_run_session(session_id, created_at DESC)` 就是为它留的），
-但**当前没有任何接口或调用方需要它**。加一个没人调的方法等于把"以后大概
-要"写进代码 —— 等 ④ 事件流 / ⑤ 恢复 / 会话历史这几个里有一个真的需要时
-再加，那时也能顺手确定要不要分页。
+"某个会话发生过什么"的完整历史仍然没有接口；删除会话只需要回答一个
+更窄的问题：**这个会话还有没有没结束的运行**。因此这里加的是
+`list_unfinished_for_session`，不是通用分页列表 —— 等事件流 / 历史接口
+真的需要按会话翻运行记录时再加，那时也能顺手确定要不要分页。
 
-保留那条索引而不是一起砍掉：索引是**表设计**的一部分（这张表天然按
-会话+时间查），删了将来要补一次迁移；而一个方法删了只是删几行。
+那条 `idx_agent_run_session(session_id, created_at DESC)` 仍然保留：
+它是表设计的一部分（这张表天然按会话+时间查）。
 """
 
 from __future__ import annotations
@@ -73,7 +72,7 @@ class AgentRunRepository(BaseRepository):
             error_message: str | None = None,
     ) -> None:
         """
-        写终态：completed / failed（将来还有 cancelled）。
+        写终态：completed / failed / cancelled。
 
         error_type / error_message 只在失败时有值 —— 规格的 Run 不回它们，
         **落库是它们唯一的去处**，否则一次失败的运行在库里只剩 failed
@@ -81,6 +80,44 @@ class AgentRunRepository(BaseRepository):
 
         Raises:
             ValueError: 运行不存在。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    async def list_unfinished_for_session(
+            self,
+            session_id: UUID,
+    ) -> list[AgentRun]:
+        """
+        列出会话里**还没结束**的运行：queued / running / waiting_input。
+
+        调用方是会话删除（归档）—— 它要先把这些运行结束掉，否则归档后的
+        会话里还挂着一件“没做完的事”。终态（completed / failed /
+        cancelled）不返回。
+
+        正常路径上同一个会话最多一条（进程内 thread 锁保证），但这里按
+        列表返回：锁是进程内的，重启 / 多进程下可能出现孤儿，删除逻辑
+        不该假定“只有一条”。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    async def cancel_if_unfinished(
+            self,
+            run_id: UUID,
+    ) -> bool:
+        """
+        条件更新：只有**未终态**的运行才改成 cancelled。
+
+        返回是否改到了行。False 表示它已经结束（或不存在）—— 调用方据此
+        当成“无事可做”，而不是报错。
+
+        ⚠️ 只用于**没有进程内任务**的运行（waiting_input、调度器尚未受理的
+        queued、进程重启后的孤儿）。有任务的 queued/running 必须走
+        `GraphDispatcher.cancel`：那样 handler 才会做 checkpoint 回滚、
+        写中断记录并放锁；直接改库会让图继续跑。
         """
 
         raise NotImplementedError

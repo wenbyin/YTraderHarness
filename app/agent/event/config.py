@@ -137,8 +137,19 @@ class StreamConfig(BaseModel):
         default=10_000,
         ge=1,
         description=(
-            "发布端写队列的上限（条）。满了**拒绝最新**那条，"
+            "发布端**每个写分片**的队列上限（条）。满了**拒绝最新**那条，"
             "已接收的照常按序写出 —— 理由见 publisher.py 模块 docstring。"
+        ),
+    )
+
+    write_workers: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "发布端写线程数（分片数）。事件按 stream key 哈希到分片，"
+            "**同一条 run 的先后顺序仍然由同一个分片保证**。\n\n"
+            "⚠️ 不能超过 redis.yaml 的 sync_max_connections —— 每个写线程"
+            "各占一条同步连接。"
         ),
     )
 

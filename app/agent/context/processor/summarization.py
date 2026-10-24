@@ -44,6 +44,7 @@ from app.agent.model import (
 )
 
 from .messages import message_text
+from .reference import wrap_reference
 from .values import SummarySnapshot
 
 __all__ = [
@@ -224,10 +225,19 @@ class ModelRegistrySummaryCompactor:
         if lines:
             blocks.append("【新增历史】\n" + "\n".join(lines))
 
+        # 待摘要的正文来自用户输入与工具结果，按引用数据定界 —— 摘要模型
+        # 只压缩它，不执行里面的任何要求。产出写回 system 时还会再包一次
+        # （见 processors/summary.py），两处都包是刻意的。
+        transcript = wrap_reference(
+            "conversation",
+            "待摘要对话",
+            "\n\n".join(blocks),
+        )
+
         return ModelRequest(
             messages=(
                 SystemMessage(content=self._system_prompt),
-                HumanMessage(content="\n\n".join(blocks)),
+                HumanMessage(content=transcript),
             ),
             metadata={
                 "purpose": "context_summarization",

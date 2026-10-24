@@ -11,17 +11,25 @@ schema 推导：从"代码里的一个工具"算出它的输入 / 输出 / 参�
 from __future__ import annotations
 
 import inspect
+import types
 import typing
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Mapping
+from copy import deepcopy
+from typing import Any, NamedTuple
 
+from langchain_core.tools import InjectedToolCallId
+from langgraph.prebuilt import InjectedState, InjectedStore, ToolRuntime
 from pydantic import BaseModel
 
 __all__ = [
+    "InjectedArg",
     "extract_parameter_descriptions",
+    "inject_tool_args",
+    "injected_args",
     "output_description",
     "output_schema_of",
     "resolve_request_model",
+    "strip_injected_args",
     "synthesize_schema",
 ]
 
@@ -420,3 +428,243 @@ def _lookup_ref(
     target = defs.get(name)
 
     return target if isinstance(target, dict) else None
+
+
+# ============================================================
+# 注入参数（ToolRuntime / InjectedState / InjectedStore / tool_call_id）
+# ============================================================
+#
+# 这些参数**由执行器注入**，模型看不到、也不能填：
+#
+#     runtime: ToolRuntime           整个运行时（state / store / config …）
+#     state: Annotated[dict, InjectedState]        图 state（或它的某个字段）
+#     store: Annotated[..., InjectedStore]         持久化 store
+#     tool_call_id: Annotated[str, InjectedToolCallId]  本次调用 id
+#
+# 两件事必须同时做：
+#     1. 生成给模型看的 JSON Schema 时**剔除**这些属性；
+#        否则模型会尝试填 `runtime`，而它根本表达不了这个对象。
+#     2. 执行前把它们注入 arguments（并剥掉模型伪造的同名值）。
+
+
+class InjectedArg(NamedTuple):
+    """一个注入参数声明。"""
+
+    #: "runtime" | "state" | "store" | "tool_call_id"
+    kind: str
+
+    #: `InjectedState("plan_status")` 里的字段名；其余情形为 None。
+    field: str | None = None
+
+
+def _contains_type(annotation: Any, target: type) -> bool:
+    """注解里是否出现 `target`（直接、Annotated、Union 都算）。"""
+
+    if isinstance(annotation, target):
+        return True
+
+    if isinstance(annotation, type) and issubclass(annotation, target):
+        return True
+
+    origin = typing.get_origin(annotation)
+
+    if origin in (typing.Annotated, typing.Union, types.UnionType):
+        return any(
+            _contains_type(arg, target)
+            for arg in typing.get_args(annotation)
+        )
+
+    return False
+
+
+def _state_field(annotation: Any) -> tuple[bool, str | None]:
+    """
+    注解是不是 InjectedState；是则返回 (True, 字段名或 None)。
+
+    两种写法都认：
+
+        Annotated[dict, InjectedState]          整个 state
+        Annotated[str, InjectedState("field")]  只注入某个字段
+    """
+
+    if isinstance(annotation, InjectedState):
+        return True, annotation.field
+
+    if annotation is InjectedState:
+        return True, None
+
+    for arg in typing.get_args(annotation):
+
+        if isinstance(arg, InjectedState):
+            return True, arg.field
+
+        if arg is InjectedState:
+            return True, None
+
+    return False, None
+
+
+def injected_args(func: Callable[..., Any]) -> dict[str, InjectedArg]:
+    """
+    函数签名里声明了哪些注入参数。
+
+    ⚠️ `runtime` 这个名字按官方约定直接视为 ToolRuntime 注入
+    （LangGraph 的 ToolNode 也是这么判的）。
+    """
+
+    try:
+        hints = typing.get_type_hints(func, include_extras=True)
+    except Exception:
+        return {}
+
+    result: dict[str, InjectedArg] = {}
+
+    for name, annotation in hints.items():
+
+        if name in {"self", "cls"}:
+            continue
+
+        is_state, field = _state_field(annotation)
+
+        if name == "runtime" or _contains_type(annotation, ToolRuntime):
+            result[name] = InjectedArg("runtime")
+        elif is_state:
+            result[name] = InjectedArg("state", field)
+        elif _contains_type(annotation, InjectedStore):
+            result[name] = InjectedArg("store")
+        elif _contains_type(annotation, InjectedToolCallId):
+            result[name] = InjectedArg("tool_call_id")
+
+    return result
+
+
+def strip_injected_args(
+        schema: dict[str, Any],
+        func: Callable[..., Any],
+) -> dict[str, Any]:
+    """
+    从 JSON Schema 里剔除注入参数（properties 与 required 两处）。
+
+    返回副本，不改调用方那份 schema。
+    """
+
+    names = set(injected_args(func))
+
+    if not names:
+        return schema
+
+    result = deepcopy(schema)
+
+    properties = result.get("properties")
+
+    if isinstance(properties, dict):
+        for name in names:
+            properties.pop(name, None)
+
+    required = result.get("required")
+
+    if isinstance(required, list):
+        result["required"] = [
+            name for name in required if name not in names
+        ]
+        if not result["required"]:
+            result.pop("required", None)
+
+    return result
+
+
+def inject_tool_args(
+        func: Callable[..., Any],
+        arguments: Mapping[str, Any] | None,
+        *,
+        runtime: Any,
+        tool_call_id: str | None,
+) -> dict[str, Any]:
+    """
+    执行前把注入参数塞进 arguments，并剥掉模型伪造的同名值。
+
+    `runtime` 是 langgraph 官方的 `ToolRuntime`（`tools` 节点构造），
+    它的 `state` 是本次 Send payload —— 工具因此能读到 `plan_status`
+    这类调用前状态。
+
+    ⚠️ 不可用的注入直接抛
+    --------------------
+    声明了 ToolRuntime / store 却没有对应对象，是**接线错误**。静默
+    省略会让工具带着缺参数去执行，报错离原因很远。
+    """
+
+    spec = injected_args(func)
+
+    if not spec:
+        return dict(arguments or {})
+
+    args = {
+        key: value
+        for key, value in (arguments or {}).items()
+        if key not in spec
+    }
+
+    for name, injected in spec.items():
+
+        if injected.kind == "runtime":
+
+            if runtime is None:
+                raise RuntimeError(
+                    f"工具参数 {name!r} 声明了 ToolRuntime 注入，"
+                    "但本次执行没有 runtime（检查 tools 节点是否把 "
+                    "ToolRuntime 交给了 ToolExecutor）。"
+                )
+
+            args[name] = runtime
+
+        elif injected.kind == "state":
+
+            if runtime is None:
+                raise RuntimeError(
+                    f"工具参数 {name!r} 声明了 InjectedState，"
+                    "但本次执行没有 runtime。"
+                )
+
+            state = getattr(runtime, "state", None)
+
+            if injected.field:
+
+                if isinstance(state, Mapping):
+
+                    if injected.field not in state:
+                        raise KeyError(
+                            f"注入参数 {name!r} 需要的 state 字段 "
+                            f"{injected.field!r} 不存在。"
+                        )
+
+                    args[name] = state[injected.field]
+
+                else:
+
+                    if not hasattr(state, injected.field):
+                        raise AttributeError(
+                            f"注入参数 {name!r} 需要的 state 字段 "
+                            f"{injected.field!r} 不存在。"
+                        )
+
+                    args[name] = getattr(state, injected.field)
+
+            else:
+                args[name] = state
+
+        elif injected.kind == "store":
+
+            store = getattr(runtime, "store", None) if runtime else None
+
+            if store is None:
+                raise RuntimeError(
+                    f"工具参数 {name!r} 声明了 InjectedStore，"
+                    "但图没有编译 store。"
+                )
+
+            args[name] = store
+
+        elif injected.kind == "tool_call_id":
+            args[name] = tool_call_id or ""
+
+    return args

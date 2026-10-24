@@ -12,6 +12,9 @@ from uuid import UUID
 
 from sqlalchemy import delete, func, or_, select
 
+from app.services.skill.models.sqlalchemy.skill_capability import (
+    SkillCapability as SkillLinkModel,
+)
 from app.services.tool.models.sqlalchemy.tool_classification import (
     ToolDefinitionClassification as LinkModel,
 )
@@ -194,6 +197,26 @@ class CapabilityRepositoryImpl(CapabilityRepository):
             .select_from(LinkModel)
             .where(
                 LinkModel.classification_id.in_(
+                    capability_ids
+                )
+            )
+        )
+
+        return result.scalar_one()
+
+    async def count_skill_links(
+            self,
+            capability_ids: list[UUID],
+    ) -> int:
+
+        if not capability_ids:
+            return 0
+
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(SkillLinkModel)
+            .where(
+                SkillLinkModel.capability_id.in_(
                     capability_ids
                 )
             )

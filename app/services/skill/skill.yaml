@@ -1,0 +1,500 @@
+openapi: 3.1.0
+
+info:
+  title: Skill Management API
+  version: 1.0.0
+  description: |
+    Skill definitions and their binding to the existing capability tree.
+
+    A Skill does NOT grant tools directly. Tool visibility is derived at
+    runtime:
+
+        skill_capability.capability_id
+          -> capability.code
+          -> ToolQueryService.tool_keys_for_capabilities(codes)
+
+    That resolution is an internal service call, not a management endpoint.
+
+    Non-responsibilities:
+      - Skill versioning (updates are in place; the runtime snapshots the
+        definition when spawning a sub-agent).
+      - Tokens, A2A Agent Cards, A2A protocol metadata.
+      - Skill-level, capability-level, or tool-level authorization.
+        Platform authentication is inherited from the protected route tree
+        and is not modeled here.
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Skills
+    description: Skill definition management.
+  - name: Skill Capabilities
+    description: Skill ↔ capability bindings (tool visibility only).
+
+paths:
+
+  /skills:
+    get:
+      tags:
+        - Skills
+      summary: List skills
+      operationId: listSkills
+
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum:
+              - DRAFT
+              - ACTIVE
+              - DISABLED
+
+        - name: q
+          in: query
+          description: Match skill_key, name, or description.
+          schema:
+            type: string
+
+        - name: capability_id
+          in: query
+          description: Find skills bound to this capability.
+          schema:
+            type: string
+            format: uuid
+
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 20
+
+      responses:
+        '200':
+          description: Paged skill list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PagedSkillResponse'
+
+    post:
+      tags:
+        - Skills
+      summary: Create skill
+      operationId: createSkill
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillCreate'
+
+      responses:
+        '201':
+          description: Skill created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillDetail'
+
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+
+  /skills/{skill_id}:
+    get:
+      tags:
+        - Skills
+      summary: Get skill
+      operationId: getSkill
+
+      parameters:
+        - $ref: '#/components/parameters/SkillId'
+
+      responses:
+        '200':
+          description: Skill detail including capability bindings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillDetail'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags:
+        - Skills
+      summary: Update skill in place
+      operationId: updateSkill
+
+      parameters:
+        - $ref: '#/components/parameters/SkillId'
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillUpdate'
+
+      responses:
+        '200':
+          description: Updated skill
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillDetail'
+
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+    delete:
+      tags:
+        - Skills
+      summary: Delete skill
+      operationId: deleteSkill
+      description: |
+        Hard delete; capability bindings cascade. Prefer status=DISABLED
+        for normal retirement. Once another table references the skill,
+        the foreign key will refuse the delete.
+
+      parameters:
+        - $ref: '#/components/parameters/SkillId'
+
+      responses:
+        '204':
+          description: Skill deleted
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
+  /skills/{skill_id}/capabilities:
+    get:
+      tags:
+        - Skill Capabilities
+      summary: List skill capability bindings
+      operationId: listSkillCapabilities
+
+      parameters:
+        - $ref: '#/components/parameters/SkillId'
+
+      responses:
+        '200':
+          description: Bound capabilities
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CapabilityRef'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags:
+        - Skill Capabilities
+      summary: Replace skill capability bindings
+      operationId: replaceSkillCapabilities
+      description: |
+        Full replacement. An empty array clears all bindings.
+        Bindings decide tool visibility only; they are not an
+        authorization grant.
+
+      parameters:
+        - $ref: '#/components/parameters/SkillId'
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SkillCapabilityUpdate'
+
+      responses:
+        '200':
+          description: Updated capability bindings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CapabilityRef'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+
+components:
+
+  parameters:
+
+    SkillId:
+      name: skill_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+
+    NotFound:
+      description: Resource not found
+
+    Conflict:
+      description: Resource conflict (duplicate skill_key)
+
+    BadRequest:
+      description: Semantically invalid request (empty patch, null for a non-null field)
+
+    ValidationError:
+      description: Request validation failed
+
+  schemas:
+
+    SkillCreate:
+      type: object
+      additionalProperties: false
+      required:
+        - skill_key
+        - name
+        - description
+        - instructions
+      properties:
+        skill_key:
+          type: string
+          minLength: 2
+          maxLength: 120
+          pattern: '^[a-z][a-z0-9_]{1,119}$'
+
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+
+        description:
+          type: string
+          minLength: 1
+          description: Read by the main agent when selecting a skill.
+
+        tags:
+          type: array
+          items:
+            type: string
+          default: []
+          description: |
+            A2A AgentSkill.tags. Required by the standard (an empty array
+            is allowed). Used only when publishing an Agent Card.
+
+        examples:
+          type: array
+          items:
+            type: string
+          default: []
+          description: A2A AgentSkill.examples (optional).
+
+        instructions:
+          type: string
+          minLength: 1
+          description: Behaviour prompt / SOP injected into the sub-agent node.
+
+        status:
+          type: string
+          enum:
+            - DRAFT
+            - ACTIVE
+            - DISABLED
+          default: DRAFT
+
+    SkillUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: |
+        Partial update. skill_key is deliberately absent — it is the stable
+        identity referenced by future tables. Fields do not accept null.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+
+        description:
+          type: string
+          minLength: 1
+
+        tags:
+          type: array
+          items:
+            type: string
+          description: |
+            Absent means unchanged. Explicit null is rejected; send an
+            empty array to clear.
+
+        examples:
+          type: array
+          items:
+            type: string
+          description: |
+            Absent means unchanged. Explicit null is rejected; send an
+            empty array to clear.
+
+        instructions:
+          type: string
+          minLength: 1
+
+        status:
+          type: string
+          enum:
+            - DRAFT
+            - ACTIVE
+            - DISABLED
+
+    SkillSummary:
+      type: object
+      required:
+        - id
+        - skill_key
+        - name
+        - description
+        - tags
+        - status
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+
+        skill_key:
+          type: string
+
+        name:
+          type: string
+
+        description:
+          type: string
+
+        tags:
+          type: array
+          items:
+            type: string
+
+        status:
+          type: string
+          enum:
+            - DRAFT
+            - ACTIVE
+            - DISABLED
+
+        created_at:
+          type: string
+          format: date-time
+
+        updated_at:
+          type: string
+          format: date-time
+
+    SkillDetail:
+      allOf:
+        - $ref: '#/components/schemas/SkillSummary'
+        - type: object
+          required:
+            - examples
+            - instructions
+            - capabilities
+          properties:
+            examples:
+              type: array
+              items:
+                type: string
+
+            instructions:
+              type: string
+
+            capabilities:
+              type: array
+              items:
+                $ref: '#/components/schemas/CapabilityRef'
+
+    PagedSkillResponse:
+      type: object
+      required:
+        - items
+        - page
+        - page_size
+        - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SkillSummary'
+
+        page:
+          type: integer
+
+        page_size:
+          type: integer
+
+        total:
+          type: integer
+
+    SkillCapabilityUpdate:
+      type: object
+      additionalProperties: false
+      required:
+        - capability_ids
+      properties:
+        capability_ids:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            format: uuid
+
+    CapabilityRef:
+      type: object
+      description: |
+        A capability as seen from the Skill side. The definition of record
+        is the capability table (see capability.yaml); only the fields
+        needed to identify a binding are repeated here.
+      required:
+        - id
+        - code
+        - name
+      properties:
+        id:
+          type: string
+          format: uuid
+
+        code:
+          type: string
+
+        name:
+          type: string

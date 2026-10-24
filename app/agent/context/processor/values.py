@@ -44,6 +44,13 @@ class ContextSection:
 
     text: str
 
+    #: 这段内容是否为**不可信引用数据**（检索 / 记忆 / 摘要 / 画像）。
+    #:
+    #: 为 True 时 `system_message()` 会用 `<ref:...>` 包起来并附上
+    #: 引用数据规则（见 reference.py），而不是渲染成 `## 标题` 分节。
+    #: 快照仍然拿到原文与 source_ids —— 包装只发生在产物渲染这一层。
+    untrusted: bool = False
+
     #: 这段内容的来源标识（记忆 id / 文档 id / 摘要 revision）。
     source_ids: tuple[str, ...] = ()
 
@@ -55,6 +62,7 @@ class ContextSection:
         return {
             "name": self.name,
             "label": self.label,
+            "untrusted": self.untrusted,
             "chars": len(self.text),
             "token_estimate": self.token_estimate,
             "source_ids": list(self.source_ids),

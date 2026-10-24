@@ -11,11 +11,11 @@
 | 问题 | 一句话答案 |
 |---|---|
 | 工具怎么定义？ | 把方法挂在一个 service 类上，加 `@tool` 装饰器；装饰器同时生成 langchain 工具与注册表描述符 |
-| 工具从哪来？ | 两路扫描：`@tool` 自注册（import 时）+ `ServiceMethodScanner` 遍历 `TOOL_SOURCE_PACKAGES` 触发未 import 模块 |
+| 工具从哪来？ | 三路扫描：`@tool` 自注册（import 时）+ `ServiceMethodScanner` 遍历 `TOOL_SOURCE_PACKAGES` 触发未 import 模块 + `MCPToolScanner` 按 `mcp.yaml` 连外部 server 取 `tools/list` |
 | 模型看到的函数名是什么？ | `tool_key` 的点号会被换成下划线（`capability.list` → `capability_list`），因为 OpenAI 函数名不允许点号 |
 | 一次工具调用会经过什么？ | 处理器链：`select_specs` 鉴权 → 构造 `ToolInvocation` → 加载 `tool_processor` 表里的链 → 折叠洋葱 → `_base_call` 真正调 service 方法 |
 | 危险工具谁来管？ | `approval_interceptor`（HITL）：挂 `BEFORE`，调 langgraph `interrupt()` 挂起图，等 `POST /runs/{id}/resume`；批准账本落 PostgresStore，重启不重复问 |
-| 幂等靠什么？ | `tool_execution` 表唯一约束 `(session_id, run_id, tool_key, param_hash)` + 一条 `INSERT ... ON CONFLICT DO UPDATE WHERE status IN retryable` 原子抢占 |
+| 重复调用怎么管？ | 处理器链上的 `execution_guard_interceptor`（AROUND）：按 scope（SESSION / RUN / USER / GLOBAL）× execution（METHOD / INVOKE）计数，一次执行一行；success / error / unknown 三种状态各自独立配额，超限按各自的 action 拦截 |
 | 有工具级超时/重试吗？ | **没有**，且是刻意不设（重试在模型运行层与图节点层） |
 
 ---
@@ -83,8 +83,9 @@ flowchart TB
         BASE["_base_call<br/>factory.scope 造 service + 调方法"]
     end
 
-    EXE[("tool_execution 表<br/>UNIQUE(session,run,tool_key,param_hash)")]
+    EXE[("tool_execution 表<br/>一次执行一行")]
     PRC[("tool_processor 表<br/>挂在 tool_id 上的链")]
+    GUARD["execution_guard_interceptor<br/>AROUND：reserve / settle"]
 
     SVC --> MS
     CMP --> LS
@@ -93,7 +94,8 @@ flowchart TB
     DISC --> REG
     REG --> EXP --> SEL --> INV --> CHAIN --> BASE
     PRC --> CHAIN
-    INV --> EXE
+    PRC --> GUARD
+    GUARD --> EXE
     BASE --> OUT["ToolOutcome<br/>value / error / duration_ms / cached"]
 ```
 
@@ -142,6 +144,12 @@ async def current_time(timezone: str = DEFAULT_TIMEZONE) -> dict:
 
 组合工具（langchain 原生 `@tool`，跨 service）见 `app/agent/tools/catalog_tool.py:32` 的 `describe_platform`。
 
+外部 HTTP API 工具见 `app/agent/tools/web_tool.py` 的 `search` /
+`fetch`（tool_key `web.search` / `web.fetch`，DeepSeek Search &
+Fetch API）。配置模板是 `app/config/web.yaml.template`；未配置时从
+`llm.yaml` 的 deepseek provider 取 key 与站点根，最后回落
+`DEEPSEEK_API_KEY`。
+
 ### 3.3 四个身份的推导规则
 
 | 字段 | service 方法 | langchain 工具 | 规则出处 |
@@ -165,7 +173,13 @@ app.services.<模块>      → <模块>            （取第三段）
 
 ### 3.4 `SourceType` 枚举
 
-`enum.py:41` 定义了 `LOCAL_METHOD` / `MCP` / `OPENAPI`，但**只有 `LOCAL_METHOD` 有扫描器**。`MCP` / `OPENAPI` 仅占枚举值，属预留。
+`enum.py:41` 定义了 `LOCAL_METHOD` / `MCP` / `OPENAPI`。
+
+| 取值 | 扫描器 | 状态 |
+|---|---|---|
+| `LOCAL_METHOD` | `ServiceMethodScanner` / `LangchainToolScanner` | 已实现 |
+| `MCP` | `MCPToolScanner`（`registry/mcp_scanner.py`） | 已实现，按 `mcp.yaml` |
+| `OPENAPI` | 无 | 仍属预留 |
 
 ---
 
@@ -185,16 +199,51 @@ app.agent.tools
 
 ### 4.2 时机与装配
 
-- **按需，非启动期预热**。`ToolDiscoverer.default()` 装配两个扫描器（`discoverer.py:43`），`discover()` **每次重扫、无状态**（`discoverer.py:36`）。
+- **按需，非启动期预热**。`ToolDiscoverer.default()` 装配三个扫描器（`discoverer.py`），`discover()` **每次重扫、无状态**。
 - `@tool` 方法在 import 时已自注册；`ServiceMethodScanner.scan()` 额外遍历包，触发**尚未 import 的模块**完成登记（`scanner.py:87`、`registry.py:143`）——这是 `TOOL_SOURCE_PACKAGES` 存在的理由：否则一个没被任何人 import 的模块里的工具永远不会出现。
+- `MCPToolScanner` 不走包遍历，只按 `app/config/mcp.yaml` 连 provider 并取 `tools/list`；失败只跳过该 provider（见 §4.4）。
 
-### 4.3 失败处理
+### 4.3 MCP（外部工具来源）
+
+**设计立场**：本地的工具是代码里的编译期对象，所以需要扫描；MCP 的工具是外部 server 的运行时事实，我们不声明实现，只配置连接。
+
+| 层 | 负责什么 | 位置 |
+|---|---|---|
+| 配置 | provider 连接（command / args / env / 超时）与工具过滤（allowlist） | `app/common/mcp_config.py`、`app/config/mcp.yaml(.template)` |
+| 协议 | 工具清单、参数 schema、描述（**从 `tools/list` 取，不在仓库里声明**） | `app/infra/agent/mcp_client.py` |
+| 发现 | `MCPToolScanner` → `ToolManifestData(source_type=mcp, source_ref=<provider>, entrypoint=mcp:<provider>:<tool>)` | `app/services/tool/registry/mcp_scanner.py` |
+| 执行 | 常驻 `ClientSession` + langchain `StructuredTool`，注册进 `ToolRegistry` | `app/infra/agent/mcp_client.py`、`app/bootstrap/mcp.py` |
+| 快照 | `POST /tools/discovery/sync` 写 `tool_definition` | 既有同步逻辑，不改 |
+| 查询 | `GET /mcp/providers` + `GET /tools?source_ref=<provider>` | §15 |
+
+关键约束：
+
+- **工具名**：`tool_key = <provider>.<tool>`，`source_ref = <provider>`，`wire_name` 照旧把点号换成下划线。provider 名因此是工具命名空间，不要用带点号的名字。
+- **默认 allowlist**：`MCPToolFilter` 的默认 mode 是 `allowlist`，空 allow 表示一个都不放行。server 升级多出来的工具（例如 `execute_trade`）**不会**自动可执行。`deny` 在任何 mode 下都先判。
+- **两条连接路径**：执行用启动期建立的常驻会话（单 provider 串行锁）；扫描用独立线程里的一次性会话 —— `ToolScanner.scan()` 是同步协议，在 FastAPI 的请求循环里直接 `asyncio.run` 会报 loop already running。
+- **启动失败不阻断应用**：provider 连不上只记 ERROR（`app/bootstrap/mcp.py`），本地工具照常可用。没配 `mcp.yaml` 时整体关闭。
+- **外部描述是不可信输入**：description 会进模型上下文；需要改写时用既有的 `tool_documentation` 覆盖层，不要改 server。
+- **依赖版本**：`mcp` 必须留在 1.x（tdx-link-mcp 0.22.0 仍用 `Server.list_tools()`，2.x 上启动即崩），见 `requirements.txt` 的 MCP 段。
+
+**接入一个新 provider 的完整顺序**：
+
+1. 安装 server（例如 `.venv/Scripts/pip install tdx-link-mcp`）。
+2. `cp app/config/mcp.yaml.template app/config/mcp.yaml`，填 `command`、`tools.allow`。
+3. 重启进程 —— 连接在启动期建立（`app/bootstrap/mcp.py`）。
+4. `POST /tools/discovery/sync`（可带 `{"source_types":["mcp"]}` 只同步 MCP；对账会自动收窄，不会误伤本地工具）。
+5. `PUT /tools/{tool_id}/classifications` 把工具挂进能力树 —— **这一步决定模型看不看得到**。
+6. `GET /mcp/providers` 核对 `connected` / `exposed_tool_count` / `active_tool_count`。
+7. 有副作用的工具再挂处理器链（`approval` / `execution_guard` / `timeout`）。
+
+### 4.4 失败处理
 
 | 情形 | 行为 | 位置 |
 |---|---|---|
 | 包不存在 | `logger.warning` 跳过 | `registry.py:263` |
 | 包内某模块 import 崩 | **异常上抛，不吞** | `registry.py:255` |
 | 未安装 langchain | 跳过 langchain 扫描 | `scanner.py:_import_base_tool` |
+| 未安装 mcp SDK / 未配置 `mcp.yaml` | 跳过 MCP 扫描（后者整体关闭） | `infra/agent/mcp_client.py`、`common/mcp_config.py` |
+| 某个 MCP provider 连不上 | warning + 跳过该 provider，其它继续 | `mcp_scanner.py` |
 | 两个来源抢同一 `tool_key` | 直接 `ValueError` | `discoverer.py:115`、`scanner.py:185` |
 
 ---
@@ -278,7 +327,7 @@ app.agent.tools
 | `tool_documentation` | `tool_id`(PK, FK CASCADE), `description_override`, `return_description_override`, `updated_by` | 与工具一对一 |
 | `tool_parameter_documentation` | `id`, `tool_id`(FK), `parameter_path`(JSON Pointer), `description_override` | `UNIQUE(tool_id, parameter_path)` |
 | `tool_definition_classification` | `tool_id`(PK, FK CASCADE), `classification_id`(PK, FK→`capability.id` CASCADE) | 双列主键；**该表不在 `models.sql`**，是手写补的（`tool_classification.py:22`） |
-| `tool_execution` | `id`, `session_id`, `run_id`, `tool_key`, `param_hash`, `status`, `result`, `error` | `UNIQUE(session_id, run_id, tool_key, param_hash)`；`CHECK status IN (...)`；部分索引覆盖 unsettled；**`run_id` 刻意无 FK** |
+| `tool_execution` | `id`, `session_id`, `run_id`, `user_id`, `tool_key`, `scope_type`/`scope_key`, `execution_type`/`param_hash`, `match_key`, `status`, `counted`, `tool_call_id`, `result`, `error` | 一次执行一行（append-only）；`UNIQUE(run_id, tool_call_id)` 部分索引做 replay/resume 去重；`(match_key, created_at) WHERE counted` 做守卫计数；**`run_id` 刻意无 FK**。⚠️ 沿用旧表名，旧唯一约束由手工迁移脚本删除 |
 | `tool_processor` | `id`, `tool_id`(FK CASCADE), `processor_key`, `sequence`, `execution_mode`, `hook`, `config`(JSONB), `enabled` | `UNIQUE(tool_id, sequence)`；`CHECK(sequence >= 1)`、`CHECK(AROUND ⇒ SYNC)` |
 
 两张 SQL 脚本 vs ORM 的差异：`tool_processor.sql` 带 `updated_at` 触发器，但 ORM **故意不镜像**（统一用 `onupdate`，`tool_processor.py:57`）——改这两处的人要知道它们本来就不打算一致。
@@ -411,7 +460,7 @@ app.agent.tools
 
 ---
 
-## 11. 另外三个内置处理器
+## 11. 另外六个内置处理器
 
 ### 11.1 `auth`（`interceptor/auth.py`）
 
@@ -424,12 +473,24 @@ app.agent.tools
 
 | 项 | 值 |
 |---|---|
-| 挂载 | `BEFORE + AFTER`，或 `AROUND`（`chain_smoke` 专门验证"同一个键占多个 hook 位置"） |
-| `ttl_seconds` | 默认 `300`；**`0` = 不缓存** |
-| `key_fields` | 默认**全部参数**；需要隔离时显式列出 |
-| 缓存键 | `sha256(canonical_json(tool_key + 选定参数))`（`cache.py:226-262`） |
-| 只缓存 | **成功**结果（失败/已缓存不回填） |
-| 后端 | `InProcessToolCache`（`runtime/cache.py`，LRU + `monotonic` TTL，**进程内、重启清零**） |
+| 挂载 | **`AROUND` + `SYNC`**：执行前查、成功后回填；一条记录，不再拆 `BEFORE + AFTER` |
+| `ttl_seconds` | **Redis TTL**，默认 `300`；**`0` = 不缓存** |
+| 判重 | 固定为「**方法名 + 全部参数的 sha256**」，由处理器自己算，**不开放配置** |
+| 缓存键 | `tool_key:param_hash`；Redis 里再加固定前缀 `tool_cache:` |
+| 只缓存 | **成功**结果（失败 / 已缓存不回填） |
+| 后端 | 生产 `RedisToolCache`（跨实例共享，`SET ... EX`）；拿不到 Redis 数据源时退回 `InProcessToolCache`（LRU + `monotonic` TTL，进程内、重启清零） |
+| 失败处理 | **fail-open**：Redis 读写 / 序列化 / 配置错误只打 warning，按未命中 / 未写入处理，不影响工具调用 |
+
+> ⚠️ 缓存键**不含** session / run / user：调用者身份在
+> `invocation.context`，不在 `arguments` 里。结果依赖
+> `current_tool_caller()` 的工具**不能挂缓存** —— 参数相同会命中
+> 同一条缓存，A 用户可能拿到 B 用户的结果。这类工具要么别挂缓存，
+> 要么让业务参数里带一个能区分租户 / 用户的字段。
+
+⚠️ 旧版 `BEFORE + AFTER` 的缓存挂载需要**手工执行**
+`app/services/tool/cache_processor_migration.sql`：它把每个 Tool 的
+旧缓存两行重写成一对最外层的 `AROUND`（sequence 1、2），其余行后移
+两位；配置只保留 `ttl_seconds`，旧的 `key_fields` 会被丢弃。
 
 ### 11.3 `privacy`（`transformer/privacy.py`）
 
@@ -437,6 +498,114 @@ app.agent.tools
 - `PrivacyTarget`：`PHONE` / `EMAIL` / `ID_CARD` / `BANK_CARD`。**长模式先跑**，防短模式先匹配造成二次误抹。
 - **默认不含银行卡** —— 因为卡号正则容易误伤金额与订单号。
 - **是正则，不是 NER**：属最佳努力，不保证召回。`keep_length`（是否保长度）、`max_depth`（递归深度）可配。
+
+### 11.4 `execution_guard`（`interceptor/execution_guard.py`）
+
+执行守卫替代了旧版在 `graph/react/tools.py` 里手写的 `tool_execution`
+账本。挂 **`AROUND` + `SYNC`**，在工具执行前预占一次额度、执行后落终态。
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `scope` | `SESSION` | `SESSION` / `RUN` / `USER` / `GLOBAL`；`USER` / `GLOBAL` 可以不设窗口（即永久） |
+| `execution` | `METHOD` | `METHOD`（只看工具）/ `INVOKE`（工具 + 相同参数） |
+| `window_seconds` | `None` | 计数窗口；`None` = 整个 scope 生命周期。⚠️ 对 `USER` / `GLOBAL` 就是永久 |
+| `success_limit` / `success_action` | `3` / `BLOCK` | SUCCESS 的独立配额。`limit=1` = 成功一次后禁止再次提交 |
+| `error_limit` / `error_action` | `3` / `BLOCK` | FAILED 的独立配额。`limit=3` = 允许 3 次失败，第 4 次开始拦 |
+| `unknown_limit` / `unknown_action` | `1` / `BLOCK` | UNKNOWN 的独立配额。默认 fail-closed |
+
+三种状态**独立计数、独立配额、独立动作**，不是三选一。判定顺序是
+`success -> unknown -> error`：某个状态达到上限且动作是 `BLOCK` 就停；
+`ALLOW` 只是“这一条不拦”，继续看下一个。
+
+⚠️ 配置字段必须保持**扁平**：管理面前端直接按
+`config_schema.properties` 生成控件，嵌套 pydantic 模型会输出
+`$defs` + `$ref`，当前前端解析不了（表现为控件置空）。因此用
+`success_limit` / `success_action`，不要改成 `success: {limit, action}`。
+
+⚠️ 已经挂载过旧配置的库需要**手工执行**
+`app/services/tool/execution_guard_config_migration.sql`：它把
+`limit / on_exceeded / on_unknown / on_error` 映射成新的
+`success_* / error_* / unknown_*` 扁平键，所有 action 设为 `BLOCK`。
+代码里的默认值已经是 BLOCK，但 `tool_processor.config` 是挂载时
+落库的，旧行不会自动跟随代码默认值。
+
+计数口径：`SUCCESS` / `FAILED` / `UNKNOWN` 占额度；`REJECTED` /
+`INTERRUPT` / `CANCELLED` / `BLOCKED` / 缓存命中不占。同一次
+`(run_id, tool_call_id)` 在重放 / resume 时复用同一行；已成功的直接
+回放结果，不再执行。
+
+⚠️ `success` 的计数包含 `PENDING` / `RUNNING`：在途尝试先占一个成功
+名额，否则 `success_limit=1` 时两个并发分支会同时看到“还没有成功”
+而都执行。落终态后名额随状态转移到 SUCCESS / FAILED / UNKNOWN。
+
+**submit 工具（退款 / 下单）的推荐配置**：
+
+```json
+{
+  "scope": "USER",
+  "execution": "INVOKE",
+  "window_seconds": null,
+  "success_limit": 1,
+  "success_action": "BLOCK",
+  "error_limit": 3,
+  "error_action": "BLOCK",
+  "unknown_limit": 1,
+  "unknown_action": "BLOCK"
+}
+```
+
+含义：同一个用户、同一组参数**成功过一次就永久禁止再次提交**；
+失败最多允许 3 次（第 4 次拦）；unknown 一次就 fail-closed。
+想无限重试失败，把 `error_limit` 设为 `null`。
+
+⚠️ **上线前提**：守卫是处理器链上的一条记录。没有挂它的工具**不会**
+产生执行记录，也不会被计数拦截。需要保护的工具要挂两条 `AROUND`
+记录（先进 + 后出，`SYNC`），建议放在链的最外层。
+
+### 11.5 `timeout`（`interceptor/timeout.py`）
+
+| 项 | 值 |
+|---|---|
+| 挂载 | **`AROUND` + `SYNC`** |
+| `timeout_seconds` | 单次调用最多等待的秒数，默认 `30`，必须 `> 0` |
+| 超时结果 | `ToolOutcome(error=ToolTimeout(...))` |
+| 能取消什么 | `await` 中的协程（HTTP / DB / `asyncio.sleep`）；阻塞 I/O 与 CPU 密集代码取消不了 |
+| 副作用 | 超时**不代表**没有副作用；执行守卫按 `tool.started` 把它归成 `UNKNOWN`（已开始）或 `FAILED, counted=false`（未开始） |
+
+与 retry 的顺序：`retry` 外层、`timeout` 内层 = 每次尝试独立超时；
+反过来 = 整个重试组共享总预算。
+
+### 11.6 `retry`（`interceptor/retry.py`）
+
+| 项 | 值 |
+|---|---|
+| 挂载 | **`AROUND` + `SYNC`** |
+| `max_attempts` | 总尝试次数（含第一次），默认 `3`；`1` = 不重试 |
+| `retry_on_error` | 布尔开关。`false`（默认）= 只重试超时（`ToolTimeout` / `TimeoutError`）；`true` = 重试所有 `outcome.error` |
+| `backoff_seconds` / `backoff_multiplier` / `max_backoff_seconds` | 默认 `0.5` / `2.0` / `30` |
+| 永不重试 | `ToolCallDenied` / `GraphInterrupt` / `CancelledError` |
+
+⚠️ 旧配置的 `retry_on` 多选白名单已经移除。已有配置需要手工执行
+`app/services/tool/retry_processor_migration.sql`：旧的超时白名单映射为
+`retry_on_error=false`，包含其它异常名的映射为 `true`，并删除 `retry_on`。
+
+⚠️ 每次尝试都会重新走一遍内层链。数据库事务会回滚，但**外部副作用
+不会** —— 退款、下单这类工具默认不要挂 retry；只读 / 幂等工具才适合。
+
+推荐嵌套：
+
+```text
+retry -> guard -> timeout -> cache -> ... -> 工具本体
+```
+
+`retry` 在外层，每次尝试都走一次守卫（失败 / 成功分别计数）；
+`timeout` 在守卫内层，守卫能拿到 `ToolTimeout` 并归成 `UNKNOWN`。
+
+⚠️ **超时后重试与 unknown_limit 的冲突**：如果超时发生在工具开始之后，
+守卫把它记成 `UNKNOWN`；默认 `unknown_limit=1` 会让**第二次尝试**
+直接被执行守卫拦住。要给「超时后重试」的工具把 `unknown_limit` 调到
+`>= max_attempts`（或 `null`），或者把 `guard` 放到 `retry` 外层
+（一次逻辑调用只占一次额度，重试对守卫不可见）。
 
 ---
 
@@ -481,19 +650,27 @@ sequenceDiagram
     participant E as ToolExecutor
     participant S as selection
     participant C as chain
+    participant G as execution_guard
     participant F as ServiceFactory
     participant DB as tool_execution
 
     N->>E: execute(tool_key, arguments, tool_id, tool_call_id, caller_identity, runtime)
     E->>S: select_specs([tool_key])  ← 校验可执行
-    E->>E: 构造 ToolInvocation（私有 arguments 副本 + caller 快照）
-    E->>DB: claim(...)  ← 原子抢占，None = 放弃
+    E->>E: 构造 ToolInvocation（私有 arguments 副本 + caller / session / run）
     E->>C: _load_chain(tool_id) → build_chain → CompiledChain
     Note over E: ASYNC BEFORE 观察者 create_task（旁路，不 await）
     E->>C: compile_chain 折叠洋葱
-    C->>C: 各 BEFORE → 最里层
-    C->>F: factory.scope → 造 service → 调方法
-    F-->>C: 返回值 / 异常
+    C->>G: around → reserve（advisory lock + 计数 + 插 PENDING）
+    G->>DB: INSERT ... counted=True
+    alt 允许执行
+        C->>C: 其它 BEFORE / AROUND
+        C->>F: factory.scope → 造 service → 调方法
+        F-->>C: 返回值 / 异常
+        C->>G: 回到守卫，settle(SUCCESS / FAILED / ...)
+        G->>DB: UPDATE ... counted
+    else 拦截 / 回放
+        G-->>C: ToolOutcome(ToolCallDenied) 或 回放结果
+    end
     C->>C: 各 AFTER（由内向外）
     Note over E: ASYNC AFTER 观察者 create_task
     E-->>N: ToolOutcome → 转 ToolMessage 回灌模型
@@ -501,13 +678,14 @@ sequenceDiagram
 
 逐步：
 
-1. react 图的 tools 节点（`graph/react/tools.py:1046`）→ `get_tool_executor().execute(...)`（`tool_executor.py:143`）。
-2. `select_specs([tool_key])` 校验可执行（`:185`）。
-3. 构造 `ToolInvocation`（私有 arguments 副本、塞 caller 快照，`:212-219`）。
-4. `_load_chain(tool_id)` → `build_chain`（跳过已删实现、未 `enabled` 的行，`:160-217`）→ `CompiledChain`（`sync_entries` + `async_before/after`）。
-5. ASYNC BEFORE 观察者先 `create_task` 起掉（`:231-241`）；`compile_chain` 折叠；最里层 `_base_call` 造 service + 调方法（经 `factory.scope`，`:300-389`）。
-6. 同步链执行完，ASYNC AFTER 观察者起掉。
-7. 结果 `ToolOutcome` 回灌模型（tools 节点转成 `ToolMessage`）。
+1. react 图的 tools 节点（`graph/react/tools.py`）→ `get_tool_executor().execute(...)`（`tool_executor.py`）。
+2. `select_specs([tool_key])` 校验可执行。
+3. 构造 `ToolInvocation`（私有 arguments 副本、caller 快照、session / run 身份）。
+4. `_load_chain(tool_id)` → `build_chain`（跳过已删实现、未 `enabled` 的行）→ `CompiledChain`。
+5. `compile_chain` 折叠洋葱。若链上挂了 `execution_guard_interceptor`，守卫先 `reserve`（事务级 advisory lock + 计数 + 插一行 PENDING），被拦下就直接短路。
+6. 其余 BEFORE / AROUND 执行；最里层 `_base_call` 造 service + 调方法（经 `factory.scope`）。
+7. 守卫回到调用点，按结果 `settle`：成功 / 失败 / 拒绝 / 中断 / 取消各自落到对应状态，并修正 `counted`。
+8. 同步链执行完，ASYNC AFTER 观察者起掉；结果 `ToolOutcome` 回灌模型。
 
 ### 13.1 工具如何"暴露"给模型
 
@@ -518,22 +696,29 @@ sequenceDiagram
 
 ---
 
-## 14. 错误分类与幂等
+## 14. 错误分类与执行守卫
 
 ### 14.1 执行状态机
 
-`ToolExecutionStatus`（`enum.py:144-207`）：
+`ToolExecutionStatus`（`enum.py`）：
 
 ```
-PENDING / RUNNING / SUCCESS / FAILED / UNKNOWN / CANCELLED / REJECTED / INTERRUPT
+PENDING / RUNNING / SUCCESS / FAILED / UNKNOWN / BLOCKED / CANCELLED / REJECTED / INTERRUPT
 ```
 
-`RETRYABLE_EXECUTION_STATUSES = {FAILED, CANCELLED, REJECTED, INTERRUPT}`（`:224`，**fail-closed**：不在集合里的一律不重试）。
+`RETRYABLE_EXECUTION_STATUSES = {FAILED, BLOCKED, CANCELLED, REJECTED, INTERRUPT}`（**fail-closed**：不在集合里的一律不重试）。⚠️ 新守卫**不用**这个集合做判定，它用每行上的 `counted` 加上 success / error / unknown 三种独立配额；集合保留给旧调用方与测试。
 
-| 观察 | 含义 |
-|---|---|
-| `FAILED` / `UNKNOWN` **当前无写入方** | 未分类异常一律落 `RUNNING` —— 无法确定副作用，**防误重试** |
-| `INTERRUPT` | 仅支持**执行前**中断（`enum.py:180`） |
+| 状态 | 谁写 | 含义 |
+|---|---|---|
+| `PENDING` | 守卫预占 | 已占额度、工具还没跑 |
+| `SUCCESS` | 守卫 | 执行成功，结果已落库 |
+| `FAILED` | 守卫 | 工具明确报错；**不承诺**没有副作用 |
+| `UNKNOWN` | 守卫 | 执行开始后被取消、审批后中断、崩溃遗留 |
+| `BLOCKED` | 守卫 | 被策略拦下，工具未执行 |
+| `REJECTED` | 守卫 | 被 auth / 审批 / 参数拒绝，工具未执行 |
+| `INTERRUPT` | 守卫 | HITL 中断，**工具未开始** |
+| `CANCELLED` | 守卫 | 执行前取消，确认无副作用 |
+| `RUNNING` | （暂无写入方） | 保留的「执行中」语义 |
 
 ### 14.2 异常 → `ToolOutcome`
 
@@ -543,17 +728,28 @@ PENDING / RUNNING / SUCCESS / FAILED / UNKNOWN / CANCELLED / REJECTED / INTERRUP
 
 **本子系统没有工具级超时**。executor 未用 `wait_for`；`ApprovalConfig.wait_seconds` 只用于显示。超时在**模型运行层**（`ModelRuntimePolicy.timeout`）与**图节点层**处理。
 
-### 14.4 幂等
+### 14.4 执行守卫（替代旧的幂等 claim）
 
-唯一约束 `uq_tool_execution_identity = (session_id, run_id, tool_key, param_hash)`。
-
-`claim()`（`tool_execution_impl.py:45-102`）用**一条语句**完成「查 + 占」：
+`execution_guard_interceptor` 在 `ToolExecutionService.reserve` 里完成一次
+「加锁 + 读取 + 判定 + 预占」：
 
 ```sql
-INSERT ... ON CONFLICT DO UPDATE ... WHERE status IN (retryable)
+-- 事务级 advisory lock，按 match_key 串行化
+SELECT pg_advisory_xact_lock(hashtextextended(:match_key, 0));
+-- 窗口内 counted 的记录按状态分组
+SELECT status, count(*) FROM tool_execution
+ WHERE match_key = :match_key AND counted
+   AND created_at >= :window_start
+ GROUP BY status;
+-- 允许 -> INSERT ... status=PENDING, counted=true
+-- 拦截 -> INSERT ... status=BLOCKED, counted=false（审计）
 ```
 
-返回 `None` = 放弃执行。这条设计专门挡 **`Send` 扇出并发重复调用** —— 两个分支同时要调同一个工具时，只有一个能抢占成功。
+- **并发**：`Send` 扇出的两个分支会按 `match_key` 排队；后一个看到前一个的 `PENDING`，它占一个 success 名额，所以 `success_limit=1` 时不会两个都执行。
+- **去重**：`(run_id, tool_call_id)` 部分唯一索引挡住 LangGraph 重放 / HITL resume 的重复执行；已成功的直接回放结果。
+- **幂等的近似**：`execution=INVOKE` + `scope=RUN` + `success_limit=1` 等价于「同一次运行内同参只成功执行一次」。
+- **submit 工具**：`scope=USER`（或 `GLOBAL`）+ `execution=INVOKE` + `window_seconds=null` + `success_limit=1, success_action=BLOCK` + `error_limit` 按需要设 = 「同一用户同参成功一次后永久禁止再次提交；失败按配额重试」。
+- **表结构**：沿用 `tool_execution`；已有库需要**手工执行** `app/services/tool/tool_execution_migration.sql`（删旧唯一约束、加新列、旧行 `counted=false`）。`create_all` 不会改已存在的表。
 
 ---
 
@@ -566,12 +762,20 @@ INSERT ... ON CONFLICT DO UPDATE ... WHERE status IN (retryable)
 | 方法 | 路径 | 职责 |
 |---|---|---|
 | POST | `/tools/discovery/sync` | 扫描并把发现结果同步进 `tool_definition` |
-| GET | `/tools` | 列出工具（分页） |
+| GET | `/tools` | 列出工具（分页；`source_type` / `source_ref` 可过滤） |
 | GET | `/tools/{tool_id}` | 工具详情（含 manifest） |
 | GET | `/tools/{tool_id}/documentation` | 取文档（生效值） |
 | PUT | `/tools/{tool_id}/documentation` | 覆盖文档 |
 | GET | `/tools/{tool_id}/classifications` | 取能力关联 |
 | PUT | `/tools/{tool_id}/classifications` | 整体替换能力关联 |
+
+### 15.1.1 `mcp_providers.py`（`mcp_provider.yaml`）
+
+| 方法 | 路径 | 职责 |
+|---|---|---|
+| GET | `/mcp/providers` | 列出配置里的 provider：配置状态、运行连接状态、已同步工具计数 |
+
+只读。增删改 provider 要改 `mcp.yaml` 并重启（连接在启动期建立），所以刻意不做写接口。前端拿 `name` 作为 `GET /tools?source_ref=<name>` 的过滤值；`source_type=mcp` 可再收窄一层。
 
 ### 15.2 `tool_processors.py` + `processors.py`（`tool_processor.yaml`）
 
@@ -610,10 +814,11 @@ INSERT ... ON CONFLICT DO UPDATE ... WHERE status IN (retryable)
 
 | 项 | 说明 |
 |---|---|
-| `SourceType.MCP` / `OPENAPI` | 枚举存在，**无扫描器**（`enum.py:41`） |
-| `ToolExecutionStatus.FAILED` / `UNKNOWN` | 无写入方，保留语义（`enum.py:164-178`） |
-| 无重试 / 超时拦截器 | **刻意不设**（`interceptor/__init__.py:15`）：图节点级已有重试与超时，重复一层只会放大重试次数 |
-| 无 reaper | 没有清理 `PENDING` / `RUNNING` 遗留行的任务（`tool_execution.py` 注释） |
+| `SourceType.OPENAPI` | 枚举存在，**无扫描器**（`enum.py:41`）；`MCP` 已实现（§4.3） |
+| `ToolExecutionStatus.RUNNING` | 暂无写入方，保留「执行中」语义 |
+| 重试 / 超时拦截器 | **存在但不默认挂**：图节点级已有重试与超时，工具级只给确实需要的工具显式挂（`timeout_interceptor` / `retry_interceptor`） |
+| 无 reaper | 没有把崩溃遗留的 `PENDING` / `RUNNING` 归为 `UNKNOWN` 的任务；守卫把它们当作「执行中」fail-closed |
+| 未挂守卫的工具没有执行记录 | 守卫是处理器链上的 AROUND；链不存在时它不会跑。上线前需要给需要保护的工具挂两条 AROUND 记录 |
 
 ### 16.2 契约与实现的不一致
 
@@ -625,17 +830,18 @@ INSERT ... ON CONFLICT DO UPDATE ... WHERE status IN (retryable)
 
 ### 16.3 未确认
 
-- `tool_execution` 的**服务实现完整度**未逐行核对（接口基类里的 `NotImplementedError` 属正常 ABC 模式，非功能缺失）。
-- `graph/react/tools.py:1046-1222` 里「异常 → `ToolExecutionStatus`」的具体映射（`decide`）与审批 `interrupt` 在节点内的完整装配，未在本次阅读范围内。
+- 守卫的**清理 / 保留策略**未实现：`tool_execution` 是 append-only，`window_seconds` 只影响查询，不删除旧行；长期运行需要单独的清理任务。
+- 工具级「是否有副作用」的声明还没有。守卫只能按 error / unknown 的独立配额决定重试语义；把 `FAILED` 当「已确认无副作用」是不安全的默认假设。
 
-### 16.4 实测发现的过期断言（**2 条**）
+### 16.4 实测发现的过期断言（**1 条**）
 
 | 脚本 | 失败断言 | 根因 | 是否链路缺陷 |
 |---|---|---|---|
-| `app.agent.tool_smoke` | `组合工具走的是 TOOL_SOURCE_REF 模块级变量` | 断言写 `all(m.source_ref == "agent.platform")`，但组合工具现在有 **2 个**：`agent.current_time`（`source_ref="agent"`，因 `time_tool.py` 刻意不写 `TOOL_SOURCE_REF`）+ `agent.platform.describe_platform`（`source_ref="agent.platform"`） | **否**，断言过窄 |
 | `app.agent.prompt_smoke` | `两个 model_role 都登记了` | 断言 `keys == {CLASSIFICATION, SUMMARIZATION}`，但 `found_prompts()` 现返回 **7 个**键（另加 5 个 `memory.*` 提示词） | **否**，目录正常增长 |
 
-修法（留给维护者）：`tool_smoke` 改成断言"组合工具的 `source_ref` 由**模块路径推导**，只有显式声明 `TOOL_SOURCE_REF` 的才是自定义分组"；`prompt_smoke` 改成断言"含 `CLASSIFICATION` / `SUMMARIZATION` 且 `REASONING` 不在其中"，而不是精确集合相等。**不要**为了测试绿去给 `time_tool.py` 加 `TOOL_SOURCE_REF` —— 那会破坏刻意设计的分组。
+`app.agent.tool_smoke` 那条 `source_ref == "agent.platform"` 的过期断言已修：现在断言"模块路径推导，只有显式声明 `TOOL_SOURCE_REF` 的才是自定义分组"。
+
+修法（留给维护者）：`prompt_smoke` 改成断言"含 `CLASSIFICATION` / `SUMMARIZATION` 且 `REASONING` 不在其中"，而不是精确集合相等。
 
 ---
 
@@ -645,7 +851,7 @@ INSERT ... ON CONFLICT DO UPDATE ... WHERE status IN (retryable)
 
 | 脚本 | 结果 | 覆盖 |
 |---|---|---|
-| `app.agent.tool_smoke` | 部分通过（1 条断言过期，见 §16.4） | 工具定义/发现/文档覆盖/能力树 CRUD/关联/成环拒绝/引用检查 |
+| `app.agent.tool_smoke` | ✅ 全部通过 | 工具定义/发现/文档覆盖/能力树 CRUD/关联/成环拒绝/引用检查 |
 | `app.agent.tool_processor_smoke` | ✅ 全部通过 | cache 短路成 `ToolOutcome` 并标 `cached`、底层只执行一次、`ttl=0` 不缓存、指标记次数与失败率、错误按类型分桶、BEFORE 临时键被清理、BEFORE 发 STARTED / AFTER 发 SUCCEEDED、事件默认不带参数且可 JSON 序列化、退出订阅上下文自动退订 |
 | `app.infra.agent.chain_smoke` | ✅ 全部通过 | 半条 AROUND 被 `enabled` 关掉、同一个键占多个 hook 位置、AROUND+ASYNC 被兜住、三条 AROUND 记录报错、实现已删的行跳过并留痕、空链时 base 直接被调用 |
 | `app.infra.agent.tool_execution_smoke` | ✅ 全部通过 | 真处理器（cache 第一次未命中/第二次命中）、ASYNC 观察者被起掉且返回值不被等待 |
@@ -661,7 +867,7 @@ INSERT ... ON CONFLICT DO UPDATE ... WHERE status IN (retryable)
 3. **`select_specs` 是唯一判据**。把"能看见"与"能执行"绑到同一函数，消灭"模型看到但执行时 403"这类不一致。
 4. **AROUND 占两条记录**。用同一个数据结构表达洋葱进出，避免引入第二种链式描述格式。代价是 `_AROUND_RECORDS = 2` 这个隐式约定必须靠 `validate_onion` 守住。
 5. **没有工具级重试/超时**。重试要在**知道副作用是否发生**的层级做。工具层不知道，模型运行层和图节点层知道。在工具层加会得到"重试了但有副作用"的最坏组合。
-6. **`FAILED`/`UNKNOWN` 留空**。宁可把它记成 `RUNNING`（不确定）也不给一个错误的终态——因为终态会驱动自动重试。
+6. **状态与重试策略分离**。旧模型用 `FAILED` / `UNKNOWN` 直接表达「能不能重跑」，于是「工具明确报错」与「不知道跑没跑」只能二选一。守卫把两者拆开：状态只描述发生了什么，error / unknown 各自的独立配额决定下一次是否放行。代价是配置方必须自己判断工具的副作用属性。
 7. **审批命名空间用 `run_id` 而不是 `thread_id`**。HITL 的授权粒度必须是"这一次运行"，不是"这个会话"。用 thread 会让一次"始终允许"永久污染整个会话。
 8. **`DENIED` 单列不进 failure**。被拦下不是故障，把它算进错误率会让"安全策略生效"看起来像"系统不稳定"。
 9. **参数文档是覆盖层，schema 是代码**。让运营能改文案，但改不了类型契约。
@@ -673,12 +879,17 @@ INSERT ... ON CONFLICT DO UPDATE ... WHERE status IN (retryable)
 | 关注点 | 先读 |
 |---|---|
 | 工具定义 | `app/services/tool/registry/decorator.py`、`app/agent/tools/time_tool.py`、`app/agent/tools/catalog_tool.py` |
-| 发现 | `app/services/tool/registry/{discoverer,scanner,registry}.py` |
+| 外部 API 工具 | `app/agent/tools/web_tool.py`（`web.search` / `web.fetch`，DeepSeek Search & Fetch API） |
+| 实验工具 | `app/agent/tools/test_tool.py`（`agent.sleep_for`，默认睡 30 秒，用来验证 timeout / retry） |
+| 发现 | `app/services/tool/registry/{discoverer,scanner,mcp_scanner,registry}.py` |
+| MCP | `app/common/mcp_config.py`、`app/infra/agent/mcp_client.py`、`app/bootstrap/mcp.py`、`app/config/mcp.yaml.template` |
 | Schema | `app/services/tool/registry/{schema,docstring}.py` |
 | 选择/命名 | `app/services/tool/registry/selection.py` |
 | 表结构 | `app/services/tool/models/sqlalchemy/`、`models.sql`、`tool_processor.sql` |
 | 能力树 | `app/services/capability/`、`app/api/v1/capabilities.py` |
 | 处理器契约 | `app/agent/tools/processor/{base,context}.py` |
+| 执行守卫 | `app/agent/tools/processor/interceptor/execution_guard.py`、`app/services/tool/application/{tool_execution_service_impl,_execution}.py` |
+| 执行记录表 | `app/services/tool/models/sqlalchemy/tool_execution.py` |
 | HITL | `app/agent/tools/processor/interceptor/approval.py` |
 | 链编译 | `app/infra/agent/chain.py` |
 | 执行入口 | `app/infra/agent/tool_executor.py` |

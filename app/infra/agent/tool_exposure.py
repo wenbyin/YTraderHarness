@@ -66,6 +66,10 @@ from typing import Any
 
 from app.agent.context.processor.sources import ToolExposureSource
 from app.services.tool.registry import select_specs, wire_name
+from app.services.tool.registry.schema import (
+    injected_args,
+    strip_injected_args,
+)
 
 __all__ = ["RegistryToolExposureSource", "for_wire"]
 
@@ -147,6 +151,34 @@ def for_wire(
 
     update: dict[str, Any] = {"name": wire_name(spec.tool_key)}
 
+    # ⚠️ 模型侧 schema 用 tool_call_schema，并显式剔除注入参数
+    # ----------------------------------------------------
+    # `args_schema` 是执行侧的完整模型，包含 ToolRuntime /
+    # InjectedState；直接拿它 bind 给模型，模型的参数说明里会出现一个
+    # 它填不了的对象。
+    #
+    # 模块级 langchain 工具的 `tool_call_schema` 已经由 LangChain 剔除
+    # 了注入参数；这里再走一遍 `strip_injected_args`，覆盖 service
+    # 方法那种由我们合成 schema 的情形。
+    func = (
+        getattr(descriptor, "func", None)
+        or getattr(descriptor, "coroutine", None)
+    )
+
+    schema_source = (
+        getattr(descriptor, "tool_call_schema", None)
+        or descriptor.args_schema
+    )
+
+    if func and injected_args(func):
+
+        schema_dict = _schema_dict(schema_source)
+
+        if schema_dict is not None:
+            schema_dict = strip_injected_args(schema_dict, func)
+            update["args_schema"] = schema_dict
+            schema_source = schema_dict
+
     if overrides:
 
         description = overrides.get("description")
@@ -159,7 +191,7 @@ def for_wire(
         if isinstance(parameters, Mapping) and parameters:
 
             patched = _apply_parameter_overrides(
-                descriptor.args_schema, parameters
+                schema_source, parameters
             )
 
             # None = 一个路径都没落上（参数被改名/删掉了，或路径写错）。
@@ -174,6 +206,21 @@ def for_wire(
 # ============================================================
 # 参数说明：JSON Pointer -> JSON Schema
 # ============================================================
+
+
+def _schema_dict(schema: Any) -> dict[str, Any] | None:
+    """pydantic 模型类 / dict -> JSON Schema dict；认不出返回 None。"""
+
+    if isinstance(schema, dict):
+        return schema
+
+    if isinstance(schema, type):
+        try:
+            return schema.model_json_schema()
+        except Exception:
+            return None
+
+    return None
 
 
 def _apply_parameter_overrides(

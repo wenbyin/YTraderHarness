@@ -5,7 +5,7 @@ Context Builder 的契约与实现。
 ----
     base.py         BaseContextBuilder + 六个 type 基类
     contracts.py    执行期数据形状（ModelRequest 复用 Model 模块的那一个）
-    agent_invoke.py 生产实现：把 11 个阶段委托给 Processor 流水线
+    agent_invoke.py 生产实现：把 13 个阶段委托给 Processor 流水线
                     （`app/agent/context/processor/`）
 
 发现方式：**反射遍历本包**

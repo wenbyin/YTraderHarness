@@ -23,11 +23,12 @@ thread_id 按会话稳定，同一 thread 同时只跑一次
 复用），多轮因此共用一个 checkpoint —— 这正是多轮历史能累积的前提。
 见 `_resolve_thread_id`。
 
-准入控制在**请求期**：同一会话已有运行在途时，`create_run` 直接抛
-`ConflictError`（-> 409），而不是让它排进调度器（那是"排队"，调用方
-拿到的是一个可能很久以后才跑的 run）。锁的释放点只有一个 —— dispatch
-handler 的 `finally`；另有两处兜底：请求事务回滚（补偿钩子）与调度被
-拒收（post-commit 钩子）。三者的完整理由见各自的注释。
+准入控制在**请求期**：同一会话已有运行在途、或会话已归档（archived，
+只读）时，`create_run` 直接抛 `ConflictError`（-> 409），而不是让它排进
+调度器（那是"排队"，调用方拿到的是一个可能很久以后才跑的 run）。会话
+行用 `get_for_update` 读取，与归档串行化。锁的释放点只有一个 ——
+dispatch handler 的 `finally`；另有两处兜底：请求事务回滚（补偿钩子）与
+调度被拒收（post-commit 钩子）。三者的完整理由见各自的注释。
 
 ⚠️ 锁是**进程内**的，因此部署必须 workers=1
 ------------------------------------------
@@ -54,9 +55,11 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
+from app.agent.event import publish_trace_event
 from app.agent.graph.react.catalog import AGENT_TYPE
 from app.agent.prompt import get_prompt_provider
 from app.common.environment import current_environment
+from app.common.event import EventType, SpanKind
 from app.common.exceptions import ConflictError, NotFoundError
 from app.common.service.base import RollbackHook, ServiceContext
 from app.infra.graph import (
@@ -79,6 +82,7 @@ from ..domain.schemas import (
     ResumeRequest,
     Run,
     RunStatus,
+    SessionStatus,
 )
 from ..repository.agent_run import AgentRunRepository
 from ..repository.agent_session import AgentSessionRepository
@@ -185,7 +189,15 @@ class AgentRunServiceImpl(AgentRunService):
         # ⚠️ 顺序有讲究：**便宜且无副作用**的校验排在最前，取锁排在它们
         # 之后。反过来的话，一次 404 / 400 也会先占上锁再立刻还回去 ——
         # 平白多出一条能失败的路径，而且失败方式很难看（占了锁又抛）。
-        session = await self._sessions.get(session_id, user_id=user_id)
+        # ⚠️ 锁定读，不是普通 get
+        # ----------------------
+        # 删除会话（归档）也锁这一行。只读的话会出现：
+        #     create_run 读到 active -> 归档提交 -> create_run 插入运行
+        # 结果给一个已归档的会话开了新运行。`FOR UPDATE` 让两边在会话行上
+        # 排队，后拿到锁的一方读到的是新状态。
+        session = await self._sessions.get_for_update(
+            session_id, user_id=user_id,
+        )
 
         # 会话必须存在，**且对调用方可见**（归属过滤在仓储里做）。
         # 运行是派生自会话的，没有会话的运行是孤儿。
@@ -194,6 +206,13 @@ class AgentRunServiceImpl(AgentRunService):
         # 别人的会话走**同一条** 404，不区分 —— 免得泄露某个 id 是否存在。
         if session is None:
             raise NotFoundError(f"会话不存在：{session_id}")
+
+        # 归档 = 只读。放在取 thread 锁之前：这是一次不产生任何副作用的
+        # 拒绝，不该先占锁再还。
+        if session.status == SessionStatus.ARCHIVED.value:
+            raise ConflictError(
+                "会话已归档，不能再开新运行。"
+            )
 
         # 空白输入在这里就拒掉（-> 400），不放进图：图对空上下文的反应是
         # 在 prompt 组装那一步抛 "组装之后的上下文是空的"，那会变成一次
@@ -221,6 +240,10 @@ class AgentRunServiceImpl(AgentRunService):
         # 那段里的每一步都是"要落库的东西"，不该混进一个只读动作。
         duty_key = await _resolve_duty_key()
 
+        # Trace 的开关：客户端传了才开。空白串归一成 None，避免生成一个
+        # 空 trace_id 的 Redis 键（它看起来与"没开"一模一样）。
+        trace_id = (request.trace_id or "").strip() or None
+
         # 没有 dispatcher 就不取锁：没人推进这次运行，也就没人放锁 ——
         # 取了就是把自己锁死。条件必须与 _schedule 的早退**完全一致**。
         if self._dispatcher is not None:
@@ -246,6 +269,8 @@ class AgentRunServiceImpl(AgentRunService):
                 # （builder 节点据此取提示词），写消息时填进
                 # agent_message.business_agent_id —— 三处因此指向同一个值。
                 duty_key=duty_key,
+                # Trace 的开关就是"客户端有没有传 trace_id"。
+                trace_id=trace_id,
                 created_at=now,
                 updated_at=now,
             )
@@ -268,7 +293,31 @@ class AgentRunServiceImpl(AgentRunService):
         # 一起提交 —— 不会出现"消息在、时间没动"的半边状态。
         await self._sessions.touch(session_id)
 
-        self._schedule(session_id, run_id, thread_id)
+        # run.accepted：服务已经确定 run_id 并落下了运行行。
+        #
+        # 放在 **post-commit** 而不是这里直接发：本方法跑在请求事务里，
+        # 事务回滚时"已接受"就是一个假事实。post-commit 保证事件与
+        # 运行行同时成立。
+        async def _accepted() -> None:
+            await publish_trace_event(
+                EventType.RUN_ACCEPTED,
+                trace_id=trace_id,
+                run_id=str(run_id),
+                thread_id=str(session_id),
+                span_id=str(run_id),
+                span_kind=SpanKind.RUN,
+                span_name="run",
+                payload={"agent_type": AGENT_TYPE},
+            )
+
+        self._post_commit.append(_accepted)
+
+        self._schedule(
+            session_id,
+            run_id,
+            thread_id,
+            trace_id=trace_id,
+        )
 
         return build_run(entity)
 
@@ -287,12 +336,21 @@ class AgentRunServiceImpl(AgentRunService):
 
         # 归属校验与 get_run 走同一条路：落在**会话表**上，别人的会话得到
         # 一模一样的 404 —— 不区分，免得泄露某个 id 是否存在。
-        session = await self._sessions.get(
+        #
+        # 锁定读：与归档串行化。真正的兜底还有 dispatch handler 的终态
+        # guard —— 归档可能已经把这个 run 硬取消，而本次 resume 的
+        # post-commit 投递晚于那次提交。
+        session = await self._sessions.get_for_update(
             entity.session_id, user_id=user_id,
         )
 
         if session is None:
             raise NotFoundError(f"运行不存在：{run_id}")
+
+        if session.status == SessionStatus.ARCHIVED.value:
+            raise ConflictError(
+                "会话已归档，不能再恢复其中的运行。"
+            )
 
         # 只有停在 waiting_input 的运行可以被恢复。其余状态走 409：请求
         # 本身没毛病（run 存在、也归你），是它与**当前状态**冲突 ——
@@ -601,6 +659,8 @@ class AgentRunServiceImpl(AgentRunService):
             session_id: UUID,
             run_id: UUID,
             thread_id: str,
+            *,
+            trace_id: str | None = None,
     ) -> None:
         """
         登记一次调度。**不执行** —— 本方法跑在请求事务里，见模块 docstring。
@@ -662,6 +722,20 @@ class AgentRunServiceImpl(AgentRunService):
                     thread_id,
                     handle.message,
                 )
+                return
+
+            # run.queued：dispatcher 已受理（进入进程内队列）。拒收时不发
+            # —— 那次运行从未进过队列，发了就是伪造。
+            await publish_trace_event(
+                EventType.RUN_QUEUED,
+                trace_id=trace_id,
+                run_id=str(run_id),
+                thread_id=str(session_id),
+                span_id=str(run_id),
+                span_kind=SpanKind.RUN,
+                span_name="run",
+                payload={"queue_name": "agent_run"},
+            )
 
         self._post_commit.append(_hook)
 

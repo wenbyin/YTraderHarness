@@ -106,6 +106,7 @@ from ..domain.tasks import MemoryPersonaExtractParams
 from ..repository.persona import MemoryPersonaRepository
 from ..repository.scene import MemorySceneRepository
 from .memory_persona_service import MemoryPersonaService
+from .profile_cache import profile_cache_invalidation_hook
 
 __all__ = [
     "AGENT_TYPE",
@@ -404,6 +405,12 @@ class MemoryPersonaServiceImpl(MemoryPersonaService):
             result=result,
             written=written,
             persona=persona,
+        )
+
+        # 画像可能刚被改写。**提交成功之后**失效 L3 缓存（L2 的键不
+        # 受影响）；提前删会让读者在事务提交前把旧值重新写回缓存。
+        self.post_commit.append(
+            profile_cache_invalidation_hook(scope, "l3")
         )
 
     # ========================================================

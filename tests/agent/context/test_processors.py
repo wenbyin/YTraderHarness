@@ -513,12 +513,12 @@ async def test_memory_is_injected(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "偏好简洁" in system
     assert "原话0" in system
     assert "记忆0" in system
-    assert "## 用户画像" in system
-    assert "## 相关原话" in system
-    assert "## 相关记忆" in system
+    assert '<ref:memory desc="用户画像' in system
+    assert '<ref:memory desc="相关原话' in system
+    assert '<ref:memory desc="相关记忆' in system
 
     # 空的那一层（场景）**不出段**，不是给一个空壳。
-    assert "## 记忆场景索引" not in system
+    assert "记忆场景索引" not in system
 
     # L0 的 role 渲染成 `user`，不是 `MessageRole.USER`（混入枚举的
     # `__format__` 给的是后者，那是既有缺陷，见 memory_retrieval.py）。
@@ -660,7 +660,7 @@ async def test_memory_replays_instead_of_recalling(
 
     assert service.requests == []
     assert "偏好简洁" in result.messages[0].content
-    assert "## 相关记忆" in result.messages[0].content
+    assert '<ref:memory desc="相关记忆' in result.messages[0].content
     assert result.injected_memory_ids == ("m1",)
 
 

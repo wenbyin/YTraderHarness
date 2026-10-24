@@ -211,6 +211,17 @@ class RedisConfig(BaseModel):
         ),
     )
 
+    sync_max_connections: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "事件发布端**同步写线程池**的上限（见 RedisDataSource 的"
+            "_sync_client）。\n\n"
+            "⚠️ 必须 ≥ event_stream.yaml 的 write_workers —— 每个写线程"
+            "各占一条连接；池满时 redis-py 立刻抛 MaxConnectionsError。"
+        ),
+    )
+
     stream_max_connections: int = Field(
         default=20,
         ge=1,
@@ -364,6 +375,17 @@ class CheckpointerConfig(BaseModel):
     pool_max_size: int = Field(
         default=5,
         ge=1,
+    )
+
+    parallel_cursor_operations: bool = Field(
+        default=True,
+        description=(
+            "是否关闭 saver 内部的全局串行锁（连接池模式应为 True）。\n\n"
+            "langgraph 的 AsyncPostgresSaver 用一个 asyncio.Lock 串行化"
+            "**所有** cursor 操作 —— 单连接时必须，连接池下只会把整个"
+            "进程的 checkpoint 读写排成一条队。详见 "
+            "app/infra/graph/checkpoint_concurrency.py。"
+        ),
     )
 
     store: StoreSettings = Field(

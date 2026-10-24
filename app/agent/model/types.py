@@ -958,6 +958,23 @@ class ModelRequest:
     #: 没有声明的模型这里置了也没用（静默不生效，不报错）。
     disable_thinking: bool = False
 
+    #: 这次调用**显式要求保留思考模式** —— 即使带 tools 也不关。
+    #:
+    #: 默认 False：沿用"带 tools -> 关思考"的形状判据。ReAct 主循环
+    #: （react）置 True，让模型在工具调用之间保留推理链。
+    #:
+    #: ⚠️ 优先级
+    #: ----------
+    #:     response_format 非空        仍然关 —— 结构化输出必须发强制
+    #:                                 tool_choice，思考模式会 400 / 截断
+    #:     definition.disable_thinking 仍然关 —— 模型级硬开关
+    #:     request.disable_thinking    仍然关 —— 调用方显式要求关
+    #:     enable_thinking            覆盖"带 tools"这一条
+    #:
+    #: 代价：deepseek-v4-flash 在思考模式下有把工具调用写成 DSML 正文的
+    #: 已知风险，由 leaked_tool_call 的两道闸兜底（可见的重试 / 报错）。
+    enable_thinking: bool = False
+
     def __post_init__(self) -> None:
 
         # list -> tuple：调用方（节点）手上常常是 list，而这里必须
@@ -980,6 +997,7 @@ class ModelRequest:
             "tool_count": len(self.tools),
             "has_response_format": self.response_format is not None,
             "disable_thinking": self.disable_thinking,
+            "enable_thinking": self.enable_thinking,
             "metadata_keys": sorted(str(key) for key in self.metadata),
         }
 

@@ -225,7 +225,12 @@ class AgentMessage(APIModel):
     role: str = Field(description="user / assistant。")
 
     kind: str = Field(
-        description="chat / interaction / tool_activity / notice。",
+        description=(
+            "chat / interaction / tool_activity / notice / "
+            "task_instruction / task_result。\n\n"
+            "任务消息（task_instruction / task_result）的 metadata 里带 "
+            "`task_id` / `plan_id` / `skill_key`，前端按它归组到任务卡片。"
+        ),
     )
 
     business_agent_id: str | None = Field(

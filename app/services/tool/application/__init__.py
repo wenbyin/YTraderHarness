@@ -13,6 +13,8 @@ app/services/capability 的 CapabilityService。这里只有工具 ↔ 能力的
 关联服务（ToolClassificationService）。
 """
 
+from .mcp_provider_service import MCPProviderService
+from .mcp_provider_service_impl import MCPProviderServiceImpl
 from .processor_definition_service import (
     ProcessorDefinitionService,
 )
@@ -37,6 +39,8 @@ from .tool_query_service import ToolQueryService
 from .tool_query_service_impl import ToolQueryServiceImpl
 
 __all__ = [
+    "MCPProviderService",
+    "MCPProviderServiceImpl",
     "ProcessorDefinitionService",
     "ProcessorDefinitionServiceImpl",
     "ToolClassificationService",

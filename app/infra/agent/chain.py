@@ -235,9 +235,8 @@ def _validate(entries: Sequence[ChainEntry]) -> None:
         # ⚠️ 这里**不**校验"同一个键只能有一种 hook"。
         #
         # 那看起来像个合理的自洽性检查，其实会误杀正常配置：
-        # cache_interceptor 支持 BEFORE + AFTER，而它的"先查后回填"
-        # 正是靠**两条记录**实现的（见 cache.py）。一个实现占多个
-        # hook 位置是设计的一部分。
+        # privacy_transformer 同时挂 BEFORE + AFTER（抹参数 + 抹结果），
+        # 一个实现占多个 hook 位置是设计的一部分。
         #
         # "这个 hook 该实现支持吗"是挂载期的事（服务层的
         # _validate_mount 按 supported_hooks 判），执行期再查一遍

@@ -84,6 +84,7 @@ from app.infra.graph.recorder import GraphRunRecorder
 if TYPE_CHECKING:
     from app.agent.context.processor.sources import ToolExposureSource
     from app.agent.context.updater import ContextUpdater
+    from app.agent.plan.publish import TaskBoard
 
 __all__ = ["ReactContext"]
 
@@ -122,6 +123,32 @@ class ReactContext:
     #: 语义**（窄输入 vs 完整上下文），所以是两个实例而不是一个开关。
     classifier_builder: BaseContextBuilder
 
+    #: planner 节点用的 Context Builder 实例。
+    #:
+    #: 窄输入：摘要 + 历史 + 当前用户输入，不含画像 / 记忆 / 知识 /
+    #: 工具。按 catalog.PLANNER_BUILDER_TYPE 在启动期解析一次。
+    #: 默认 None 是为了让既有测试 / 只构造旧字段的调用方不被迫补参；
+    #: 生产 runtime 必须注入，否则 planner 会降级返回 {}。
+    planner_builder: BaseContextBuilder | None = None
+
+    #: 子代理子图（`llm_node`）用的 Context Builder 实例。
+    #:
+    #: 按 catalog 的 `SUB_AGENT` 类型在启动期解析一次。与 `builder` 是
+    #: **两种语义**：主图注入完整对话上下文；子图只看到自己任务 scope
+    #: 的 messages / summary / skill。
+    #:
+    #: 默认 None 是为了让只构造既有字段的测试不被迫补参；生产 runtime
+    #: 必须注入，子图的 llm_node 拿不到时会显式报错（不静默退回主图
+    #: builder —— 那会让 worker 看到父对话并沿用父提示词）。
+    subagent_builder: BaseContextBuilder | None = None
+
+    #: 任务板（Redis）—— planner 把 A2A task 发布到这里。
+    #:
+    #: None 是**合法状态**：本地没起 Redis、或这版只跑主图顺序执行时，
+    #: 发布这一步会降级成「只写 state」，而不是让整轮失败。接上 worker
+    #: 之后任务板变成调度权威，那时 None 必须按 fail-closed 处理。
+    task_board: "TaskBoard | None" = None
+
     #: 调用之后的回写口子。None = 不回写（当前唯一的状态）。
     context_updater: "ContextUpdater | None" = None
 
@@ -138,6 +165,13 @@ class ReactContext:
     #: 同一个推导，两处必须一起改。
     tool_source: "ToolExposureSource | None" = None
 
+    #: 客户端传入的 Trace 聚合键（None = 未开启 Trace）。
+    #:
+    #: 节点只读它做两件事：判断要不要产生 trace 事件；把 trace_id 带进
+    #: TraceEmitter 的信封。**不要**把它或 emitter 存进共享实例
+    #: （ModelRuntime / builder / registry），也不进 graph state。
+    trace_id: str | None = None
+
     #: 这条运行属于哪个**业务会话**（`agent_session.session_id`）。
     #:
     #: ⚠️ 不是 langgraph 的 `thread_id`
@@ -146,7 +180,7 @@ class ReactContext:
     #: 会话行派生；而 session_id 是会话自己的主键 —— 会话详情页、消息、
     #: 运行列表全按它关联。
     #:
-    #: 谁在用：工具执行账本（`tool_execution.session_id`）拿它做判重键的
+    #: 谁在用：工具执行账本（`tool_execution.session_id`）拿它做
     #: 第一段。**拿不到就不执行工具**（见 tools.py 的 `_LedgerUnavailable`）
     #: —— 一次没有记录的副作用不可追溯，而不可追溯比失败更糟。
     #:

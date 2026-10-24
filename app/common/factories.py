@@ -38,21 +38,26 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from .redis_factory import RedisClientFactory, RedisClients
 from .repository.base import SessionFactory
 from .repository.factory import RepositoryFactory
 from .service.factory import ServiceFactory
 
 __all__ = [
     "build_factories",
+    "build_redis_factory",
+    "get_redis_factory",
     "get_repository_factory",
     "get_service_factory",
     "reset_factories",
+    "reset_redis_factory",
 ]
 
 
 #: 应用级单例。lifespan 装配时写入，之后只读。
 _service_factory: ServiceFactory | None = None
 _repository_factory: RepositoryFactory | None = None
+_redis_factory: RedisClientFactory | None = None
 
 
 def build_factories(
@@ -122,6 +127,47 @@ def get_repository_factory() -> RepositoryFactory:
     return _repository_factory
 
 
+def build_redis_factory(
+        source: RedisClients | None,
+) -> RedisClientFactory:
+    """
+    装配应用级 Redis 客户端工厂。
+
+    由 lifespan 在数据源就绪之后调用一次。`source` 为 None（本地没起
+    Redis，`required: false`）是合法状态 —— 工厂的 `available` 为 False，
+    调用方据此退回进程内实现。
+
+    与 `build_factories` 同一条纪律：本模块只保存，不建连、不关池。
+    """
+
+    global _redis_factory
+
+    _redis_factory = RedisClientFactory(source)
+
+    return _redis_factory
+
+
+def get_redis_factory() -> RedisClientFactory:
+    """取应用级 Redis 工厂。未装配时抛 —— 与 get_service_factory 同形。"""
+
+    if _redis_factory is None:
+        raise RuntimeError(
+            "应用级 RedisClientFactory 还没装配。"
+            "它由 lifespan 调用 build_redis_factory() 建立 —— "
+            "请确认应用正常启动，或在测试里显式装配一次。"
+        )
+
+    return _redis_factory
+
+
+def reset_redis_factory() -> None:
+    """清掉 Redis 工厂单例（测试用）。"""
+
+    global _redis_factory
+
+    _redis_factory = None
+
+
 def reset_factories() -> None:
     """
     丢弃已装配的工厂。
@@ -135,3 +181,5 @@ def reset_factories() -> None:
 
     _service_factory = None
     _repository_factory = None
+
+    reset_redis_factory()

@@ -76,11 +76,17 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from app.agent.context.builder.base import BaseContextBuilder
 from app.agent.context.registry import create_context_builder
 from app.agent.model import ModelRegistry
+from app.agent.plan.publish import build_task_board
 from app.infra.agent.tool_exposure import RegistryToolExposureSource
 from app.infra.graph import GraphDefinition, GraphRegistry, RunContext
 from app.services.tool.registry import get_tool_registry
 
-from .catalog import CLASSIFIER_BUILDER_TYPE, CONTEXT_BUILDER_TYPE
+from .catalog import (
+    CLASSIFIER_BUILDER_TYPE,
+    CONTEXT_BUILDER_TYPE,
+    PLANNER_BUILDER_TYPE,
+    SUBAGENT_BUILDER_TYPE,
+)
 from .context import ReactContext
 from .definition import build_graph_definition
 from .graph import build_react_graph
@@ -190,6 +196,19 @@ def register_react_graph(
         CLASSIFIER_BUILDER_TYPE
     )
 
+    # planner 的窄输入 builder：resolver + summary + history + prompt。
+    # 与 classifier 一样在启动期解析，缺实现直接报错。
+    planner_builder = create_context_builder(
+        PLANNER_BUILDER_TYPE
+    )
+
+    # 子代理子图的 llm_node 用同一个 context 取它。在这里解析而不是在
+    # 子图首次运行时解析：缺实现不该等到 worker 已经 claim 了任务才炸
+    # （那时任务 lease 已经开始走了）。
+    subagent_builder = create_context_builder(
+        SUBAGENT_BUILDER_TYPE
+    )
+
     state_graph = build_react_graph()
 
     # 工具注册表：**启动期扫一遍**。
@@ -238,6 +257,12 @@ def register_react_graph(
             model_registry=model_registry,
             builder=context_builder,
             classifier_builder=classifier_builder,
+            planner_builder=planner_builder,
+            subagent_builder=subagent_builder,
+            # 任务板：进程级 Redis 客户端，每次运行包一层 holder。
+            # Redis 未装配时是 None —— planner 会把发布降级写进 notes，
+            # 而不是让整轮失败（见 plan/publish.py 的失败语义）。
+            task_board=build_task_board(),
             context_updater=context_updater,
             tool_source=tool_source,
             # 业务会话。与 caller_identity 同一条取法：直接取属性、
@@ -263,6 +288,11 @@ def register_react_graph(
             # "需要 agent_id 的那个工具取不到那篇场景"，比"整轮失败"安静得多，
             # 所以这里必须与契约对齐（见 RunContext.duty_key 的说明）。
             duty_key=run_context.duty_key,
+            # Trace 聚合键。与 session_id / caller_identity 同一条取法：
+            # 直接取属性、不给 getattr 兜底 —— 它是 RunContext 契约的一部分
+            # （默认 None）。拿不到的后果是"这次运行静默不采 trace"，
+            # 比整轮失败安静得多，所以必须与契约对齐。
+            trace_id=run_context.trace_id,
         )
 
     definition = build_graph_definition(

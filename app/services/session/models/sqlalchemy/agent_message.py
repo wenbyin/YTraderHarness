@@ -160,11 +160,16 @@ class AgentMessage(Base):
         comment="user / assistant，见 domain/schemas/enum.py。",
     )
 
+    # ⚠️ 2026-10-22 新增 task_instruction / task_result。已有库必须先跑
+    # `app/services/session/task_message_kind_migration.sql` 重建 CHECK。
     kind: Mapped[str] = mapped_column(
         String(24),
         nullable=False,
         default="chat",
-        comment="chat / interaction / tool_activity / notice。",
+        comment=(
+            "chat / interaction / tool_activity / notice / "
+            "task_instruction / task_result。"
+        ),
     )
 
     business_agent_id: Mapped[str | None] = mapped_column(
@@ -270,7 +275,10 @@ class AgentMessage(Base):
             name="ck_agent_message_role",
         ),
         CheckConstraint(
-            "kind IN ('chat', 'interaction', 'tool_activity', 'notice')",
+            "kind IN ("
+            "'chat', 'interaction', 'tool_activity', 'notice', "
+            "'task_instruction', 'task_result'"
+            ")",
             name="ck_agent_message_kind",
         ),
         CheckConstraint(

@@ -59,6 +59,9 @@ class DataSourceFactory:
                 pool_max_size=(
                     definition.config.pool_max_size
                 ),
+                parallel_cursor_operations=(
+                    definition.config.parallel_cursor_operations
+                ),
                 # store 与 checkpointer 共用上面那个池（理由见
                 # GraphCheckpointerProvider 的模块 docstring）。
                 # 单位是**分钟** —— 见 StoreSettings 的说明。

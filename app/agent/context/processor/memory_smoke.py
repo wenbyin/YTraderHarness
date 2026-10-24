@@ -501,12 +501,17 @@ async def main() -> int:
 
     system_text = getattr(system, "content", "") if system else ""
 
-    check("四段确实进了 system 消息（各带一个 ## 标题）",
-          all(f"## {label}" in system_text
-              for label in ("用户画像", "记忆场景索引", "相关原话", "相关记忆")),
+    check("四段确实进了 system 消息（各带一个 ref 标签）",
+          system_text.count("<ref:memory ") == 4
+          and system_text.count("</ref:memory>") == 4,
           f"实际 {system_text[:200]!r}")
-    check("system 里没有两层标题（`## 用户画像` 只出现一次）",
-          system_text.count("## 用户画像") == 1)
+    check("标题进了 desc，正文里不再有 ## 标题",
+          all(label in system_text
+              for label in ("用户画像", "记忆场景索引", "相关原话", "相关记忆"))
+          and not any(f"## {label}" in system_text
+                      for label in ("用户画像", "记忆场景索引", "相关原话", "相关记忆")))
+    check("每个 ref 块尾部都带引用数据规则",
+          system_text.count("[引用数据规则]") == 4)
 
     applied = _context_state_updates(model_request)
 

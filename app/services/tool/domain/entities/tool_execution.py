@@ -1,9 +1,20 @@
 """
 Domain entity for ToolExecution.
 
-一次工具调用的执行记录。它是 `tool_execution` 表的领域形态 ——
-表结构与约束的说明在 models/sqlalchemy/tool_execution.py，
-状态语义在 domain/schemas/enum.py 的 ToolExecutionStatus。
+**一次执行一条记录**的 append-only 账本 —— 与旧版「一个判重键一行、
+重试时重置」的幂等账本不同。表结构与约束的说明在
+models/sqlalchemy/tool_execution.py（沿用 `tool_execution` 表名，
+在原表上扩展），状态语义在
+domain/schemas/enum.py 的 ToolExecutionStatus。
+
+为什么要改成 append-only
+------------------------
+守卫要回答的问题从「这件事是不是已经做过」变成了「这个维度上
+已经发生过几次」。后者必须保留每一次尝试，否则「重试一次」会把
+上一次的痕迹抹掉，计数永远停在 1。
+
+判重（同一 tool_call_id 不重复执行）仍然保留，但它落在
+`(run_id, tool_call_id)` 的唯一索引上，而不是靠覆盖同一行。
 """
 
 from __future__ import annotations
@@ -14,7 +25,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..schemas.enum import ToolExecutionStatus
+from ..schemas.enum import (
+    ExecutionMatch,
+    ExecutionScope,
+    ToolExecutionStatus,
+)
 
 __all__ = ["ToolExecution"]
 
@@ -23,23 +38,23 @@ class ToolExecution(BaseModel):
     """
     一条执行记录。
 
-    四条**判重键**字段（session_id / run_id / tool_key / param_hash）
-    是不可变的：它们共同决定「这是不是同一次调用」。状态与结果则是
-    一行生命里会变的部分 —— 从 PENDING 走到某个终态。
+    身份、维度、状态是三组字段：
 
-    ⚠️ `session_id` 是 `agent_session.session_id`，不是 langgraph 的
-    `thread_id` —— 见 ORM 类 docstring 里那段理由。
+        身份      execution_id / run_id / tool_call_id
+        维度      scope_type / scope_key / execution_type / param_hash
+        状态      status / counted / result / error
 
-    ⚠️ `result` 是**脱敏之后**的那一份
-    --------------------------------
-    写库发生在处理器链跑完之后，privacy_transformer 已生效，因此这里
-    存的就是模型当时看到的内容。见 ORM 类 docstring 的同一段说明。
+    ⚠️ `counted` 与 `status` 不是一回事
+    ---------------------------------
+    `status` 描述发生了什么，`counted` 描述这次尝试是否占用守卫额度。
+    被拒绝、中断、取消、守卫拦下的记录 `counted=False` —— 它们没有
+    真正执行，不该把下一次调用挡在门外。
 
-    ⚠️ `result` 与 `error` 的"空"不是一回事
-    -------------------------------------
-    工具正常返回 `None` 是**合法成功**（`ToolOutcome.value` 可以为
-    None），因此 SUCCESS 时 `result` 可以是 None。要判断"这次有没有
-    说到结果"，看 status，不要看 result 是不是 None。
+    ⚠️ `session_id` / `run_id` 可以为空
+    ---------------------------------
+    图外直调（冒烟、脚本）没有会话与运行。守卫在 scope 需要它们时
+    会 fail-closed，但记录本身允许为空 —— 否则图外调用连「被拒绝」
+    都记不下来。
     """
 
     model_config = ConfigDict(
@@ -50,29 +65,89 @@ class ToolExecution(BaseModel):
         description="执行记录 ID。",
     )
 
-    session_id: UUID = Field(
-        description=(
-            "所属会话（agent_session.session_id）。"
-            "⚠️ 不是 langgraph 的 thread_id。"
-        ),
-    )
-
-    run_id: UUID = Field(
-        description="本次运行（agent_run 主键，即 pipeline_run_id）。",
-    )
-
     tool_key: str = Field(
         description="被调用的工具，形如 document.retrieve_documents。",
     )
 
+    tool_id: UUID | None = Field(
+        default=None,
+        description="tool_definition 主键；还没同步进库的工具为空。",
+    )
+
+    session_id: UUID | None = Field(
+        default=None,
+        description=(
+            "所属会话（agent_session.session_id）。"
+            "⚠️ 不是 langgraph 的 thread_id。图外直调时为空。"
+        ),
+    )
+
+    run_id: UUID | None = Field(
+        default=None,
+        description="本次运行（agent_run 主键，即 pipeline_run_id）。",
+    )
+
+    user_id: str | None = Field(
+        default=None,
+        description=(
+            "调用者（caller_identity.user_id 的字符串形态）。"
+            "拿不到时为空 —— 不要回落到会话反查。"
+        ),
+    )
+
+    scope_type: ExecutionScope = Field(
+        description="计数维度：SESSION / RUN / USER / GLOBAL。",
+    )
+
+    scope_key: str = Field(
+        description=(
+            "维度取值：session_id / run_id / user_id / '*'。"
+            "反规范化存储，便于按维度计数与排查。"
+        ),
+    )
+
+    execution_type: ExecutionMatch = Field(
+        description="METHOD（只看工具）/ INVOKE（工具 + 参数）。",
+    )
+
     param_hash: str = Field(
-        description="调用参数的 sha256 十六进制摘要。",
+        default="",
+        description=(
+            "INVOKE 时的参数 sha256；METHOD 时为空串。"
+            "与 cache 拦截器同一套 canonical_json + sha256。"
+        ),
+    )
+
+    match_key: str = Field(
+        description=(
+            "上面五段（tool_key + scope + execution + param_hash）的"
+            "定长摘要。计数、加锁、索引都用它，避免多列组合比较。"
+        ),
     )
 
     status: ToolExecutionStatus = Field(
         description=(
-            "执行状态。⚠️ 「能不能重跑」的判据在枚举那边，"
-            "不在这个字段的**名字**上 —— 见 ToolExecutionStatus。"
+            "执行状态。⚠️ 「能不能重跑」的判据在守卫配置"
+            "（success / error / unknown 三种独立配额）与 counted "
+            "位上，不在这个字段的**名字**上。"
+        ),
+    )
+
+    counted: bool = Field(
+        default=True,
+        description=(
+            "这次尝试是否占用额度。PENDING 时先记 True（并发分支要"
+            "看见它），落终态时按结果改成 False（拒绝/中断/取消/"
+            "缓存命中）。"
+        ),
+    )
+
+    tool_call_id: str | None = Field(
+        default=None,
+        description=(
+            "模型给的调用 id。与 run_id 一起构成 replay/resume 的"
+            "去重键：同一次工具调用在图中重跑时复用同一行，"
+            "不再消耗额度。"
         ),
     )
 
@@ -94,7 +169,7 @@ class ToolExecution(BaseModel):
     )
 
     created_at: datetime = Field(
-        description="创建时间（claim 那一刻）。",
+        description="创建时间（预占那一刻）。",
     )
 
     updated_at: datetime = Field(

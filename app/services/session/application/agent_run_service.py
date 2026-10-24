@@ -70,6 +70,8 @@ class AgentRunService(BaseService):
 
         Raises:
             NotFoundError: 会话不存在，**或它不属于 user_id**。
+            ConflictError: 会话已归档（archived 是只读的，不能再开新运行）
+                    或同一会话已有运行在进行中。
             ValueError: input.text 为空或只有空白（-> 400）。
         """
 
@@ -112,7 +114,9 @@ class AgentRunService(BaseService):
 
         Raises:
             NotFoundError: 运行不存在，**或它所属的会话不属于 user_id**。
-            ConflictError: 两种情形（-> 409）：
+            ConflictError: 三种情形（-> 409）：
+                会话已归档（归档会先取消未终态运行，理论上不会走到这里，
+                这条是并发窗口的防御）；
                 这次运行**不在** `waiting_input` —— 跑完的没什么可恢复，
                 正在跑的还没停下来轮不到插队；
                 `answers` 的集合与当前待处理的中断**不一致** —— 少了那个

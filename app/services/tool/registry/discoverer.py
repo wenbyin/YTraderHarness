@@ -48,12 +48,20 @@ class ToolDiscoverer:
         """
         装配本进程里的全部来源。
 
-        两个扫描器都是 LOCAL_METHOD —— 区别在**取数方式与执行方式**，
+        前两个扫描器都是 LOCAL_METHOD —— 区别在**取数方式与执行方式**，
         不在来源：一个来自 @tool 自注册（执行时要由工厂建 self），
         一个来自模块级的 langchain BaseTool（执行时直接调它自己）。
 
-        新增来源（MCP / OpenAPI）时在这里加一行即可。
+        第三个是 MCP：工具在外部 server 里，按 `mcp.yaml` 的连接配置
+        走 `tools/list`，不扫代码。没有配置文件时它返回空清单。
+
+        新增来源（OpenAPI）时在这里加一行即可。
         """
+
+        # 惰性 import：`mcp_scanner` 会拖进 MCP 客户端（含可选的 mcp
+        # SDK）。只用本地工具、或根本没装 SDK 的环境不该在 import
+        # 注册表时就付这份成本 —— 与 scanner 里延迟取 BaseTool 同一取舍。
+        from .mcp_scanner import MCPToolScanner
 
         return cls([
             ServiceMethodScanner(
@@ -61,6 +69,7 @@ class ToolDiscoverer:
                 else get_tool_registry()
             ),
             LangchainToolScanner(),
+            MCPToolScanner(),
         ])
 
     # ========================================================

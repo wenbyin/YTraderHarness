@@ -1,14 +1,17 @@
 """
 Repository contract for Capability.
 
-只管 capability 表本身（能力树），加上一条"我被多少工具引用"
-的反查 —— 后者是删除前的必要判断，属于能力自己的生命周期，
-因此留在本契约里（见 count_links）。
+只管 capability 表本身（能力树），加上两条"我被谁引用"的反查 ——
+它们是删除前的必要判断，属于能力自己的生命周期，因此留在本契约里：
 
-⚠️ 关联的**读写**不在这里。它们是 tool 模块的事，契约是
-app/services/tool/repository/tool_classification.py ——
-那条路径的主语是工具，删工具就该顺带解除关联。本模块只问
-"能不能删"，不改关联。
+    count_links        被多少个 Tool 引用（tool 模块的关联表）
+    count_skill_links  被多少个 Skill 绑定（skill 模块的关联表）
+
+⚠️ 关联的**读写**不在这里。Tool 关联归 tool 模块
+（app/services/tool/repository/tool_classification.py），Skill 绑定
+归 skill 模块（app/services/skill/repository/skill_capability.py）——
+两边的主语都不是能力，删工具 / 删 Skill 就该各自顺带解除关联。
+本模块只问"能不能删"，不改关联。
 """
 
 from __future__ import annotations
@@ -134,6 +137,27 @@ class CapabilityRepository(BaseRepository):
         它读的是 tool 模块的关联表（tool_definition_classification）。
         读在这里是刻意的：问的是"这个能力能不能删"，主语是能力；
         而**写**关联（挂上/摘掉）仍然只发生在 tool 模块。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    async def count_skill_links(
+            self,
+            capability_ids: list[UUID],
+    ) -> int:
+        """
+        统计这些能力被多少个 Skill 绑定。
+
+        与 count_links 同一条理由：删除前要给出能读懂的冲突，
+        而不是让数据库外键抛一句无上下文的错误。
+
+        与工具引用不同的是，**force 也不能放行这一条**：Skill 的绑定
+        在库里的外键是 ON DELETE RESTRICT，删掉绑定会让对应 Skill 的
+        工具可见性无声缩小。要先解除绑定，或改用 is_active=false。
+
+        读的是 skill 模块的关联表（skill_capability）。与 count_links
+        一样，这是"我能不能被删"的只读反查，不改对方的数据。
         """
 
         raise NotImplementedError

@@ -1,0 +1,116 @@
+openapi: 3.1.0
+
+info:
+  title: MCP Provider API
+  version: 1.0.0
+  description: |
+    MCP Provider Management (read-only).
+
+    Responsibilities:
+      - Expose the configured MCP providers (mcp.yaml).
+      - Expose their runtime connection state.
+      - Expose how many of their tools have been synchronized into
+        tool_definition.
+
+    Non-responsibilities:
+      - Creating / editing providers. Connection parameters are
+        deployment data (paths, env, secrets) and live in mcp.yaml.
+        Connections are established at startup, so a write endpoint
+        would misleadingly imply hot reload.
+      - The tools themselves. Filter them with
+        GET /tools?source_type=mcp&source_ref=<name>.
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: MCP Providers
+    description: MCP provider configuration and runtime state
+
+paths:
+
+  /mcp/providers:
+    get:
+      tags:
+        - MCP Providers
+      summary: List MCP providers
+      operationId: listMcpProviders
+      responses:
+        '200':
+          description: Provider list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MCPProviderListResponse'
+
+components:
+  schemas:
+
+    MCPProviderSummary:
+      type: object
+      required:
+        - name
+        - enabled
+        - transport
+        - connected
+        - exposed_tool_count
+        - tools_mode
+        - tool_count
+        - active_tool_count
+        - missing_tool_count
+      properties:
+        name:
+          type: string
+          description: >
+            Provider identifier. Also the tool source_ref and the
+            prefix of its tool_key (`<name>.<tool>`).
+        enabled:
+          type: boolean
+          description: >
+            Enabled in configuration. False for every provider when
+            the global switch is off.
+        transport:
+          type: string
+          enum:
+            - stdio
+          description: Connection transport.
+        connected:
+          type: boolean
+          description: >
+            Whether this process currently holds a session.
+            False when the provider failed to start or is disabled.
+        exposed_tool_count:
+          type: integer
+          description: >
+            Tools admitted by the allowlist and registered in the
+            in-process registry. Zero when not connected.
+        tools_mode:
+          type: string
+          enum:
+            - all
+            - allowlist
+            - denylist
+          description: Tool filter mode.
+        tool_count:
+          type: integer
+          description: >
+            Total rows in tool_definition with this source_ref.
+        active_tool_count:
+          type: integer
+          description: Rows whose source_state is ACTIVE.
+        missing_tool_count:
+          type: integer
+          description: >
+            Rows whose source_state is MISSING (absent from the last
+            successful scan).
+
+    MCPProviderListResponse:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          description: In configuration declaration order.
+          items:
+            $ref: '#/components/schemas/MCPProviderSummary'

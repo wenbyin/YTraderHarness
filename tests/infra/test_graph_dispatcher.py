@@ -63,10 +63,16 @@ async def _wait_until(predicate, *, timeout: float = 5.0) -> None:
 
 
 def test_defaults_match_the_agreed_limits() -> None:
-    """10 个并行、256 个排队 —— 这两个数字是使用方定的，别被悄悄改小。"""
+    """
+    默认 768 个并行、4096 个排队。
 
-    assert DEFAULT_MAX_CONCURRENCY == 10
-    assert DEFAULT_QUEUE_SIZE == 256
+    Windows 上 `select()` 有 512 socket 上限，真实压测时用
+    GRAPH_DISPATCHER_MAX_CONCURRENCY 压到 128；Linux 上可以提到 700+。
+    两个值都可用环境变量覆盖；这里钉住的是默认值。
+    """
+
+    assert DEFAULT_MAX_CONCURRENCY == 768
+    assert DEFAULT_QUEUE_SIZE == 4096
 
 
 def test_zero_concurrency_is_rejected() -> None:

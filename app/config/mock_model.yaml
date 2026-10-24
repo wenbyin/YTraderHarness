@@ -1,0 +1,91 @@
+# ============================================================
+# Mock 模型服务（开发 / 前端联调）
+# ============================================================
+#
+# 启动：
+#     python run_server.py --mock
+#     python run_server.py --no-mock      # 显式关闭，覆盖本文件的 enabled
+#
+# 也可以设置环境变量 MOCK_MODEL_ENABLED=1/0；它的优先级高于本文件。
+#
+# ⚠️ 为什么独立一份，不写进 app.yaml
+# ---------------------------------
+# app/common/app_config.py 的 AppConfig 是 extra="forbid"，新增一个顶层键
+# 会让整份 app.yaml 被拒绝。mock 是开发功能，独立文件既不动生产配置的
+# 校验，也方便整体删除。
+#
+# ⚠️ 它只绑定回环地址；生产环境不要打开。
+#
+# 延迟 / 字数 / 速率都按截断正态分布配置：
+#     mean 均值，std 标准差，min/max 裁切边界
+# 正态分布的尾部会产生负延迟或 0 字符回复，因此必须裁剪。
+# 分类调用单独一组，避免分类也等 8 秒。
+
+mock_model:
+
+  #: 是否启用。--mock / --no-mock 与环境变量优先。
+  enabled: "${MOCK_MODEL_ENABLED:-false}"
+
+  #: 监听地址与端口。llm.yaml 的 mock.base_url 默认指向 18080。
+  #: 只建议 127.0.0.1；0.0.0.0 仅供容器/局域网联调。
+  host: "${MOCK_MODEL_HOST:-127.0.0.1}"
+  port: "${MOCK_MODEL_PORT:-18080}"
+
+  #: 随机种子。留空 = 每次启动不同；固定整数用于复现同一条回复。
+  seed: "${MOCK_MODEL_SEED:-}"
+
+  #: 强制分类结果的 execution_plan。
+  #:
+  #: stress_eval 固定为 react：压测流量只走主链路，不随机分叉到
+  #: other。要恢复随机行为把它设成 random（或空串）：
+  #:     MOCK_MODEL_EXECUTION_PLAN=random python run_server.py --mock
+  #:
+  #: 可选值：react / other / random。
+  execution_plan: "${MOCK_MODEL_EXECUTION_PLAN:-react}"
+
+  #: 流式回复每块字符数。越大事件越少、越不像逐 token。
+  chunk_chars: 24
+
+  #: 每个请求打一条 INFO 日志（只含角色/长度/耗时，不含 prompt）。
+  log_requests: true
+
+  #: 普通对话 / 推理调用。
+  stream:
+    #: 首 token 延迟（毫秒）。
+    ttft_ms: { mean: 700, std: 250, min: 100, max: 3000 }
+    #: 整段回复字符数。
+    response_chars: { mean: 500, std: 160, min: 40, max: 2000 }
+    #: 流式输出速率（字符/秒）。
+    chars_per_second: { mean: 440, std: 80, min: 300, max: 580 }
+
+  #: 分类 / 结构化输出调用。分类是非流式，但同样模拟 TTFT 与总耗时。
+  classification:
+    ttft_ms: { mean: 350, std: 120, min: 100, max: 1200 }
+    response_chars:  { mean: 160, std: 30, min: 40, max: 400 }
+    chars_per_second:  { mean: 440, std: 80, min: 300, max: 580 }
+
+  #: 工具调用随机策略。
+  tool_call:
+    #: 带 tools 的自动调用中，返回 tool_calls 的概率。
+    probability: 0.05
+    #: 命中后每次返回几个 tool_call（正态 + 裁剪）。
+    count: { mean: 1.0, std: 0.4, min: 0.0, max: 3.0 }
+
+  #: mock 能力 -> 工具解析。
+  #:
+  #: 无论分类器返回什么 capability code，都从下面这个固定池里随机选 N 个
+  #: tool_key。这样不依赖数据库里的 capability/tool 关联，前端联调时
+  #: 一定能触发 bind_tools -> tool_calls -> 工具执行那条链路。
+  capability:
+    tool_keys:
+      - mock.echo
+      - mock.lookup
+      - mock.calc
+      - mock.current_time
+      - mock.ping
+    #: 每次暴露几个工具（正态 + 裁剪到 1~5）。
+    count: { mean: 2.0, std: 1.0, min: 1.0, max: 5.0 }
+
+  #: 分类结果 capability_needs 的候选池。
+  #: 为空时从 system prompt 里的候选清单解析；两者都没有就返回空列表。
+  capability_pool: []

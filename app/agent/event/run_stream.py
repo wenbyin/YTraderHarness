@@ -1159,6 +1159,48 @@ class RunStreamRegistry:
 
         self._streams: dict[str, RunStream] = {}
 
+        #: 容量通知。API 的 `attach_wait` 在达到 max_active_run_streams
+        #: 时等它；某个流被摘除后 set。
+        #:
+        #: 仍然保留同步 `attach`（测试与内部调用），它在满时会抛
+        #: TooManyRunStreamsError；HTTP 路由走 `attach_wait`，排队而不
+        #: 返回 503。
+        self._capacity = asyncio.Event()
+        self._capacity.set()
+
+    # ========================================================
+
+    async def attach_wait(
+            self,
+            run_id: UUID,
+            *,
+            start: str = "0",
+    ) -> "RunStreamAttachment":
+        """
+        挂订阅者；容量满时**等待**，不抛 TooManyRunStreamsError。
+
+        等待的是活跃 **run 数**，不是订阅者数。同一个 run 的新订阅者
+        直接复用现有流，不占额度。
+
+        ⚠️ 等待期间 HTTP 请求一直挂着；客户端断开由它自己的超时/关闭
+        处理。Driver 侧还有 max_concurrency 限流，正常情况下不会在这里
+        堆很多。
+        """
+
+        config = self._config or load_stream_config()
+        key = stream_key(config.key_prefix, str(run_id))
+
+        while True:
+            stream = self._streams.get(key)
+
+            if stream is not None and not stream.is_closing:
+                return self.attach(run_id, start=start)
+
+            if len(self._streams) < config.max_active_run_streams:
+                return self.attach(run_id, start=start)
+
+            await self._capacity.wait()
+
     # ========================================================
 
     def attach(
@@ -1211,6 +1253,9 @@ class RunStreamRegistry:
 
             self._streams[key] = stream
 
+            if len(self._streams) >= config.max_active_run_streams:
+                self._capacity.clear()
+
             stream.start()
 
         return RunStreamAttachment(stream=stream, sub=stream.attach(start))
@@ -1227,6 +1272,11 @@ class RunStreamRegistry:
 
         if self._streams.get(stream._key) is stream:
             del self._streams[stream._key]
+
+            config = self._config or load_stream_config()
+
+            if len(self._streams) < config.max_active_run_streams:
+                self._capacity.set()
 
     # ========================================================
 
@@ -1251,6 +1301,7 @@ class RunStreamRegistry:
         streams = list(self._streams.values())
 
         self._streams.clear()
+        self._capacity.set()
 
         for stream in streams:
             await stream.aclose()

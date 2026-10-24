@@ -680,6 +680,44 @@ async def test_capacity_limit_raises_an_explicit_error(
         handle.aclose()
 
 
+async def test_capacity_wait_queues_instead_of_raising(
+        redis: FakeStreamRedis,
+) -> None:
+    """HTTP 路由走 attach_wait：满员时排队，不抛 503 对应的异常。"""
+
+    registry = RunStreamRegistry(
+        redis,
+        config=make_config(max_active_run_streams=2),
+    )
+
+    first = registry.attach(uuid4(), start="0")
+    second = registry.attach(uuid4(), start="0")
+
+    await pump()
+
+    waiting = asyncio.create_task(
+        registry.attach_wait(uuid4(), start="0")
+    )
+    await pump()
+
+    assert not waiting.done()
+
+    first.aclose()
+
+    for _ in range(20):
+        await pump()
+
+        if waiting.done():
+            break
+
+    third = await asyncio.wait_for(waiting, timeout=2)
+
+    assert registry.active_count == 2
+
+    second.aclose()
+    third.aclose()
+
+
 async def test_a_run_at_capacity_does_not_count_against_itself(
         redis: FakeStreamRedis,
 ) -> None:

@@ -47,9 +47,13 @@ from uuid import UUID
 __all__ = [
     "AsyncToolCall",
     "CALLER_CONTEXT_KEY",
+    "RUN_CONTEXT_KEY",
+    "SESSION_CONTEXT_KEY",
+    "TOOL_STARTED_CONTEXT_KEY",
     "ToolCallDenied",
     "ToolInvocation",
     "ToolOutcome",
+    "ToolTimeout",
     "build_caller_context",
 ]
 
@@ -64,6 +68,28 @@ __all__ = [
 #: 而它的默认行为是**拒绝**，于是症状变成"所有工具都调不动了"，
 #: 离原因（一个字母）非常远。
 CALLER_CONTEXT_KEY = "caller"
+
+#: 本次调用属于哪条会话 / 哪一次运行。
+#:
+#: 由 `ToolExecutor.execute` 从 `runtime.context`（ReactContext）抄进
+#: `ToolInvocation.context` —— 执行守卫据此做 SESSION / RUN 维度的
+#: 计数。抄一份而不是让每个处理器自己读 runtime，是为了让处理器
+#: 在**图外直调**（runtime=None）时也能拿到同样的形状；拿不到时
+#: scope 需要它的守卫会 fail-closed。
+SESSION_CONTEXT_KEY = "session_id"
+RUN_CONTEXT_KEY = "run_id"
+
+#: 工具方法**真正开始执行**的标记。
+#:
+#: 由 `ToolExecutor._base_call` 在调 service 方法 / langchain 工具之前
+#: 写入。守卫用它区分两种取消 / 中断：
+#:
+#:     未开始     CANCELLED / INTERRUPT —— 确认无副作用，不占额度
+#:     已开始     UNKNOWN              —— 可能已产生副作用，占额度
+#:
+#: 没有这个标记时，只能按"中断 == 未执行"处理；将来加 AFTER 中断
+#: 就会把已执行过的调用误记成未执行（见 ToolExecutionStatus 的说明）。
+TOOL_STARTED_CONTEXT_KEY = "tool.started"
 
 
 def build_caller_context(
@@ -113,6 +139,32 @@ class ToolCallDenied(Exception):
     """
 
 
+class ToolTimeout(TimeoutError):
+    """
+    工具执行超时。
+
+    为什么单独一个类型，而不是直接抛 `TimeoutError`
+    --------------------------------------------
+    `ToolOutcome.error` 里要区分「工具自己抛了 TimeoutError」与
+    「timeout 处理器主动中止了它」：后者**可能已经产生了副作用**
+    （外部请求发出去了、只是没等到响应），执行守卫应把它归成
+    UNKNOWN 而不是普通 FAILED。
+
+    继承 `TimeoutError` 是为了让 retry 的 `retry_on=["TimeoutError"]`
+    能自然匹配到它（见 retry.py 的按类名 / MRO 匹配）。
+    """
+
+    def __init__(
+            self,
+            timeout_seconds: float,
+            message: str | None = None,
+    ) -> None:
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            message or f"工具执行超过 {timeout_seconds} 秒"
+        )
+
+
 @dataclass(frozen=True)
 class ToolInvocation:
     """
@@ -145,8 +197,11 @@ class ToolInvocation:
     #: 但**不要改调用方放进去的键**：那些是环境，不是你的便签。
     #:
     #: 调用方会放的键（处理器可以读）：
-    #:     tool_call_id          本次调用的 id（模型给的）
-    #:     CALLER_CONTEXT_KEY    调用者身份快照，见 build_caller_context
+    #:     tool_call_id            本次调用的 id（模型给的）
+    #:     CALLER_CONTEXT_KEY      调用者身份快照，见 build_caller_context
+    #:     SESSION_CONTEXT_KEY     所属会话（可能为 None）
+    #:     RUN_CONTEXT_KEY         所属运行（可能为 None）
+    #:     TOOL_STARTED_CONTEXT_KEY 工具方法是否真的开始执行
     context: dict[str, Any] = field(default_factory=dict)
 
 

@@ -206,6 +206,7 @@ class FakeDefinitionRepository:
 
     async def list_paged(
             self, *, keyword=None, source_type=None,
+            source_ref=None,
             source_state=None, classification_code=None,
             offset=0, limit=20,
     ):
@@ -216,6 +217,11 @@ class FakeDefinitionRepository:
                 r for r in rows
                 if keyword.lower() in r.tool_key.lower()
                 or keyword.lower() in r.name.lower()
+            ]
+
+        if source_ref is not None:
+            rows = [
+                r for r in rows if r.source_ref == source_ref
             ]
 
         if source_state is not None:
@@ -447,6 +453,10 @@ class FakeCapabilityRepository:
             1 for ids in self.links.values()
             if wanted & set(ids)
         )
+
+    async def count_skill_links(self, capability_ids):
+        # 本冒烟不建 Skill 绑定；契约新增的这条反查返回 0。
+        return 0
 
 
 # ============================================================
@@ -1228,9 +1238,22 @@ async def main() -> int:
         bool(composite),
     )
     check(
-        "组合工具走的是 TOOL_SOURCE_REF 模块级变量",
+        "组合工具的 source_ref 由模块路径推导；显式 TOOL_SOURCE_REF 优先",
         all(
-            m.source_ref == "agent.platform" for m in composite
+            (
+                m.source_ref == "agent.platform"
+                if m.entrypoint.startswith(
+                    "app.agent.tools.catalog_tool"
+                )
+                else (
+                    m.source_ref == "web"
+                    if m.entrypoint.startswith(
+                        "app.agent.tools.web_tool"
+                    )
+                    else m.source_ref == "agent"
+                )
+            )
+            for m in composite
         ),
     )
     check(
@@ -1242,9 +1265,16 @@ async def main() -> int:
             {m.tool_key for m in composite}
         ),
     )
+    # 全局清单现在可能包含 MCP 来源（mcp.yaml 存在时）。本地工具仍
+    # 必须都是 local_method，外部工具必须标成 mcp —— 判据是 entrypoint
+    # 前缀，而不是「清单里只有一种来源」那个已经过期的假设。
     check(
-        "组合工具与 @tool 同属 local_method",
-        len({m.source_type for m in everything}) == 1,
+        "代码里的工具是 local_method；外部来源标成 mcp",
+        all(
+            m.source_type.value
+            == ("mcp" if m.entrypoint.startswith("mcp:") else "local_method")
+            for m in everything
+        ),
     )
 
     # --------------------------------------------------------

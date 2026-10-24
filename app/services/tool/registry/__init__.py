@@ -22,6 +22,7 @@ import 链上少拖进 langchain 与 schema 生成。
 from .decorator import ToolDescriptor, tool
 from .discoverer import ToolDiscoverer
 from .docstring import parse_docstring, resolve_returns
+from .mcp_scanner import MCPToolScanner
 from .processor_registry import (
     PROCESSOR_PACKAGES,
     ToolProcessorRegistry,
@@ -39,10 +40,14 @@ from .scanner import (
     ToolScanner,
 )
 from .schema import (
+    InjectedArg,
     extract_parameter_descriptions,
+    inject_tool_args,
+    injected_args,
     output_description,
     output_schema_of,
     resolve_request_model,
+    strip_injected_args,
     synthesize_schema,
 )
 from .selection import select_specs, tool_key_of, wire_name
@@ -51,7 +56,9 @@ from .spec import ToolManifestData, ToolSpec
 __all__ = [
     "PROCESSOR_PACKAGES",
     "TOOL_SOURCE_PACKAGES",
+    "InjectedArg",
     "LangchainToolScanner",
+    "MCPToolScanner",
     "ServiceMethodScanner",
     "ToolDescriptor",
     "ToolDiscoverer",
@@ -63,6 +70,8 @@ __all__ = [
     "extract_parameter_descriptions",
     "get_processor_registry",
     "get_tool_registry",
+    "inject_tool_args",
+    "injected_args",
     "iter_package_modules",
     "output_description",
     "output_schema_of",
@@ -70,6 +79,7 @@ __all__ = [
     "resolve_request_model",
     "resolve_returns",
     "select_specs",
+    "strip_injected_args",
     "synthesize_schema",
     "tool",
     "tool_key_of",

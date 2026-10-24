@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Awaitable, Callable
 from typing import Final
 
@@ -57,7 +58,9 @@ __all__ = [
 
 #: 队列容量（**在等**的信封数）。满了就拒绝并明确告知，而不是无限
 #: 堆积把内存吃光。在跑的那些不算在里面 —— 见 DEFAULT_MAX_CONCURRENCY。
-DEFAULT_QUEUE_SIZE: Final[int] = 1024
+DEFAULT_QUEUE_SIZE: Final[int] = int(
+    os.environ.get("GRAPH_DISPATCHER_QUEUE_SIZE", "4096")
+)
 
 #: 同时**在跑**的图数量上限。超出的留在队列里等，不拒绝。
 #:
@@ -72,7 +75,15 @@ DEFAULT_QUEUE_SIZE: Final[int] = 1024
 #: 它的作用是让若干个 run **交替推进**：一个在算向量时，另一个正好在
 #: 等 Milvus 写入 / 等模型调用，把空隙填上。调到接近核数只会让每个
 #: run 的延迟都变差。
-DEFAULT_MAX_CONCURRENCY: Final[int] = 32
+#:
+#: 默认 768。Windows 上 `select()` 有 512 socket 上限，真实压测时用
+#: GRAPH_DISPATCHER_MAX_CONCURRENCY 压到 128 留余量；Linux 上可以
+#: 提到 700+（见 scripts/run_server_stress_linux.sh）。
+#: 文档流水线的 embedding 是本地 CPU 前向，和 Agent 对话共用这个
+#: dispatcher；跑重文档管线时可以临时调回较小值。
+DEFAULT_MAX_CONCURRENCY: Final[int] = int(
+    os.environ.get("GRAPH_DISPATCHER_MAX_CONCURRENCY", "768")
+)
 
 _Handler = Callable[[DispatchEnvelope], Awaitable[None]]
 

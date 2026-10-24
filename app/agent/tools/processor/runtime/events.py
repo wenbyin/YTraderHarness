@@ -136,7 +136,7 @@ class ToolEventBus:
     #:
     #: 100 是个折中：一次突发里足够装下几十个工具的起止事件，
     #: 又不至于让一个卡住的订阅者攒下几百 MB。
-    DEFAULT_QUEUE_SIZE = 100
+    DEFAULT_QUEUE_SIZE = 512
 
     def __init__(self, *, queue_size: int | None = None) -> None:
 

@@ -1,24 +1,31 @@
 """
 Service contract for ToolExecution.
 
-一次工具调用的账本。「先查后执行」这件事的**判定**在这里，
-判定所依据的那份集合在 domain/schemas/enum.py。
+执行守卫的判定全部在这里：给定一次调用、维度配置与已有记录，
+回答「执行 / 拦截 / 回放」。调用方（AROUND 拦截器）只负责把
+身份与参数递进来、按结果驱动工具、最后 settle。
 
 为什么调用方递的是 `arguments` 而不是 `param_hash`
 -----------------------------------------------
-判重键是"这次调用是不是同一件事"的定义，**属于本服务**。让调用方
-自己算摘要，等于把定义复制到每一个调用点 —— 而它错了不会报错，
-只会静静地每次都判成"新调用"，也就是这张表完全失效。
+判重键 / INVOKE 维度是"这次调用是不是同一件事"的定义，**属于本
+服务**。让调用方自己算摘要，等于把定义复制到每一个调用点 ——
+而它错了不会报错，只会静静地每次都判成"新调用"，也就是守卫完全
+失效。
 
 事务边界
 --------
 由调用方决定，本服务内部不 commit / rollback（与其余服务同一条）。
+
+⚠️ `reserve` 必须在**一个事务**里完成 lock -> 读 -> 写
+-----------------------------------------------------
+`factory.scope(ToolExecutionService, begin=True)` 就是这个事务。
+把读和写拆到两个 scope 里，并发窗口会重新打开 —— 症状是
+「两个相同调用都执行了」，没有任何报错。
 """
 
 from __future__ import annotations
 
 from abc import abstractmethod
-from collections.abc import Mapping
 from typing import Any
 from uuid import UUID
 
@@ -26,6 +33,10 @@ from app.common.service.base import BaseService
 
 from ..domain.entities import ToolExecution
 from ..domain.schemas.enum import ToolExecutionStatus
+from ..domain.schemas.execution import (
+    ExecutionGuardRequest,
+    ExecutionReservation,
+)
 
 __all__ = ["ToolExecutionService"]
 
@@ -33,55 +44,30 @@ __all__ = ["ToolExecutionService"]
 class ToolExecutionService(BaseService):
 
     # ========================================================
-    # 抢占
+    # 预占
     # ========================================================
 
     @abstractmethod
-    async def claim(
+    async def reserve(
             self,
-            *,
-            session_id: UUID,
-            run_id: UUID,
-            tool_key: str,
-            arguments: Mapping[str, Any],
-    ) -> ToolExecution | None:
+            request: ExecutionGuardRequest,
+    ) -> ExecutionReservation:
         """
-        原子抢占这个键。返回 None = **没抢到，不许执行**。
+        原子地判定并预占一次调用。
 
-        调用方的用法是：`claim` 返回 None 就**放弃执行**，并用
-        `find` 取回那一行以便说清"为什么不执行"。两件事分开是因为
-        **判定只能在 claim 里做**（它才有原子性），而 find 只负责
-        措辞。
+        返回：
 
-        ⚠️ 不要把这里写成"先 find 再 claim"
-        ----------------------------------
-        `find` 的返回值**不能**用来决定要不要执行 —— 那样两个并发
-        分支（本图是 Send 扇出，同一轮模型可以发出两个相同调用）
-        会都读到"没有记录"，于是一个副作用执行两遍。
+            EXECUTE  attempt 非空。调用方**必须**在工具跑完（或中断 /
+                     取消 / 拒绝）后调 `settle`。
+            BLOCK    工具不执行，reason 说明原因。
+            REPLAY   同一次工具调用已经成功过，attempt.result 是当时
+                     的结果；调用方直接回放，不再执行。
 
-        ⚠️ `arguments` 是**模型给的原始参数**，见 _execution.param_hash_of。
-        """
-
-        raise NotImplementedError
-
-    # ========================================================
-    # 读
-    # ========================================================
-
-    @abstractmethod
-    async def find(
-            self,
-            *,
-            session_id: UUID,
-            run_id: UUID,
-            tool_key: str,
-            arguments: Mapping[str, Any],
-    ) -> ToolExecution | None:
-        """
-        取这个键上的那一行，没有就 None。
-
-        用途只有两个：拒绝时写清"它现在是什么状态"、以及排查。
-        **不参与判定**（见 claim 的说明）。
+        ⚠️ 并发安全
+        ----------
+        本方法内部先拿按 `match_key` 的 advisory lock，再读计数并写
+        记录。调用方**不要**在它外面再做"先查后执行" —— 那条路的
+        并发窗口正是本方法要关掉的东西。
         """
 
         raise NotImplementedError
@@ -96,18 +82,22 @@ class ToolExecutionService(BaseService):
             execution_id: UUID,
             *,
             status: ToolExecutionStatus,
+            counted: bool,
             result: Any = None,
             error: dict[str, Any] | None = None,
             error_exc: BaseException | None = None,
     ) -> ToolExecution:
         """
-        把一行推进到某个状态。
+        把一条预占记录推进到终态。
 
-        ⚠️ 只允许推进到终态或 `RUNNING`，**不接受 PENDING**
-        ------------------------------------------------
-        PENDING 是"刚抢到、还没跑"，它是 claim 的产物。允许 settle 到
-        PENDING 等于开一条把"正在跑的记录"退回起点的路，而那条路一旦
-        被走到，别的分支就会以为"没人持有"从而抢走执行权。
+        ⚠️ 只允许推进到终态，**不接受 PENDING**
+        -------------------------------------
+        PENDING 是 reserve 的产物。允许 settle 到 PENDING 等于开一条
+        把"正在跑的记录"退回起点的路，而那条路一旦被走到，守卫的
+        重放/恢复判定就会以为「还没开始」。
+
+        `counted` 在这一步修正：拒绝 / 中断 / 取消 / 缓存命中传 False，
+        真正执行过的传 True。
 
         error 与 error_exc 二选一
         ------------------------

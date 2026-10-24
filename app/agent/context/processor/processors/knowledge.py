@@ -80,6 +80,8 @@ class RetrievalProcessor(ContextProcessor):
             text=text,
             source_ids=source_ids,
             token_estimate=counter.count_text(text),
+            # 检索命中的正文来自文档 / 外部知识库，一律按引用数据定界。
+            untrusted=True,
         )
 
         return context

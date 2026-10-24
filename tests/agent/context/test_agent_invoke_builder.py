@@ -2,7 +2,7 @@
 `agent_invoke` Builder 的端到端行为（规格 §四、§九、§十九、§二十）。
 
 跑的是**生产路径上那一个实现**（反射发现的那个），因此这里验证的是
-真实装配：`create_context_builder(AGENT_INVOKE)` 拿到它、11 个阶段方法
+真实装配：`create_context_builder(AGENT_INVOKE)` 拿到它、13 个阶段方法
 委托给流水线、策略从 resolver 出来、快照落进请求 metadata。
 """
 
@@ -22,7 +22,7 @@ from app.agent.context.processor.errors import ContextStateError
 from app.agent.context.processor.pipeline import PIPELINE_STAGE_ORDER
 from app.agent.context.registry import create_context_builder
 from app.agent.model import ModelRole
-from app.common.context import ContextBuilderType
+from app.common.context import ContextBuilderType, StageId
 
 from context_fakes import (
     FakeMemoryRetrieval,
@@ -81,14 +81,14 @@ def test_builder_is_discovered_by_the_registry() -> None:
 
 
 def test_builder_declares_every_stage_and_two_required() -> None:
-    """声明参与全部 11 个阶段，其中入口与出口是 required。"""
+    """声明参与全部 13 个阶段，其中入口与出口是 required。"""
 
     builder = AgentInvokeProcessorContextBuilder()
 
     assert builder.enabled_stages == frozenset(PIPELINE_STAGE_ORDER)
     assert builder.required_stages == frozenset({
-        PIPELINE_STAGE_ORDER[0],   # context_resolver（入口）
-        PIPELINE_STAGE_ORDER[7],   # prompt_assembler（出口）
+        StageId.CONTEXT_RESOLVER,   # 入口
+        StageId.PROMPT_ASSEMBLER,   # 出口
     })
 
 
@@ -149,7 +149,7 @@ async def test_build_is_callable_through_the_base_contract() -> None:
 
 
 async def test_snapshot_reports_every_processor() -> None:
-    """快照里 11 个 Processor 各有状态（规格 §廿六）。"""
+    """快照里每个阶段都有 Processor 状态（规格 §廿六）。"""
 
     result = await AgentInvokeProcessorContextBuilder().build_with_result(
         _request(_state())
@@ -429,3 +429,56 @@ async def test_build_with_result_reports_processor_outcomes(
     # 出现多次 —— 快照的 `memory_ids` 正是靠这个名字把它们收在一起的。
     assert result.snapshot.injected_sections.count("memory") >= 1
     assert result.as_metadata()["context_hash"] == result.context_hash
+
+
+@pytest.mark.asyncio
+async def test_trace_stage_spans_cover_real_stages() -> None:
+    """
+    只有真正执行的 stage 才发 Span；父子关系指向 context.build。
+    """
+
+    from app.agent.context.trace import ContextTrace
+    from app.common.event import TraceEmitter
+
+    raw: list[dict] = []
+
+    emitter = TraceEmitter(
+        trace_id="trace-1",
+        run_id="run-1",
+        thread_id="session-1",
+        writer=raw.append,
+    )
+
+    builder = create_context_builder(ContextBuilderType.AGENT_INVOKE)
+
+    request = _request(
+        _state(),
+        trace=ContextTrace(emitter=emitter, parent_span_id="build-span"),
+    )
+
+    await builder.build(request)
+
+    started = {
+        item["event_type"]
+        for item in raw
+        if item["event_type"].endswith(".started")
+    }
+
+    assert "context.prompt_assemble.started" in started
+    assert all(
+        item["parent_span_id"] == "build-span"
+        for item in raw
+    )
+
+    # 有 started 就一定有同 span_id 的 completed。
+    completed_spans = {
+        item["span_id"]
+        for item in raw
+        if item["event_type"].endswith(".completed")
+    }
+    started_spans = {
+        item["span_id"]
+        for item in raw
+        if item["event_type"].endswith(".started")
+    }
+    assert started_spans <= completed_spans

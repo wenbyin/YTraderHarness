@@ -4,17 +4,26 @@
 拓扑
 ----
     START -> builder
-    builder --(execution_plan == plan)--> planner -> agent
-    builder --(其余，含降级 / other)-----> agent
-    agent   --(有 tool_calls)-----------> tools -> agent     循环
-    agent   --(没有)--------------------> END
+    builder --(合成 enter_plan_mode)--> tools
+    builder --(plan 且没有任务 / 任务全完成)--> planner
+    planner --(默认)-------------------------> task_listener -> agent
+    planner --(STOP_AFTER_PLANNER=1)---------> END（只出计划，开发期）
+    builder --(其余，含降级 / off)------------> agent
+    agent   --(有 tool_calls)--> tools
+    tools   --(Command.goto, 工具自己决定)--> planner | agent | subagent_dispatch
+    agent   --(没有 tool_calls 且有任务)--> task_listener
+    agent   --(没有 tool_calls 且无任务)--> END
+    subagent_dispatch --(Send ×N, 预 claim)--> subagent_worker ×N
+    subagent_worker   --(join)--------------> subagent_dispatch   # 下一波
+    subagent_dispatch --(没有 ready task)----> task_listener       # 收尾
 
 ⚠️ builder 的分支列表与 route_after_builder 的返回值必须一致
 ----------------------------------------------------------
 写漏一个，LangGraph 直到**运行到那条边**才报 `Unknown branch`（装配期
-看不出来）。当前是 [AGENT_NODE, PLANNER_NODE] —— 注意 `direct` 与
-`react` 都回 AGENT_NODE，所以列表里**没有**这两个名字：分支集合是"可能
-走到的节点"，不是"可能返回的值"。理由见 routing.route_after_builder。
+看不出来）。当前是 [AGENT_NODE, PLANNER_NODE, TOOLS_NODE] ——
+注意 `react` 与 `other` 都回 AGENT_NODE，所以列表里**没有**这两个
+名字：分支集合是"可能走到的节点"，不是"可能返回的值"。理由见
+routing.route_after_builder。
 
 装配是**显式**写的，不遍历 `catalog.EDGES`
 ------------------------------------------
@@ -46,15 +55,23 @@ from .catalog import (
     AGENT_NODE,
     NODE_SPECS,
     PLANNER_NODE,
+    SUBAGENT_DISPATCH_NODE,
+    SUBAGENT_WORKER_NODE,
+    TASK_LISTENER_NODE,
 )
 from .context import ReactContext
-from .planner_node import planner_node
 from .routing import (
     TOOLS_NODE,
     route_after_agent,
     route_after_builder,
+    route_after_planner,
 )
+from app.agent.graph.planner.graph import build_planner_graph
+from app.agent.graph.subagent.graph import build_subagent_graph
+
 from .state import ReactState
+from .subagent_dispatch_node import subagent_dispatch_node
+from .task_listener_node import task_listener_node
 from .tools import tools_node
 
 __all__ = ["NODE_FUNCTIONS", "build_react_graph"]
@@ -68,9 +85,20 @@ __all__ = ["NODE_FUNCTIONS", "build_react_graph"]
 NODE_FUNCTIONS: dict[str, Any] = {
     AGENT_BUILDER_NODE: agent_builder_node,
     AGENT_NODE: agent_node,
-    PLANNER_NODE: planner_node,
+    TASK_LISTENER_NODE: task_listener_node,
     TOOLS_NODE: tools_node,
+    SUBAGENT_DISPATCH_NODE: subagent_dispatch_node,
 }
+
+#: planner / subagent worker **不是**普通节点函数，而是编译进父图的子图。
+#:
+#: `NODE_FUNCTIONS["planner"]` 保留为**冒烟/测试替换点**：存在时按普通
+#: 节点使用（见 agent_smoke.py 的 stub），不存在时挂编译子图。生产路径
+#: 不往里写，于是始终走子图。
+#:
+#: 这样 interrupt 由父图的 Pregel 循环管理（冒泡 / resume），子图的
+#: custom 事件也会进父运行的事件流。代价是子图输出会按同名 channel
+#: 合并 —— 已用 `SubAgentOutput`（空 schema）隔掉。
 
 
 def build_react_graph() -> StateGraph:
@@ -103,22 +131,61 @@ def build_react_graph() -> StateGraph:
     )
 
     for spec in NODE_SPECS:
+
+        if spec.node_id in {SUBAGENT_WORKER_NODE, PLANNER_NODE}:
+            continue
+
         graph.add_node(spec.node_id, NODE_FUNCTIONS[spec.node_id])
+
+    # planner：编译好的子图作为节点。独立 PlannerState / transcript /
+    # checkpoint namespace；只把 plan / tasks / current_task / team_decision
+    # 合并回父图。
+    #
+    # ⚠️ 这里 compile() 不带 checkpointer：**子图会继承父图的**（实测，
+    # 无 checkpointer 的子图作为节点时 interrupt / resume 仍按父 thread
+    # 的嵌套 namespace 工作）。父图由组合根按生产/冒烟选择 saver。
+    graph.add_node(
+        PLANNER_NODE,
+        NODE_FUNCTIONS.get(PLANNER_NODE) or build_planner_graph().compile(),
+    )
+
+    # worker：同上。
+    graph.add_node(
+        SUBAGENT_WORKER_NODE,
+        build_subagent_graph().compile(),
+    )
 
     # 入口是 builder，不是 agent：先理解输入，再决定怎么执行。
     graph.add_edge(START, AGENT_BUILDER_NODE)
 
-    # 条件边一：Agent Builder 判出的执行方案决定去哪。
-    # 分支列表是**可能走到的节点**（不是可能返回的值）：direct 与 react
-    # 都回 AGENT_NODE，所以这里看不到它们。
+    # 条件边一：控制调用 / plan_status + 计划任务状态决定去哪。
+    #
+    # 分支列表是**可能走到的节点**（不是可能返回的值）：react / other
+    # 都回 AGENT_NODE，所以这里看不到它们。分类器的
+    # execution_plan 只决定"要不要合成 enter_plan_mode 调用"，真正的
+    # 模式切换在 tools 节点（见 routing.route_after_builder）。
     graph.add_conditional_edges(
         AGENT_BUILDER_NODE,
         route_after_builder,
-        [AGENT_NODE, PLANNER_NODE],
+        [AGENT_NODE, PLANNER_NODE, TOOLS_NODE],
     )
 
-    # planner 当前是占位（什么都不做），放行到主循环。
-    graph.add_edge(PLANNER_NODE, AGENT_NODE)
+    # planner 之后：默认进 task_listener（领取一个 ready task，再进主
+    # 循环）。开发期可以用开关停在 planner 之后，只检查计划：
+    #
+    #     YTRADER_PLAN_STOP_AFTER_PLANNER=1
+    #
+    # ⚠️ 默认**不能**是 END：planner 已经不发布任务板，停在 END 会得到
+    # 一次「completed 但没有任何 assistant 回复」的运行。
+    #
+    # ⚠️ 条件边的分支列表必须包含两个目标；漏写会在运行期报
+    # `Unknown branch`（装配期看不出来）。
+    graph.add_conditional_edges(
+        PLANNER_NODE,
+        route_after_planner,
+        [TASK_LISTENER_NODE, END],
+    )
+    graph.add_edge(TASK_LISTENER_NODE, AGENT_NODE)
 
     # 条件边二：模型自己决定要不要调工具。
     #
@@ -134,16 +201,29 @@ def build_react_graph() -> StateGraph:
     graph.add_conditional_edges(
         AGENT_NODE,
         route_after_agent,
-        [TOOLS_NODE, END],
+        [TOOLS_NODE, TASK_LISTENER_NODE, END],
     )
 
-    # 回环：带着工具结果回到模型。上界由 recursion_limit 兜底。
+    # tools **没有静态出边**。
     #
-    # ⚠️ 扇出后这条边同时是**扇入点**：N 个分支的返回值经 messages 上的
-    # add_messages reducer 汇总进父状态，agent 在所有分支跑完之后只执行
-    # 一次、看得到全部 ToolMessage（实测：顺序与 Send 顺序一致）。
-    # 这也是本图不需要 document 那种"路由屏障节点"的原因 —— 全图只有
-    # 一个扇出阶段。
-    graph.add_edge(TOOLS_NODE, AGENT_NODE)
+    # 下一跳由分支返回的 `Command.goto` 决定（LangGraph 的 handoff）：
+    # **任何**工具都可以在 Tool 里写 `Command(goto=...)`；没返回 Command
+    # 的普通工具由 tools 节点补 `Command(goto="agent")`。每批调用只有
+    # 第一个调用（控制器分支）返回 Command，其余分支只写消息 / 状态 ——
+    # 否则同一 super-step 会出现多个 goto，多个节点都被调度。
+    #
+    # ⚠️ 扇入仍然成立：N 个分支的返回值经 messages 上的 add_messages
+    # reducer 汇总进父状态，控制器 Command 里指定的下一跳在所有分支
+    # 跑完之后才执行（实测：顺序与 Send 顺序一致）。
+
+    # 子代理扇出的 join：所有 worker 分支结束后回到 dispatch 重新调度
+    # 下一波（实测：多个 Send 分支共用一个静态出边时，目标节点在**全部**
+    # 分支结束后执行一次，不是每分支一次）。
+    graph.add_edge(SUBAGENT_WORKER_NODE, SUBAGENT_DISPATCH_NODE)
+
+    # subagent_dispatch 没有静态出边：
+    #   有 ready task -> Command(goto=[Send("subagent_worker", ...)])
+    #   没有          -> Command(goto="task_listener")
+    # 与 tools 的 handoff 约定一致。
 
     return graph

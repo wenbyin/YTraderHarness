@@ -516,6 +516,46 @@ async def main() -> int:
             )
             check("不存在 -> 404", resched_missing.status_code == 404)
 
+            # =================================================
+            section("POST /tasks/{task_id}/invoke（定时任务立即触发）")
+
+            invoked = await client.post(
+                f"/api/v1/tasks/{delayed_id}/invoke"
+            )
+
+            check("200", invoked.status_code == 200,
+                  f"实际 {invoked.status_code} {invoked.text[:200]}")
+
+            triggered = invoked.json()
+
+            check("execute_at 变成 null（不再等原定时间）",
+                  triggered.get("execute_at") is None,
+                  f"实际 {triggered.get('execute_at')!r}")
+            check("generation 再 +1（触发同样让旧定时失效）",
+                  triggered.get("generation") == 5,
+                  f"实际 {triggered.get('generation')}")
+            check("不新建任务、不改 attempt（同一轮执行）",
+                  triggered.get("attempt") == 0,
+                  f"实际 {triggered.get('attempt')}")
+
+            ran = await wait_for(delayed_id, TaskStatus.SUCCESS)
+            check("确实被执行了（不等原来那个小时）",
+                  ran is not None,
+                  f"实际 {ran.status if ran else None}")
+
+            # 已终结的不许再触发：会产生第二次外部副作用
+            invoke_done = await client.post(
+                f"/api/v1/tasks/{delayed_id}/invoke"
+            )
+            check("触发一条已终结的是 409",
+                  invoke_done.status_code == 409,
+                  f"实际 {invoke_done.status_code}")
+
+            invoke_missing = await client.post(
+                f"/api/v1/tasks/{uuid4()}/invoke"
+            )
+            check("不存在 -> 404", invoke_missing.status_code == 404)
+
     finally:
 
         await relay.aclose()

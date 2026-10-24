@@ -29,7 +29,7 @@ ModelRegistry**。
     pipeline.py      执行引擎（§十）
     registry.py      反射发现
     errors.py        异常层级（复用 ApplicationError，§二十八）
-    processors/      11 个具体实现
+    processors/      13 个具体实现
 
 ⚠️ 本包必须有 __init__.py
 ------------------------

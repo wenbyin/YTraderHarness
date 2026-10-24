@@ -394,10 +394,10 @@ def test_validation() -> None:
     )
 
     # ⚠️ 曾经有一条"同一个键不能有两种 hook"的校验，已删 ——
-    # cache_interceptor 正是靠 BEFORE + AFTER 两条记录工作的，
-    # 那条规则会误杀它。这里留一条断言防止它被重新加回来。
+    # 它会误杀那些把同一实现挂到多个调用点的配置。cache 现在只挂
+    # AROUND，但这条规则本身不能回来。这里留一条断言防止它被重新加回。
     check(
-        "同一个键可以占多个 hook 位置（cache 就是这么配的）",
+        "同一个键可以占多个 hook 位置",
         len(build([
             Row("a_around", ProcessorHook.BEFORE, sequence=1),
             Row("a_around", ProcessorHook.AFTER, sequence=2),

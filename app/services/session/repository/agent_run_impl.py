@@ -22,10 +22,19 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from sqlalchemy import func, select, update
+
 from ..domain.entities import AgentRun
 from ..domain.schemas.enum import RunStatus
 from ..models.sqlalchemy.agent_run import AgentRun as AgentRunModel
 from .agent_run import AgentRunRepository
+
+#: 还没结束的运行状态。用枚举成员而不是字面量拼 —— 加状态时这里会一起被看到。
+_UNFINISHED_STATUSES: tuple[str, ...] = (
+    RunStatus.QUEUED.value,
+    RunStatus.RUNNING.value,
+    RunStatus.WAITING_INPUT.value,
+)
 
 
 class AgentRunRepositoryImpl(AgentRunRepository):
@@ -62,6 +71,10 @@ class AgentRunRepositoryImpl(AgentRunRepository):
             # 症状是"运行行上永远看不到这次用了哪份职责"，而服务层明明设了。
             # 上面那段注释就是当年 caller_identity 漏掉这一跳留下的。
             duty_key=run.duty_key,
+            # 后加的列，同样的坑：漏了只会静默写 NULL，而 trace 的开关
+            # 恰恰就是"trace_id 是否为空"——漏写会让前端传了 trace_id
+            # 也采不到任何事件。
+            trace_id=run.trace_id,
             created_at=run.created_at,
             updated_at=run.updated_at,
         )
@@ -111,6 +124,56 @@ class AgentRunRepositoryImpl(AgentRunRepository):
         model.error_message = error_message
 
         await self._session.flush()
+
+    async def list_unfinished_for_session(
+            self,
+            session_id: UUID,
+    ) -> list[AgentRun]:
+        """
+        语义见契约。按 created_at 升序返回：删除逻辑会逐个处理，先来的
+        先结束，日志读起来与发生顺序一致。
+        """
+
+        result = await self._session.execute(
+            select(AgentRunModel)
+            .where(
+                AgentRunModel.session_id == session_id,
+                AgentRunModel.status.in_(_UNFINISHED_STATUSES),
+            )
+            .order_by(AgentRunModel.created_at.asc())
+        )
+
+        return [self._to_entity(model) for model in result.scalars()]
+
+    async def cancel_if_unfinished(
+            self,
+            run_id: UUID,
+    ) -> bool:
+        """
+        条件更新，语义见契约。
+
+        ⚠️ 条件里带状态，不能只按 run_id 改
+        ---------------------------------
+        调用方与服务层读到的状态之间有一段窗口；如果这里无脑写成
+        cancelled，可能把一条**刚刚跑完**的 completed 覆盖成 cancelled。
+        `WHERE status IN (未终态)` 让这种情况改到 0 行，调用方据此跳过。
+        """
+
+        result = await self._session.execute(
+            update(AgentRunModel)
+            .where(
+                AgentRunModel.run_id == run_id,
+                AgentRunModel.status.in_(_UNFINISHED_STATUSES),
+            )
+            .values(
+                status=RunStatus.CANCELLED.value,
+                error_type=None,
+                error_message=None,
+                updated_at=func.now(),
+            )
+        )
+
+        return result.rowcount == 1
 
     # ========================================================
     # internals

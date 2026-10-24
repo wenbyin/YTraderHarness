@@ -4,7 +4,8 @@ info:
   title: Async Task Management API
   version: 1.0.0
   description: |
-    Unified asynchronous task infrastructure: query, trace, cancel, retry.
+    Unified asynchronous task infrastructure: query, trace, cancel, retry,
+    invoke.
 
     Responsibilities:
       - Report what background tasks exist and what state they are in.
@@ -217,6 +218,49 @@ paths:
       responses:
         '200':
           description: The re-queued task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskDetail'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+
+  /tasks/{task_id}/invoke:
+    post:
+      tags:
+        - Tasks
+      summary: Trigger a delayed task now
+      operationId: invokeTask
+      description: |
+        Makes a **scheduled task run now** instead of at its `execute_at`.
+
+        This is the "trigger from the console" button: the task already
+        exists — business code submitted it with a future execution time —
+        and this only moves that moment to now and dispatches it. It does
+        **not** create a task, and it does not touch `attempt`: the task
+        still belongs to the same run cycle.
+
+        Execution remains asynchronous. The call returns as soon as the
+        task is made eligible (`execute_at` becomes null); poll
+        `GET /tasks/{task_id}` for the outcome.
+
+        Refused (409) while the task is running (the executor is about to
+        write its result back) and once it has reached a terminal state
+        (triggering again would turn "finished" into a second external
+        side effect). Use `/retry` to re-run a failed/cancelled task;
+        successful work needs a new task.
+
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+
+      responses:
+        '200':
+          description: The task, now eligible to run immediately
           content:
             application/json:
               schema:
@@ -531,6 +575,8 @@ components:
 
     Conflict:
       description: >-
-        The task is queued or running (retry would race with the executor),
-        or it already succeeded (re-running it would produce a second
-        external side effect).
+        The task's current status does not allow the operation: it is
+        already running (the executor is about to write its result back),
+        it has reached a terminal state (moving or re-running it would
+        turn "finished" into "will run again"), or it already succeeded
+        (re-running it would produce a second external side effect).

@@ -12,7 +12,7 @@
 **没有第二个驱动**：`build()` 的循环、`StageResolution` 的边界校验、
 "必须有产出"的收尾检查全部沿用既有实现。本类只做三件事：
 
-    1. 把 11 个阶段方法**逐个**委托给流水线（薄薄一层，见下）
+    1. 把 13 个阶段方法**逐个**委托给流水线（薄薄一层，见下）
     2. 每阶段之后把工作集里的 draft 同步进既有的 `ContextBuildState.draft`
     3. 在最后一个阶段之后把快照写进 draft 的 metadata（规格 §十九/§二十七）
 
@@ -23,7 +23,7 @@
     声明参与的阶段**必须实现**对应的阶段方法（否则类定义期 TypeError）
 
 它是对的 —— "声明了就要实现"是这份契约的诚实性保证。逐个覆写让这条
-校验继续有效，也让"这张图会跑哪 11 个阶段"在类体里一眼看得见；而
+校验继续有效，也让"这张图会跑哪 13 个阶段"在类体里一眼看得见；而
 覆写 `_run_stage` 会绕过它（`_is_unimplemented` 判的是阶段方法本身）。
 
 每个方法都是一行委托 —— 它们**不是**重复逻辑，而是两套契约之间的桥。
@@ -55,7 +55,7 @@ from .contracts import ContextBuildState
 
 __all__ = ["AgentInvokeProcessorContextBuilder", "ProcessorContextBuilder"]
 
-#: 本实现声明参与的阶段：**全部** 11 个。
+#: 本实现声明参与的阶段：**全部** 13 个。
 #:
 #: 这不是"每个阶段都一定跑"——跑不跑由每个 Processor 的 `when` gate 决定
 #: （见 processor/processors/__init__.py 的那张表）。阶段参与是**静态**
@@ -216,12 +216,22 @@ class ProcessorContextBuilder(ABC):
 
         state.draft = replace(context.draft, metadata=metadata)
 
-    # ---- 11 个阶段方法（每个一行，见模块 docstring） ----------
+    # ---- 13 个阶段方法（每个一行，见模块 docstring） ----------
 
     async def _stage_context_resolver(
             self, state: ContextBuildState
     ) -> None:
         await self._delegate(StageId.CONTEXT_RESOLVER, state)
+
+    async def _stage_task_resolver(
+            self, state: ContextBuildState
+    ) -> None:
+        await self._delegate(StageId.TASK_RESOLVER, state)
+
+    async def _stage_skill_loader(
+            self, state: ContextBuildState
+    ) -> None:
+        await self._delegate(StageId.SKILL_LOADER, state)
 
     async def _stage_profile_loader(
             self, state: ContextBuildState
@@ -286,15 +296,16 @@ class AgentInvokeProcessorContextBuilder(
         create_context_builder(ContextBuilderType.AGENT_INVOKE)
             -> 本类的一个实例（零参构造）
 
-    它声明参与全部 11 个阶段、其中两个 required；跑不跑由 Processor 的
+    它声明参与全部 13 个阶段、其中两个 required；跑不跑由 Processor 的
     gate 与 Context Policy 决定（见 processor/processors/__init__.py）。
     """
 
-    version = "1.0.0"
+    version = "1.1.0"
     display_name = "主 Agent 上下文构建（Processor 流水线）"
     description = (
-        "按固定 11 阶段流水线构建主 Agent 的 LLM 上下文："
-        "画像 / 摘要 / 历史 / 记忆 / 检索 / 工具 / 组装 / 预算 / 压缩 / 校验。"
+        "按固定 13 阶段流水线构建主 Agent 的 LLM 上下文："
+        "任务 / 技能 / 画像 / 摘要 / 历史 / 记忆 / 检索 / 工具 / "
+        "组装 / 预算 / 压缩 / 校验。"
     )
 
     enabled_stages: ClassVar[frozenset[StageId]] = _ALL_STAGES

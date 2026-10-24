@@ -1,0 +1,263 @@
+# ============================================================
+# 这是模板，不是可用配置。用法：
+#
+#     cp app/config/casdoor.yaml.template app/config/casdoor.yaml
+#
+# 然后 export 下面这些环境变量（不要把明文写进文件）：
+#
+#     CASDOOR_CLIENT_ID
+#     CASDOOR_CLIENT_SECRET
+#     CASDOOR_CERTIFICATE_FILE
+#
+# 为什么 casdoor.yaml 本身不在仓库里：它含明文凭据，已被 .gitignore
+# 按**路径**排除。本文件是它的镜像，client_id / client_secret 一律
+# 只留 ${VAR} 名，**不写默认值** —— 漏配时启动期就会报错，而不是
+# 悄悄用一份模板里的假凭据跑起来。
+# ============================================================
+
+# Casdoor 鉴权配置。
+#
+# 本文件**不是数据源** —— 它没有顶层 `type` 键，数据源加载器会跳过它
+# （见 app/infra/datasource/loader.py::load_all）。放在 app/config/ 是
+# 刻意的：这里才是"部署时要改的东西"该待的地方。
+#
+# 读取它的是 app/common/auth/config.py（`${VAR}` 展开 + pydantic 校验），
+# 装配出 app/common/auth/component.py 里那个鉴权组件。
+#
+# ============================================================
+# 生效方式：所有 /api/v1 接口
+# ============================================================
+#
+# app/api/v1/router.py 把 protected_router 挂了 `Depends(current_user)`，
+# 凡是走它注册的接口，都会先校验：
+#
+#     1. 带没带 token（Authorization: Bearer <token>）
+#     2. 签名 / 有效期 / audience 对不对
+#     3. 有没有 required_groups 里要求的群组
+#
+# 结果分别是 401 / 401 / 403。/docs 与 /openapi.json 不在 /api/v1 下，
+# 保持开放（**这是一个有意识的决定**：它意味着接口清单对匿名可见）。
+#
+# ============================================================
+# 凭据从哪拿（Casdoor 控制台 http://localhost:8088）
+# ============================================================
+#
+#   client_id / client_secret
+#       Applications -> 选中你的应用 -> 页面上直接有
+#
+#   certificate
+#       Certs -> 选中该应用绑定的证书（默认 cert-built-in）-> 复制 PEM。
+#       ⚠️ 必须是**完整的 X.509 证书**（含 BEGIN/END CERTIFICATE），
+#          不是裸公钥 —— 验签时按证书解析。
+#
+#   org_name / application_name
+#       Organizations 页的名字 / Applications 页的名字。
+#       **填错不会报错，只会让每个请求都 401**（audience 对不上）。
+#
+# 密钥一律走环境变量，不进版本库：
+#
+#     CASDOOR_CLIENT_ID / CASDOOR_CLIENT_SECRET / CASDOOR_CERTIFICATE_FILE
+#
+# ============================================================
+# ⚠️ 配置错 = 整个后端不可用
+# ============================================================
+#
+# 校验是**启动期失败**的（app/main.py 的 lifespan 里提前构造组件）：
+# 宁可起不来，也不要"起得来但每个请求都 401"—— 后者会被当成客户端
+# 或 Casdoor 的问题去查，离真正的原因很远。
+#
+# 所以：证书没配、endpoint 写错、application_name 填错，都会在启动时
+# 就报出来，而不是等到第一个请求。
+
+name: casdoor
+
+# 总开关。
+#
+# false = 完全跳过校验，current_user 返回一个合成用户
+#         （groups 即 required_groups），供本地开发/跑测试用。
+#
+# ⚠️ 生产**打不开**这个口子：APP_ENV=prod 且 enabled: false 时
+#    app/main.py 会直接拒绝启动。理由是这个开关一旦在生产被误开，
+#    所有接口就是裸奔，而且没有任何运行期迹象 —— 它必须响亮地失败。
+enabled: true
+
+# Casdoor 服务地址。后端**拿 token 换用户信息**走这里。
+endpoint: "${CASDOOR_ENDPOINT:-http://localhost:8088}"
+
+# 前端/浏览器看到的地址，用于拼授权链接（/auth/login 要跳这里）。
+#
+# 留空 = 与 endpoint 相同。分离部署时（后端在内网、浏览器走公网域名）
+# 才需要显式给：给错了的症状是浏览器跳到后端内网地址，打不开。
+front_endpoint: "${CASDOOR_FRONT_ENDPOINT:-http://localhost:8088}"
+
+# ------------------------------------------------------------
+# 应用凭据
+# ------------------------------------------------------------
+
+client_id: "${CASDOOR_CLIENT_ID}"
+
+client_secret: "${CASDOOR_CLIENT_SECRET}"
+
+# 组织名。进 JWT 的 issuer，也用于组织/群组名的归属判断。
+org_name: "${CASDOOR_ORG_NAME:-YTraderHarness}"
+
+# 应用名。**它同时是 JWT 的 audience**（Casdoor 按应用签发 token），
+# 所以填错的表现是"验签全过、audience 校验全挂"。
+application_name: "${CASDOOR_APPLICATION_NAME:-YTraderHarness}"
+
+# 前端回调地址 —— Casdoor 验完会把浏览器跳到这里，并带上 ?code=&state=。
+#
+# ⚠️ 同时要在 Casdoor 的该应用配置里登记为 Redirect URLs，否则
+#    Casdoor 会直接拒绝授权请求。
+#
+# 它由配置给出、**不接收调用方传入**：让请求方自己指定 redirect_uri
+# 就是开放重定向（攻击者可以把"code 换 token"的请求引到自己的站点）。
+redirect_uri: "${CASDOOR_REDIRECT_URI:-http://localhost:8000/user/callback}"
+
+# ------------------------------------------------------------
+# 验签证书（二选一，certificate 优先）
+# ------------------------------------------------------------
+#
+# 证书是**公开信息**，写这里不算泄密；但用文件/环境变量更省事 ——
+# PEM 是多行文本，塞进 yaml 的字符串里要自己处理换行。
+
+# 内联 PEM。从控制台粘过来时注意保持每行的缩进一致。
+certificate: "${CASDOOR_CERTIFICATE:-}"
+
+# PEM 文件路径（如 ./app/config/casdoor_cert.pem）。
+certificate_file: "${CASDOOR_CERTIFICATE_FILE:-./app/config/cert.pem}"
+
+# ------------------------------------------------------------
+# 群组校验 —— 本文件最要紧的一段
+# ------------------------------------------------------------
+
+# token 里哪个 claim 装群组。
+#
+# 默认 `groups`：Casdoor 的 JWT 会带上用户的群组，以及 roles /
+# permissions。但**这是本配置里最不确定的一项** —— 取决于你 Casdoor
+# 版本与应用上"Token fields"的配置，claim 名可能不是 `groups`。
+#
+# 真配错了不会静默：403 的服务端日志里会打出 token **实际含有**
+# 哪些 claim 名（只打名字、不打值），照着改这里即可，不用改代码。
+groups_claim: "${CASDOOR_GROUPS_CLAIM:-groups}"
+
+# token 里哪个 claim 装角色。
+#
+# 与 groups_claim 同一套形状容错（数组 / 裸字符串 / 对象数组），
+# 同样可配。
+#
+# ⚠️ 角色**不参与登录门槛**（那是上面 required_groups 的事）。它被带进
+# AuthenticatedUser 是为了**工具级**鉴权：挂在工具处理器链上的
+# checkauth 拦截器按"这个工具要求哪些角色"去判。所以这里配错的表现
+# 不是 403，而是"那个工具调不动了"。
+roles_claim: "${CASDOOR_ROLES_CLAIM:-roles}"
+
+# token 里哪个 claim 装**组织**（写进 agent_session.org_id 的那个）。
+#
+# 与上面两项不同的两点，都要知道：
+#
+#   1. **只认字符串**。groups / roles 有形状容错（数组 / 裸字符串 /
+#      对象数组），组织没有 —— 它是单值标识，遇到别的形状一律当"没有"。
+#      不做 str() 兜底：把一个字典转成字符串写进库，谁也认不出那是什么。
+#
+#   2. **取不到是允许的**（org_id 写 NULL），不像 required_groups 那样
+#      会 403。配错 claim 名的表现是"这一列恒为 NULL"—— 排查时看服务端
+#      日志里打出的 claim 名单（见 groups_claim 那条），或直接查库。
+org_claim: "${CASDOOR_ORG_CLAIM:-org}"
+
+# 必须命中其中之一才放行（any-of）。
+#
+# 值的形态做了容错，以下四种都认：
+#
+#     ["Y-Trader-User"]                   数组（正常形态）
+#     "Y-Trader-User"                     裸字符串
+#     [{"name": "Y-Trader-User"}]         对象数组
+#     "y-trader/Y-Trader-User"            owner 限定名，按 / 之后比对
+#
+# 为什么必须容错：Casdoor 在**只有一个元素**时会把数组退化成字符串
+# （casdoor#4622，2.183.0 才修），而"群组只有一个"恰恰是最常见的
+# 部署形态 —— 不兼容的话最该通过的那批人反而进不来。
+required_groups:
+  - "${CASDOOR_REQUIRED_GROUP:-Y-Trader-User}"
+
+required_roles:
+  - "${CASDOOR_REQUIRED_ROLE:-Y-Trader-User}"
+
+# ------------------------------------------------------------
+# 管理端端点要求的角色
+# ------------------------------------------------------------
+#
+# ⚠️ 与上面的 required_groups 分工不同，别混：
+#
+#     required_groups   登录门槛。不过就 403，**整棵树**都进不来
+#     admin_role        只在显式声明它的那几个端点上生效
+#                       （目前是 GET /users/search）
+#
+# 匹配语义与群组同一套：token 的 roles 里出现裸名，或用上面 org_name
+# 限定的 `YTraderHarness/Y-Trader-Admin` 形式，都算命中；**别的** owner
+# 下的同名角色不算 —— 所以这里配裸名是安全的，不会给"任何组织的
+# 同名角色"开口子。
+#
+# 配错的表现：那几个端点 403。服务端日志会把调用者**实际**持有的
+# 角色名打出来（与群组不匹配时那条日志同一形状），照着抄进本项即可。
+#
+# 空值会在启动期报错：空 admin_role 等于对所有人关门，而调用方只会
+# 看到 403 —— 那种"静默关门"必须响亮地失败。
+admin_role: "${CASDOOR_ADMIN_ROLE:-Y-Trader-Admin}"
+
+# ------------------------------------------------------------
+# 从 query string 取 token —— 唯一的例外，且限路径
+# ------------------------------------------------------------
+#
+# 浏览器的 EventSource **不能设置请求头**，而 SSE 端点
+# GET /api/v1/runs/{run_id}/events 正是用 EventSource 消费的。
+# 因此那个端点必须能从 query 里拿到 token：
+#
+#     GET /api/v1/runs/<id>/events?access_token=eyJhbGci...
+#
+# ⚠️ 但 query 里的 token 会进访问日志、代理日志、浏览器历史 ——
+#    所以**只在下面这些路径上接受**，其余接口一律只认请求头。
+#    这是全仓唯一一处例外，不要往这个列表里加新条目，除非同样
+#    被"浏览器发不了请求头"逼到墙角。
+query_token_param: "${CASDOOR_QUERY_TOKEN_PARAM:-access_token}"
+
+query_token_paths:
+  - "/api/v1/runs/*/events"
+
+# ------------------------------------------------------------
+# OAuth 登录流程
+# ------------------------------------------------------------
+
+# state 的有效期（秒）。state 是 HMAC 签名 + 自带过期时间的，
+# 不需要服务端存储。
+#
+# 它只在"跳去 Casdoor 又跳回来"这段时间里有效，给 10 分钟足够，
+# 也给不出更长的窗口 —— state 越短命越好。
+state_ttl_seconds: 600
+
+# 把 state 里的 nonce 同时写进这个 cookie，回调时要求两者一致。
+#
+# 为什么不能只签名就完事：签名只能证明"这个 state 是我签发的"，
+# 证明不了"发起登录的是同一个浏览器"。攻击者可以自己走一遍
+# /auth/login、拿到合法 state，再把自己那次回调的 URL 喂给受害者，
+# 让受害者在不知情的情况下登入攻击者的账号。cookie 把 state 和
+# 浏览器绑在一起，这条路才堵上。
+#
+# SameSite=Lax + HttpOnly；登录回调是顶层导航（GET），Lax 够用。
+state_cookie_name: "${CASDOOR_STATE_COOKIE:-y_trader_oauth_state}"
+
+# ------------------------------------------------------------
+# 出网
+# ------------------------------------------------------------
+
+# 校验 Casdoor 的 TLS 证书。
+# 本地 http://localhost:8088 用不上；生产是 https 且证书自签时，
+# 填 CA bundle 的路径（与 requests 的 verify 同语义）。
+verify_ssl: true
+
+# 调 Casdoor 的超时（秒）。
+#
+# ⚠️ 必须有：SDK 自己用的是 aiohttp 默认的 300 秒。Casdoor 挂掉时
+#    /auth/callback 会把请求处理器挂满五分钟，并一直占着连接。
+#    宁可 10 秒报错。
+request_timeout_seconds: 10

@@ -73,6 +73,13 @@ from .observer import (
 )
 from .provider import DeltaCallback, ModelClient
 from .redaction import redact_mapping
+from .trace import ModelTrace
+from app.common.event import (
+    EventType as TraceEventType,
+    SpanKind,
+    SpanLink,
+)
+from app.common.event.trace import LinkRelation
 from .types import (
     ModelAttempt,
     ModelCapabilities,
@@ -119,6 +126,17 @@ class _CallState:
     #: 消费端承诺过内容）。它是"还能不能重试 / 降级"的唯一判据 ——
     #: 见 _try_candidate 里的 commit 规则。
     deltas_emitted: int = 0
+
+    #: 本次调用的 trace 上下文（None = 未开启）。
+    trace: ModelTrace | None = None
+
+    #: 当前 attempt 的 Model Span（`TraceSpan` 句柄），成功 / 失败时收尾。
+    current_span: Any = None
+
+    #: 上一个失败 attempt 的 span_id / 关系，用于 retry_of / fallback_from
+    #: Link。只在同一个 _CallState 内有效（并发调用各有一份）。
+    last_failed_span_id: str | None = None
+    last_failed_relation: LinkRelation | None = None
 
     def record(self, attempt: ModelAttempt) -> None:
 
@@ -267,6 +285,7 @@ class ModelRuntime:
             required_capabilities: ModelCapabilities | None = None,
             policy: ModelRuntimePolicy | None = None,
             on_delta: DeltaCallback | None = None,
+            trace: ModelTrace | None = None,
     ) -> ModelResponse:
         """
         执行一次模型调用（内部可能包含多次 provider attempt）。
@@ -309,7 +328,10 @@ class ModelRuntime:
 
         active_policy = policy or self._profile.policy
 
-        state = _CallState(invocation_id=new_invocation_id())
+        state = _CallState(
+            invocation_id=new_invocation_id(),
+            trace=trace if trace is not None and trace.emitter.enabled else None,
+        )
 
         # 包一层只为了记住"已经发过增量了"（见 _delta_sink）——
         # 那个计数是 commit 规则的唯一依据，而 commit 规则又决定了
@@ -426,6 +448,34 @@ class ModelRuntime:
                 state.response = response
                 return response
 
+            # 这个候选放弃了。只有链上还有下一个时才叫"降级"。
+            if (
+                    state.trace is not None
+                    and state.last_failed_span_id is not None
+                    and index + 1 < len(chain)
+            ):
+                last_error = state.last_error
+                state.trace.emitter.instant(
+                    TraceEventType.MODEL_FALLBACK,
+                    span_kind=SpanKind.MODEL,
+                    span_name="model.invoke",
+                    span_id=state.last_failed_span_id,
+                    parent_span_id=state.trace.parent_span_id,
+                    payload={
+                        "failed_span_id": state.last_failed_span_id,
+                        "requested_model": definition.id,
+                        "fallback_model": chain[index + 1].id,
+                        "reason": (
+                            last_error.code
+                            if last_error is not None
+                            and last_error.code
+                            else type(last_error).__name__
+                            if last_error is not None
+                            else None
+                        ),
+                    },
+                )
+
         # 链走完 —— 记账的必须是**抛出去的那个**错误，而不是最后一次
         # attempt 的错误：观测要能对上调用方拿到的东西（"exhausted" 与
         # "最后一家的 unavailable" 不是同一件事）。
@@ -433,6 +483,73 @@ class ModelRuntime:
         state.last_error = terminal
 
         raise terminal
+
+    def _start_model_span(
+            self,
+            state: _CallState,
+            definition: ModelDefinition,
+            attempt_no: int,
+    ) -> Any:
+        """
+        每个 provider attempt 一个 Model Span。
+
+        重试 / 降级换新 Span，并通过 links 指向前一个失败的 Span —— 这是
+        提示词第 4 节第 7 条。
+        """
+
+        state.current_span = None
+
+        trace = state.trace
+
+        if trace is None:
+            return None
+
+        links: list[SpanLink] = []
+
+        if state.last_failed_span_id and state.last_failed_relation is not None:
+            links.append(
+                SpanLink(
+                    relation=state.last_failed_relation,
+                    span_id=state.last_failed_span_id,
+                )
+            )
+
+        span = trace.emitter.start(
+            TraceEventType.MODEL_STARTED,
+            span_kind=SpanKind.MODEL,
+            span_name="model.invoke",
+            end_type=TraceEventType.MODEL_COMPLETED,
+            failed_type=TraceEventType.MODEL_FAILED,
+            parent_span_id=trace.parent_span_id,
+            attempt=attempt_no,
+            links=links,
+            payload={
+                "model_role": self._model_role,
+                "provider": definition.provider,
+                "model_name": definition.model,
+                # 当前 ainvoke 路径由 langgraph 的协议流式驱动（见
+                # agent_node 的说明）；有没有 token 由投影层按实际 delta
+                # 判断，这里声明的是"这次请求走了流式通道"。
+                "streaming": True,
+            },
+        )
+
+        state.current_span = span
+
+        return span
+
+    def _fail_model_span(
+            self,
+            state: _CallState,
+            error: BaseException,
+    ) -> None:
+        span = state.current_span
+
+        if span is not None:
+            span.fail(error)
+            state.last_failed_span_id = span.span_id
+
+        state.current_span = None
 
     async def _try_candidate(
             self,
@@ -489,6 +606,11 @@ class ModelRuntime:
                 self._observer, state.attempts[-1], context=call_context
             )
 
+            # 客户端都没建起来：这不是一次 provider 请求，但它是"这家候选
+            # 失败了"的事实。开一个 Span 记下来，attempt 仍从 1 开始。
+            self._start_model_span(state, definition, 1)
+            self._fail_model_span(state, error)
+
             if error.disposition is ErrorDisposition.FAIL:
                 raise error
 
@@ -527,12 +649,20 @@ class ModelRuntime:
 
             started = time.perf_counter()
 
+            span = self._start_model_span(state, definition, attempt_no)
+
             try:
                 result = await self._dispatch(
                     client,
                     request,
                     attempt_timeout,
                     on_delta=on_delta,
+                    trace_span_id=None if span is None else span.span_id,
+                    trace_parent_span_id=(
+                        state.trace.parent_span_id
+                        if state.trace is not None
+                        else None
+                    ),
                 )
 
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -569,6 +699,8 @@ class ModelRuntime:
                 emit_attempt(
                     self._observer, state.attempts[-1], context=call_context
                 )
+
+                self._fail_model_span(state, error)
 
                 decision = self._decide(error, policy)
 
@@ -612,6 +744,24 @@ class ModelRuntime:
                         delay,
                     )
 
+                    # trace：重试决策本身也是一条事件（频率低，值得留）。
+                    if span is not None and state.trace is not None:
+                        state.trace.emitter.instant(
+                            TraceEventType.MODEL_RETRY_SCHEDULED,
+                            span_kind=SpanKind.MODEL,
+                            span_name="model.invoke",
+                            span_id=span.span_id,
+                            parent_span_id=state.trace.parent_span_id,
+                            attempt=attempt_no,
+                            payload={
+                                "failed_span_id": span.span_id,
+                                "next_attempt": attempt_no + 1,
+                                "delay_ms": int(delay * 1000),
+                                "reason": error.code or type(error).__name__,
+                            },
+                        )
+                        state.last_failed_relation = LinkRelation.RETRY_OF
+
                     if delay > 0:
                         await asyncio.sleep(delay)
 
@@ -623,6 +773,11 @@ class ModelRuntime:
                     error.code,
                     attempt_no,
                 )
+
+                # 下一个候选的 attempt 会通过 links 指回这次失败。
+                # 具体是"降级"还是"单纯放弃"由 _run 判断（它知道链上
+                # 还有没有下一个）。
+                state.last_failed_relation = LinkRelation.FALLBACK_FROM
 
                 return None
 
@@ -679,6 +834,8 @@ class ModelRuntime:
             timeout: float,
             *,
             on_delta: DeltaCallback | None = None,
+            trace_span_id: str | None = None,
+            trace_parent_span_id: str | None = None,
     ) -> Any:
         """
         真正把请求发给 provider，并**强制**一个超时。
@@ -710,16 +867,26 @@ class ModelRuntime:
         （见 app/common/stream/publisher.py 里"为什么是 await"）。
         """
 
+        run_metadata: dict[str, Any] = {
+            "agent_type": self._agent_type,
+            "model_role": self._model_role,
+        }
+
+        # Trace 关联：消息协议的每条事件都会带上这份 metadata，
+        # 投影层据此把 message-start / 首个 delta 对到 Model Span 上
+        # （model.first_token 的 ttft 计算）。
+        if trace_span_id is not None:
+            run_metadata["trace_span_id"] = trace_span_id
+            run_metadata["trace_parent_span_id"] = trace_parent_span_id
+            run_metadata["trace_streaming"] = True
+
         return await asyncio.wait_for(
             client.adapter.ainvoke(
                 client,
                 request,
                 timeout=timeout,
                 on_delta=on_delta,
-                run_metadata={
-                    "agent_type": self._agent_type,
-                    "model_role": self._model_role,
-                },
+                run_metadata=run_metadata,
             ),
             timeout=timeout,
         )
@@ -781,6 +948,46 @@ class ModelRuntime:
             or candidate_index > 0
             or bool(state.incompatible)
         )
+
+        # ---- Trace: 收尾当前 Model Span ----
+        span = state.current_span
+        state.current_span = None
+
+        if span is not None:
+            metadata = result.metadata or {}
+            provider_metadata = metadata.get("provider_metadata")
+            provider_metadata = (
+                provider_metadata
+                if isinstance(provider_metadata, dict)
+                else metadata
+            )
+            response_metadata = getattr(
+                result.message, "response_metadata", None
+            )
+            response_metadata = (
+                response_metadata
+                if isinstance(response_metadata, dict)
+                else {}
+            )
+
+            span.complete(
+                payload={
+                    "input_tokens": (
+                        None if usage is None else usage.input_tokens
+                    ),
+                    "output_tokens": (
+                        None if usage is None else usage.output_tokens
+                    ),
+                    "finish_reason": (
+                        provider_metadata.get("finish_reason")
+                        or response_metadata.get("finish_reason")
+                    ),
+                    "response_id": (
+                        provider_metadata.get("id")
+                        or getattr(result.message, "id", None)
+                    ),
+                }
+            )
 
         return ModelResponse(
             message=result.message,

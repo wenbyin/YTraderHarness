@@ -62,9 +62,15 @@ from collections.abc import Awaitable, Mapping, Sequence
 from typing import Any, Callable
 from uuid import UUID
 
+from langchain_core.messages import ToolMessage
+from langgraph.errors import GraphBubbleUp
+
 from app.agent.tools.processor.base import BaseToolProcessor
 from app.agent.tools.processor.context import (
     CALLER_CONTEXT_KEY,
+    RUN_CONTEXT_KEY,
+    SESSION_CONTEXT_KEY,
+    TOOL_STARTED_CONTEXT_KEY,
     AsyncToolCall,
     ToolInvocation,
     ToolOutcome,
@@ -79,7 +85,11 @@ from app.services.tool.registry.processor_registry import (
     ToolProcessorRegistry,
     get_processor_registry,
 )
-from app.services.tool.registry.schema import resolve_request_model
+from app.services.tool.registry.schema import (
+    inject_tool_args,
+    injected_args,
+    resolve_request_model,
+)
 from app.services.tool.registry.selection import select_specs
 from app.services.tool.registry.spec import ToolSpec
 
@@ -209,6 +219,26 @@ class ToolExecutor:
         if caller_identity is not None:
             invocation_context[CALLER_CONTEXT_KEY] = dict(caller_identity)
 
+        # 会话 / 运行身份：从图的 context 抄进调用上下文。
+        #
+        # 为什么抄一份而不是让处理器自己读 runtime：
+        #     图外直调（runtime=None）也要有同样的形状；
+        #     执行守卫按 SESSION / RUN 计数时不该依赖 langgraph 的
+        #     ToolRuntime 一定存在。
+        #
+        # `pipeline_run_id` 是**业务运行**的身份（不是 config 顶层那个
+        # langgraph run_id），见 ReactContext 的说明。
+        graph_context = getattr(runtime, "context", None)
+
+        session_id = getattr(graph_context, "session_id", None)
+        run_id = getattr(graph_context, "pipeline_run_id", None)
+
+        if session_id is not None:
+            invocation_context[SESSION_CONTEXT_KEY] = session_id
+
+        if run_id is not None:
+            invocation_context[RUN_CONTEXT_KEY] = run_id
+
         invocation = ToolInvocation(
             tool_key=tool_key,
             # 本次调用**私有**的副本：处理器就地改它，调用方手里的
@@ -225,7 +255,9 @@ class ToolExecutor:
             # 工具**：链上可能挂着审批或脱敏，绕过它去跑比失败更糟。
             return chain
 
-        base = self._base_call(spec, invocation, tool_call_id)
+        base = self._base_call(
+            spec, invocation, tool_call_id, runtime=runtime,
+        )
 
         # ASYNC 观察者不参与嵌套，按 hook 在链外起掉（见 chain.py）。
         for entry in chain.async_before:
@@ -302,9 +334,15 @@ class ToolExecutor:
             spec: ToolSpec,
             invocation: ToolInvocation,
             tool_call_id: str | None,
+            *,
+            runtime: Any = None,
     ) -> AsyncToolCall:
         """
         最里层：造 service、包请求模型、await 方法。
+
+        `runtime` 是 `tools` 节点构造的官方 `ToolRuntime`，只用于给
+        声明了注入参数的工具（ToolRuntime / InjectedState …）填参；
+        service 方法那条路不用它。
 
         ⚠️ 参数在**被调用时**才从 `invocation.arguments` 读 —— 处理器
         就地改的就是它，提前读会拿到改动前的值。
@@ -327,9 +365,77 @@ class ToolExecutor:
                 # 所以不需要再过一遍 resolve_request_model。
                 if spec.tool is not None:
 
-                    result = await spec.tool.ainvoke(
-                        dict(invocation.arguments)
+                    # 执行守卫靠这个标记区分「中断时还没开始」与
+                    # 「已经开始之后才中断」—— 后者可能已产生副作用，
+                    # 要记 UNKNOWN 而不是 INTERRUPT/CANCELLED。
+                    invocation.context[TOOL_STARTED_CONTEXT_KEY] = True
+
+                    # ⚠️ 注入参数在调用**之前**塞进 arguments
+                    # --------------------------------------
+                    # `runtime` / InjectedState / store / tool_call_id
+                    # 是执行器给的，不是模型给的。`inject_tool_args`
+                    # 同时会剥掉模型伪造的同名参数（模型看不到它们，
+                    # 但恶意构造的 args 里可能有）。
+                    #
+                    # tool_call_id 用本次调用的那个，与 ToolMessage /
+                    # 审批账本对齐。
+                    tool_func = (
+                        getattr(spec.tool, "func", None)
+                        or getattr(spec.tool, "coroutine", None)
                     )
+
+                    call_args = (
+                        inject_tool_args(
+                            tool_func,
+                            invocation.arguments,
+                            runtime=runtime,
+                            tool_call_id=tool_call_id,
+                        )
+                        if tool_func is not None
+                        else dict(invocation.arguments)
+                    )
+
+                    # ⚠️ 声明了 InjectedToolCallId 的工具必须收**完整
+                    # ToolCall**（LangChain 从这个形状里取 id），只传
+                    # args dict 会报 "must be invoked with a full model
+                    # ToolCall"。
+                    injected = (
+                        injected_args(tool_func)
+                        if tool_func is not None
+                        else {}
+                    )
+
+                    tool_input: Any = call_args
+
+                    if any(
+                            item.kind == "tool_call_id"
+                            for item in injected.values()
+                    ):
+                        tool_input = {
+                            "name": spec.tool.name,
+                            "args": call_args,
+                            "id": tool_call_id or "",
+                            "type": "tool_call",
+                        }
+
+                    result = await spec.tool.ainvoke(tool_input)
+
+                    # ⚠️ 完整 ToolCall 输入会得到 ToolMessage 包装
+                    # --------------------------------------------
+                    # langchain 在 `InjectedToolCallId` 那条路上要求传完整
+                    # ToolCall（见上），而它会把**工具返回值**包成
+                    # `ToolMessage(content='{"questions": ...}', ...)`。
+                    #
+                    # 如果这里原样交给上游，tools 节点会把这个对象再
+                    # json.dumps 一次，模型看到的是
+                    # `content='...' name='...' tool_call_id='...'` 这种
+                    # repr，而不是实际结果（问答工具实测）。
+                    if (
+                            isinstance(tool_input, Mapping)
+                            and tool_input.get("type") == "tool_call"
+                            and isinstance(result, ToolMessage)
+                    ):
+                        result = result.content
 
                 else:
                     factory = self._factory or get_service_factory()
@@ -358,6 +464,10 @@ class ToolExecutor:
 
                         resolved = resolve_request_model(spec.func)
 
+                        # 见上面 langchain 工具分支的同一句：真正调用
+                        # 工具方法之前打标记。
+                        invocation.context[TOOL_STARTED_CONTEXT_KEY] = True
+
                         if resolved is None:
                             result = await method(**invocation.arguments)
                         else:
@@ -368,6 +478,17 @@ class ToolExecutor:
 
             except asyncio.CancelledError:
                 # 见模块 docstring：取消不是"工具失败了"。
+                raise
+
+            except GraphBubbleUp:
+                # ⚠️ `interrupt()` 必须穿过执行器
+                # ---------------------------------
+                # HITL 工具（ask_user_question）在**工具函数体内**调用
+                # interrupt()，它抛的是 GraphInterrupt（GraphBubbleUp 的
+                # 子类）。下面那个宽泛的 Exception 会把它当成"工具执行
+                # 失败"包成 ToolOutcome —— 图和前端都看不到中断。
+                #
+                # 同理适用于其它 LangGraph 冒泡控制异常。
                 raise
 
             except Exception as exc:  # noqa: BLE001

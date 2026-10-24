@@ -4,11 +4,11 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Index,
     String,
-    UniqueConstraint,
     func,
     text,
 )
@@ -22,61 +22,57 @@ from ...domain.schemas.enum import ToolExecutionStatus
 
 class ToolExecution(Base):
     """
-    一次工具调用的执行记录 —— 幂等判重与审计的载体。
+    一次工具执行尝试 —— 守卫计数与审计的 append-only 账本。
 
-    表结构与约束逐条对应 tool_execution.sql，那份 sql 是契约。
+    ⚠️ 沿用 `tool_execution` 表名，在原表上扩展
+    ------------------------------------------
+    旧表是「一个判重键一行、重试时重置」，唯一约束
+    `(session_id, run_id, tool_key, param_hash)` 恰好禁止了
+    「一次执行一条记录」。新版直接在这张表上：
+        - 删掉旧唯一约束
+        - 增加 scope / execution / counted / tool_call_id 等列
+        - 用 `(run_id, tool_call_id)` 部分唯一索引做 replay 去重
+    迁移脚本见 `app/services/tool/tool_execution_migration.sql`，
+    需**手工执行**（`create_all` 只建缺失的表，不改已存在的表）。
 
     它在回答什么问题
     ----------------
-    「这个副作用到底发生过没有？」之前进程崩了、工具跑一半被杀、
-    审批放行后重跑，这三件事都没有任何持久痕迹可查。
+    「这个维度上已经发生过几次、这次还让不让做？」以及
+    「上一次到底成功、失败，还是不知道跑没跑？」
 
-    判重的键是 (session_id, run_id, tool_key, param_hash)
-    -------------------------------------------------
-    session_id 取的是 **agent_session.session_id**（会话行自己的主键），
-    不是 langgraph 的 thread_id。
+    一次执行一行，保存每一次尝试
+    --------------------------
+    与旧账本不同，重试不会覆盖上一行 —— 否则计数永远停在 1，
+    守卫的「超过 N 次」就没有依据。
 
-    ⚠️ 为什么用 session_id 而不是 thread_id
-    -------------------------------------
-    本仓里两者是**一对一**的（`agent_session.thread_id` 按会话稳定、
-    存在会话行上，见 agent_run_service_impl._resolve_thread_id），所以
-    分区的粒度一样。区别在**身份归属**：会话详情页、消息、运行列表
-    全都按 session_id 关联，而 thread_id 是 langgraph 的内部键
-    （形如 `dev:react:<uuid>`）—— 排查的人手里拿到的是前者。
-    存 thread_id 意味着每次查账本都要先反查一次会话，而那个映射
-    就在调用方手边（`run.session_id`）。
+    判重仍然存在，但换了键
+    --------------------
+    `(run_id, tool_call_id)` 的部分唯一索引保证：同一次模型调用在
+    LangGraph 重放 / HITL resume 时复用同一行，不会重复执行、也不会
+    重复占用额度。没有 tool_call_id 的图外直调不做 replay 去重。
 
-    run_id 在这一段里同样关键：**resume 不换 run_id**
-    （agent_run_service_impl._schedule_resume 沿用原 run）—— 所以
-    HITL 中断后重跑那次能查到中断前留下的那一行；而同一条会话的
-    **下一轮是新 run_id**，同参数可以再调，这是想要的。
+    计数键
+    ------
+    `match_key` = 五段（tool_key + scope_type + scope_key +
+    execution_type + param_hash）的定长摘要。加锁、计数、索引都走它，
+    避免多列组合比较把 NULL / 大小写之类的差异引进判定。
 
-    ⚠️ 为什么**不**建 run_id 的外键
-    ------------------------------
-    本表要在 agent_run 的生命周期之外活着。加了外键只有两种收场：
+    ⚠️ `counted` 与 `status` 是两个维度
+    --------------------------------
+    status 描述发生了什么；counted 描述是否占额度。被拒绝 / 中断 /
+    取消 / 守卫拦下的行 counted=False —— 它们没有真正执行。
+    预留时先写 True，让并发的其它分支看见「有人正在跑」；落终态时
+    再按结果修正。
 
-        级联删除    删一次历史 run 就把「这单副作用发生过」的证据删了
-        NO ACTION   一条审计记录把 run 的清理**卡住**
+    ⚠️ run_id 刻意不建外键
+    ---------------------
+    本表要在 agent_run 的生命周期之外活着：级联删除会删掉「副作用
+    发生过」的证据，NO ACTION 会把 run 的清理卡住。
 
-    两者对一张执行账本都是坏的。tool_processor 那种挂载记录可以用
-    CASCADE（Tool 没了，链就没有载体了），这里不行 —— 记录的价值
-    恰恰在于它的主体可能已经没了。
-
-    ⚠️ result 存的是**脱敏之后**的那一份
-    -----------------------------------
-    写库发生在处理器链**跑完之后**（见 graph/react/tools.py 的
-    _wrap_tool_call —— 它拿到的 ToolOutcome 是整条链含 AFTER 的
-    产物），所以 privacy_transformer 的脱敏已经生效。存进来的就是
-    模型当时看到的那份。
-
-    **不要**改成从 _base_call 里顺手取 —— 那会绕过 AFTER，把
-    未脱敏的原始结果永久写进库。
-
-    ⚠️ 没有 DB 触发器维护 updated_at
+    ⚠️ result 存的是脱敏之后的那一份
     -------------------------------
-    与 tool_processor 同一条理由（见那里的说明）：项目统一用
-    onupdate=func.now()，而 create_all 建不出触发器。两套机制
-    并存会让「到底谁在改 updated_at」没法回答。
+    写库发生在处理器链跑完之后，privacy_transformer 已生效。不要
+    改成从 _base_call 里顺手取。
     """
 
     __tablename__ = "tool_execution"
@@ -89,39 +85,79 @@ class ToolExecution(Base):
         comment="执行记录 ID。",
     )
 
-    session_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        nullable=False,
-        comment=(
-            "所属会话（agent_session.session_id）。与 run_id 一起决定"
-            "「哪条会话上的哪一次运行」。"
-            "⚠️ 是会话行自己的主键，不是 langgraph 的 thread_id —— "
-            "见类 docstring。"
-        ),
-    )
-
-    run_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        nullable=False,
-        comment=(
-            "本次运行（agent_run 主键，即 pipeline_run_id）。"
-            "⚠️ 刻意不建外键 —— 见类 docstring。"
-        ),
-    )
-
     tool_key: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
         comment="被调用的工具，形如 document.retrieve_documents。",
     )
 
+    tool_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        comment="tool_definition 主键；还没同步进库的工具为空。",
+    )
+
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        comment=(
+            "所属会话（agent_session.session_id）。"
+            "⚠️ 是会话行自己的主键，不是 langgraph 的 thread_id。"
+            "图外直调时为空。"
+        ),
+    )
+
+    run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        comment=(
+            "本次运行（agent_run 主键，即 pipeline_run_id）。"
+            "⚠️ 刻意不建外键 —— 见类 docstring。"
+        ),
+    )
+
+    user_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment=(
+            "调用者（caller_identity.user_id）。"
+            "拿不到时为空 —— 不回落到会话反查。"
+        ),
+    )
+
+    scope_type: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        comment="SESSION / RUN / USER / GLOBAL。",
+    )
+
+    scope_key: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="session_id / run_id / user_id / '*'。",
+    )
+
+    execution_type: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        comment="METHOD / INVOKE。",
+    )
+
     param_hash: Mapped[str] = mapped_column(
         String(64),
         nullable=False,
+        default="",
         comment=(
-            "调用参数的 sha256 十六进制摘要（canonical_json + "
-            "sha256_text，与 cache 拦截器同一套）。"
-            "用摘要而不是原文：参数可能很长，而这四列是唯一键。"
+            "INVOKE 时的参数 sha256；METHOD 时为空串。"
+            "与 cache 拦截器同一套 canonical_json + sha256。"
+        ),
+    )
+
+    match_key: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        comment=(
+            "五段维度组合的 sha256。计数、advisory lock、索引都用它。"
         ),
     )
 
@@ -131,8 +167,25 @@ class ToolExecution(Base):
         default=ToolExecutionStatus.PENDING.value,
         comment=(
             "执行状态。取值与语义见 domain/schemas/enum.py 的 "
-            "ToolExecutionStatus —— ⚠️ 那里的每个取值都标了它"
-            "「能不能重跑」，那才是策略的依据。"
+            "ToolExecutionStatus。"
+        ),
+    )
+
+    counted: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        comment=(
+            "这次尝试是否占用额度。被拒绝/中断/取消/守卫拦下为 "
+            "False。预占时先 True，落终态时修正。"
+        ),
+    )
+
+    tool_call_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment=(
+            "模型给的调用 id。与 run_id 一起做 replay/resume 去重。"
         ),
     )
 
@@ -141,14 +194,10 @@ class ToolExecution(Base):
             JSONB(none_as_null=True),
             nullable=True,
             comment=(
-                "工具返回值，经规范化后的 JSON 形态（可查询）。"
-                "⚠️ 是**脱敏之后**的那一份，见类 docstring。"
-                "⚠️ none_as_null=True 是必须的：否则 Python None 会被"
-                "写成 JSON 'null' 字面量（非 SQL NULL），"
-                "让 upsert 的 COALESCE 守卫失效。"
-                "工具正常返回 None 是**合法的成功结果**，"
-                "与「这列没写过」是两回事 —— 后者是 update 时"
-                "是否覆盖的判据，因此不能混。"
+                "工具返回值，规范化后的 JSON 形态。"
+                "⚠️ 是**脱敏之后**的那一份。"
+                "none_as_null=True 让 Python None 写成 SQL NULL，"
+                "而不是 JSON 'null' 字面量。"
             ),
         )
     )
@@ -157,11 +206,9 @@ class ToolExecution(Base):
         JSONB(none_as_null=True),
         nullable=True,
         comment=(
-            "失败 / 拒绝的那段说明，形状 "
+            "失败 / 拒绝的说明，形状 "
             "{'type': 异常类名, 'message': 给模型看的文案}。"
-            "完整堆栈只进日志，不入库 —— 与 checkauth 的"
-            "「文案刻意含糊、细节留日志」同一口径"
-            "（interceptor/auth.py 的 _deny）。"
+            "完整堆栈只进日志，不入库。"
         ),
     )
 
@@ -169,7 +216,7 @@ class ToolExecution(Base):
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
-        comment="这条记录第一次建出来的时间（claim 那一刻）。",
+        comment="这条记录建出来的时间（预占那一刻）。",
     )
 
     updated_at: Mapped[datetime] = mapped_column(
@@ -177,10 +224,7 @@ class ToolExecution(Base):
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
-        comment=(
-            "最后一次状态转移的时间 —— 也是判断"
-            "「这行是不是还活着」的依据。"
-        ),
+        comment="最后一次状态转移的时间。",
     )
 
     # ========================================================
@@ -188,34 +232,44 @@ class ToolExecution(Base):
     # ========================================================
 
     __table_args__ = (
-        # 状态取值必须与枚举一致。这道拦的是绕过应用的写入 ——
-        # 服务层每个校验在这里都有一份对应的表达（与 tool_processor
-        # 同一条立场）。
         CheckConstraint(
             "status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', "
-            "'UNKNOWN', 'CANCELLED', 'REJECTED', 'INTERRUPT')",
+            "'UNKNOWN', 'BLOCKED', 'CANCELLED', 'REJECTED', "
+            "'INTERRUPT')",
             name="ck_tool_execution_status",
+        ),
+        CheckConstraint(
+            "scope_type IN ('SESSION', 'RUN', 'USER', 'GLOBAL')",
+            name="ck_tool_execution_scope",
+        ),
+        CheckConstraint(
+            "execution_type IN ('METHOD', 'INVOKE')",
+            name="ck_tool_execution_execution",
         ),
         CheckConstraint(
             "error IS NULL OR jsonb_typeof(error) = 'object'",
             name="ck_tool_execution_error_object",
         ),
-        # 判重与抢锁都落在这条上：并发同键靠 INSERT ... ON CONFLICT
-        # 串行化，**不是**先查再插（那样两个并发分支会都执行）。
-        #
-        # ⚠️ 用 UniqueConstraint 而不是 Index(unique=True)：只有真正的
-        # **约束**才能被 `ON CONFLICT ON CONSTRAINT <名字>` 引用，
-        # 唯一索引只能走列推断那条形式。写死名字比列推断稳 ——
-        # 与 document_pipeline_node_run 的 uq_document_pipeline_node_run_identity
-        # 同一写法。
-        UniqueConstraint(
-            "session_id",
+        # replay / resume 去重：同一次模型调用在图中重跑时复用同一行。
+        # 部分索引：没有 tool_call_id 的图外直调不参与去重。
+        Index(
+            "uq_tool_execution_call_id",
             "run_id",
-            "tool_key",
-            "param_hash",
-            name="uq_tool_execution_identity",
+            "tool_call_id",
+            unique=True,
+            postgresql_where=text(
+                "tool_call_id IS NOT NULL AND run_id IS NOT NULL"
+            ),
         ),
-        # 运行详情页：「这一次运行调了哪些工具」。
+        # 守卫计数：按维度 + 时间窗口。只覆盖 counted 的行 ——
+        # 被拒绝/中断的行不占额度，让索引更小。
+        Index(
+            "idx_tool_execution_match",
+            "match_key",
+            "created_at",
+            postgresql_where=text("counted"),
+        ),
+        # 运行详情页：这一次运行调了哪些工具。
         Index(
             "idx_tool_execution_run_created",
             "run_id",
@@ -227,9 +281,7 @@ class ToolExecution(Base):
             "tool_key",
             "created_at",
         ),
-        # 部分索引：只覆盖「没有走到终态的行」。
-        # 那个进程被杀留下的遗留行（本期还没有 reaper，见枚举的说明）
-        # 以及将来的重试扫描都只会查这一段，比全表索引小得多。
+        # 部分索引：只覆盖没有走到终态的行（崩溃遗留 / reaper 扫描）。
         Index(
             "idx_tool_execution_unsettled",
             "created_at",

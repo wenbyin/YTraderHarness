@@ -14,7 +14,11 @@ Agent 侧的图。
 是调工具还是收尾）。因此 agent 图的 state 里装的是对话本身，而
 document 的 state 里只装指向产物的引用 —— 见 react/state.py 的说明。
 
-本包目前只有一张图
-------------------
-    react/      ReAct 循环：agent → （要调工具就）tools → agent → …
+本包有两张图
+------------
+    react/      ReAct 主图：agent → （要调工具就）tools → agent → …
+    subagent/   worker 子图：task_listener → llm_node ↔ tool_node
+
+子图由主图的 `subagent_dispatch` 通过 Send 动态扇出，每条 worker 用
+确定性的 child thread 跑一次；worker 的 messages 不并回主图。
 """

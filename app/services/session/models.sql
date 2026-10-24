@@ -31,8 +31,11 @@ CREATE TABLE agent_session (
     thread_id       VARCHAR(255),
 
     -- 会话归属的用户 ID —— Casdoor 的 sub（app/common/auth），字符串。
-    -- 它是所有 session 接口的过滤键：`user_id = 当前用户 OR user_id IS NULL`。
+    -- 两种过滤口径：
+    --   按 id 读      `user_id = 当前用户 OR user_id IS NULL`
+    --   列表 / 删除   `user_id = 当前用户`（严格）
     -- NULL 是刻意保留的存量语义（加这列之前的会话对谁都可见），
+    -- 但无主会话不出现在任何人的列表里、也不能被删除。
     -- 不代表可以省略 —— 新建会话必须写入。
     user_id         VARCHAR(255),
 
@@ -120,6 +123,11 @@ CREATE TABLE agent_run (
     -- 只有一个答案，否则运行行、提示词、消息三处可能对不上。
     duty_key        VARCHAR(128),
 
+    -- 客户端传入的 Trace 聚合键。NULL = 这次运行未开启 Trace。
+    -- trace 事件的 Redis 键是 trace:<trace_id>:events；事件里另带 run_id，
+    -- 因为 trace 可以跨 run / session。
+    trace_id        VARCHAR(255),
+
     created_at      TIMESTAMPTZ NOT NULL,
     updated_at      TIMESTAMPTZ NOT NULL
 );
@@ -144,6 +152,8 @@ CREATE TABLE agent_run (
 --         task_id VARCHAR(255);
 --     ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS
 --         duty_key VARCHAR(128);
+--     ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS
+--         trace_id VARCHAR(255);
 --
 -- ⚠️⚠️ 上面这几条（org_id / task_id / duty_key）也必须在**部署新代码之前**跑
 -- --------------------------------------------------------------------
@@ -283,7 +293,9 @@ CREATE TABLE agent_message (
             'chat',
             'interaction',
             'tool_activity',
-            'notice'
+            'notice',
+            'task_instruction',
+            'task_result'
         )),
 
     business_agent_id VARCHAR(128) NULL,

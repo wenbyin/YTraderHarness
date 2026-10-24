@@ -55,6 +55,7 @@ from app.agent.context.processor.messages import (
     is_reasoning_block,
     is_system_message,
     is_tool_message,
+    message_kind,
     message_reasoning,
     tool_calls,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "message_status",
     "new_assistant_messages",
     "record_cancellation_notice",
+    "record_interaction",
     "record_messages",
     "to_entities",
 ]
@@ -115,12 +117,16 @@ def new_assistant_messages(
        （compaction 只写 summary 通道），所以这条成立；真要用上墓碑时，
        这里必须换成按消息 id 做差集。
 
-    2. **滤掉 human 与 system**。本轮的 `HumanMessage` 是
+    2. **滤掉普通 human 与 system**。本轮的 `HumanMessage` 是
        `_initial_state` 交给图的，而 `prior_count` 是在那之前数的 ——
        不滤的话它一定会落在切片里。用户消息已由建运行那一步写过一条，
        再写一次就是**同一句话两行**，而且这一行会带着
        `role=assistant`（契约里只有 user / assistant 两个取值，
        没有第三个格子给它），前端会把它渲染成模型的回复。
+
+       **例外**：带 `kind=task_instruction` 的 HumanMessage 要写。
+       它不是用户说的那句话，是 planner / listener 注入的任务指令；
+       前端任务面板需要它。它同样以 role=assistant 落库，靠 kind 区分。
 
        system 消息今天不在 state 通道上（只出现在组装好的 prompt 里），
        滤它是为了防止将来有人往 state 里塞。
@@ -131,8 +137,15 @@ def new_assistant_messages(
     return [
         message
         for message in tail
-        if not is_human_message(message)
-        and not is_system_message(message)
+        if not is_system_message(message)
+        and (
+            not is_human_message(message)
+            # 任务指令是 HumanMessage，但它不是用户说的那句话，而是
+            # planner / listener 注入的内部指令。它带着 kind 标记，必须
+            # 落库（前端任务面板要它）；普通 HumanMessage 仍然滤掉 ——
+            # 用户那条已经由建运行的事务写过。
+            or message_kind(message) == MessageKind.TASK_INSTRUCTION.value
+        )
     ]
 
 
@@ -144,6 +157,16 @@ def message_status(run_status: RunStatus) -> str:
     类似但**不是同一组**，且列上带 CHECK —— 塞错值的报错会离原因很远。
     逐条理由见 domain/schemas/enum.py 的 MessageStatus。
 
+    ⚠️ `waiting_input` 不是 `interrupted`
+    ------------------------------------
+    HITL 中断时，assistant 消息是**完整产出**的：AIMessage 已经生成完、
+    ToolMessage 也已经返回。暂停的是 **run**，不是某条消息。把消息标成
+    interrupted 会让历史里所有 tool_activity 看起来都"被打断"，而它们
+    其实都成功完成了。
+
+    用户回答本身由 resume 路径写成一条 `kind=interaction` 的消息；"还在
+    等人"这个事实由 `agent_run.status=waiting_input` 表达。
+
     Raises:
         ValueError: 传进来一个跑不到终态的状态（queued / running）。
                     走到这里说明调用方用错了这个函数，越早炸越好。
@@ -151,9 +174,8 @@ def message_status(run_status: RunStatus) -> str:
 
     mapping = {
         RunStatus.COMPLETED: MessageStatus.COMPLETED,
-        # "图停下来等人" 对消息而言就是"被打断了"：那一轮的回复只生成到
-        # interrupt 点为止。当前产生不出来（图里没有 interrupt 点）。
-        RunStatus.WAITING_INPUT: MessageStatus.INTERRUPTED,
+        # 图停下来等人，但消息本身是完整的 —— 见 docstring。
+        RunStatus.WAITING_INPUT: MessageStatus.COMPLETED,
         RunStatus.FAILED: MessageStatus.FAILED,
         RunStatus.CANCELLED: MessageStatus.CANCELLED,
     }
@@ -221,7 +243,7 @@ def to_entities(
             # 幂等 ID 要客户端给，而消息不是客户端直接提交的。
             client_message_id=None,
             reply_to_message_id=reply_to_message_id,
-            meta={},
+            meta=_meta(message),
             created_at=created_at,
             # 同一个值，不取第二次 now() —— 见本函数 docstring。
             updated_at=created_at,
@@ -296,6 +318,112 @@ async def record_messages(
         await message_repository.add_many(entities)
 
     return len(entities)
+
+
+def _interaction_text(
+        questions: Sequence[Mapping[str, Any]],
+        answers: Mapping[str, str],
+) -> str:
+    """问答 -> 人能直接读的一段文本（结构化块另存一份）。"""
+
+    lines: list[str] = []
+
+    for question in questions:
+
+        text = str(question.get("question") or "").strip()
+
+        if not text:
+            continue
+
+        answer = answers.get(text, "")
+
+        lines.append(f"Q: {text}\nA: {answer}")
+
+    return "\n\n".join(lines)
+
+
+async def record_interaction(
+        repository_factory: RepositoryFactory,
+        *,
+        session_id: UUID,
+        run_id: UUID,
+        business_agent_id: str | None = None,
+        questions: Sequence[Mapping[str, Any]],
+        answers: Mapping[str, str],
+        annotations: Mapping[str, Mapping[str, str]] | None = None,
+        interrupt_id: str,
+) -> int:
+    """
+    一次 HITL 问答 -> 一条 `role=user`、`kind=interaction` 的消息。
+
+    为什么在 resume 路径写
+    -------------------
+    用户回答走的是 `Command(resume=...)`，不经过 `_initial_state`，所以
+    普通消息记录器看不到这句话。如果不在这里补，历史里只有 assistant 的
+    tool_activity，用户的回答只藏在 ToolMessage 的 JSON 里 —— 翻历史时
+    "我问了什么、你答了什么"不可读。
+
+    `content` 同时给两样：
+
+        text 块         人直接读的 Q/A
+        interaction 块  结构化 questions / answers / annotations，给前端渲染
+
+    Raises:
+        底层异常原样抛。调用方（resume 路径）决定是否吞掉 —— 写失败不该
+        阻止图 resume，但必须留下日志。
+    """
+
+    if not questions:
+        return 0
+
+    now = datetime.now(timezone.utc)
+
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": _interaction_text(questions, answers),
+        },
+        {
+            "type": "interaction",
+            "questions": [dict(question) for question in questions],
+            "answers": dict(answers),
+            "annotations": {
+                str(key): dict(value)
+                for key, value in (annotations or {}).items()
+            },
+        },
+    ]
+
+    async with repository_factory.scope() as repositories:
+
+        message_repository = repositories.create(MessageRepository)
+
+        start_seq = await message_repository.next_seq(session_id)
+
+        await message_repository.add_many([
+            AgentMessageEntity(
+                message_id=uuid4(),
+                session_id=session_id,
+                run_id=run_id,
+                seq=start_seq,
+                role=MessageRole.USER.value,
+                kind=MessageKind.INTERACTION.value,
+                business_agent_id=business_agent_id,
+                content=content,
+                reasoning_content=None,
+                status=MessageStatus.COMPLETED.value,
+                client_message_id=None,
+                reply_to_message_id=None,
+                meta={
+                    "interrupt_id": interrupt_id,
+                    "source": "ask_user_question",
+                },
+                created_at=now,
+                updated_at=now,
+            )
+        ])
+
+    return 1
 
 
 async def record_cancellation_notice(
@@ -384,23 +512,60 @@ async def record_cancellation_notice(
 # ============================================================
 
 
+#: 任务消息的 kind。它们自带 `additional_kwargs.kind`，优先级高于
+#: 工具/对话的推断。
+_TASK_KINDS: frozenset[str] = frozenset({
+    MessageKind.TASK_INSTRUCTION.value,
+    MessageKind.TASK_RESULT.value,
+})
+
+
 def _kind(message: Any) -> str:
     """
     assistant 消息的种类。
 
-        工具结果（ToolMessage）              -> tool_activity
-        要求调用工具（AIMessage 带 tool_calls）-> tool_activity
-        其余                                -> chat
+        task_instruction / task_result          -> 自带标记优先
+        工具结果（ToolMessage）                 -> tool_activity
+        要求调用工具（AIMessage 带 tool_calls） -> tool_activity
+        其余                                   -> chat
 
     一条既说了话、又调了工具的消息算 tool_activity —— 它的正文里两块都有
     （文本块 + tool_call 块），前端按 tool_activity 渲染工具卡片时文本
     仍然在旁边，不丢东西。
     """
 
+    tagged = message_kind(message)
+
+    if tagged in _TASK_KINDS:
+        return tagged
+
     if is_tool_message(message) or tool_calls(message):
         return MessageKind.TOOL_ACTIVITY.value
 
     return MessageKind.CHAT.value
+
+
+def _meta(message: Any) -> dict[str, Any]:
+    """
+    任务消息的归属信息。普通消息仍是空对象。
+
+    task_id / plan_id / skill_key 是前端把消息挂到任务卡片所需的最小集；
+    它们来自 `additional_kwargs`，不塞进 content —— content 只放正文。
+    """
+
+    if message_kind(message) not in _TASK_KINDS:
+        return {}
+
+    kwargs = getattr(message, "additional_kwargs", None)
+
+    if not isinstance(kwargs, Mapping):
+        return {}
+
+    return {
+        key: str(kwargs[key])
+        for key in ("task_id", "plan_id", "skill_key")
+        if kwargs.get(key)
+    }
 
 
 def _content_blocks(message: Any) -> list[dict[str, Any]]:
@@ -458,14 +623,36 @@ def _content_blocks(message: Any) -> list[dict[str, Any]]:
     # 工具调用附在最后。langchain 把它放在消息的 tool_calls 属性上而不是
     # content 里，但契约的 content 是"这条消息的全部内容块"，因此这里合并
     # —— 否则前端只看 content 就看不到"它调了哪个工具"。
+    #
+    # ⚠️ 按 id 去重，不能无条件追加
+    # ---------------------------
+    # 经 v3 协议流聚合出来的 AIMessage，`content` 里**已经**带着
+    # `tool_call` 块（实测：文本块 + tool_call 块），与属性上的
+    # `tool_calls` 是同一批调用。无条件追加会让每次工具调用在库里
+    # 出现两遍（同一 id），前端按 content 渲染就是两张工具卡片。
+    present = {
+        str(block.get("id") or "")
+        for block in blocks
+        if isinstance(block, Mapping)
+        and block.get("type") == "tool_call"
+    }
+
     for call in tool_calls(message):
+        call_id = str(call.get("id") or "")
+
+        if call_id and call_id in present:
+            continue
+
         blocks.append(
             {
                 "type": "tool_call",
-                "id": str(call.get("id") or ""),
+                "id": call_id,
                 "name": str(call.get("name") or ""),
                 "args": call.get("args") or {},
             }
         )
+
+        if call_id:
+            present.add(call_id)
 
     return blocks

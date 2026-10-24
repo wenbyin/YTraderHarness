@@ -34,6 +34,7 @@ class ToolQueryService(BaseService):
             *,
             keyword: str | None = None,
             source_type: SourceType | None = None,
+            source_ref: str | None = None,
             classification_code: str | None = None,
             source_state: SourceState | None = None,
             page: int = 1,
@@ -45,6 +46,10 @@ class ToolQueryService(BaseService):
         classification_code 按分类的**稳定标识**筛（而不是 id）：
         分类 id 会在重建分类树时变，code 不会，而调用方
         （前端 / Agent 配置）记住的是 code。
+
+        source_ref 按**来源对象**筛：MCP 场景下就是 provider 名
+        （`GET /mcp/providers` 的 `name`）。与 source_type 正交 ——
+        先按种类收窄，再按具体 server / 模块收窄。
 
         description 回的是**生效值**（人工覆盖优先），
         与详情页保持一致。

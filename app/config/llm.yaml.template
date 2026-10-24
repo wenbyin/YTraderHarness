@@ -67,3 +67,12 @@ providers:
 
     model: qwen3.7-flash
     api_key: "${QWEN_API_KEY}"
+
+  # 开发用的进程内 mock。python run_server.py --mock 时会启动它，
+  # 并把 MOCK_MODEL_BASE_URL 指到实际监听地址（见 app/mock/runtime.py）。
+  # 端口与分布参数在 app/config/mock_model.yaml。
+  mock:
+    label: Mock Model（开发 / 前端联调）
+    base_url: "${MOCK_MODEL_BASE_URL:-http://127.0.0.1:18080/v1}"
+    model: mock-chat
+    api_key: "${MOCK_MODEL_API_KEY:-mock}"

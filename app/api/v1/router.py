@@ -41,6 +41,7 @@ from .documents import router as documents_router
 from .files import router as files_router
 from .memory import router as memory_router
 from .memory_atom import router as memory_atom_router
+from .mcp_providers import router as mcp_providers_router
 from .memory_query import router as memory_query_router
 from .pipeline_runs import router as pipeline_runs_router
 from .processor_capabilities import (
@@ -50,6 +51,8 @@ from .processors import router as processors_router
 from .qa_datasets import router as qa_datasets_router
 from .retrieval_eval import router as retrieval_eval_router
 from .sessions import router as sessions_router
+from .skills import router as skills_router
+from .stress_runs import router as stress_runs_router
 from .tasks import router as tasks_router
 from .tool_processors import router as tool_processors_router
 from .tools import router as tools_router
@@ -172,6 +175,15 @@ protected_router.include_router(
     tools_router,
 )
 
+# MCP provider（外部工具来源）。
+#
+# 前缀 /mcp/ 与其余模块都不重叠。排在 tools 之后：前端通常是先拿
+# provider 列表渲染筛选项，再调 /tools?source_ref=... 取工具 ——
+# 与读代码的顺序一致。
+protected_router.include_router(
+    mcp_providers_router,
+)
+
 # 挂在 Tool 上的处理器链。
 #
 # tool_processors_router 与 tools_router 共用 /tools/ 前缀，
@@ -199,6 +211,16 @@ protected_router.include_router(
     capabilities_router,
 )
 
+# Skill 管理。
+#
+# 前缀 /skills 与上面任何一个都不重叠；/skills/{id}/capabilities
+# 与 /skills/{id} 段数不同，没有宽匹配抢先的问题。
+#
+# 它只建模 Skill 与能力绑定，不含鉴权 —— 挂在本树上即沿用平台登录。
+protected_router.include_router(
+    skills_router,
+)
+
 # Agent 运行时的会话与运行。
 #
 # 前缀 /sessions 与 /runs 都不与上面任何一个重叠 —— 注意 /runs 是**顶层**
@@ -216,6 +238,9 @@ protected_router.include_router(
 # ⚠️ 这里**没有**提交任务的路由，是刻意的：任务由业务代码在服务端
 # submit，不对外开一个"任意已注册 Handler 都能被触发"的入口。
 # 理由见 app/api/v1/tasks.py 的模块 docstring。
+#
+# /tasks/{task_id}/invoke 不违反这一点：它作用的是一条**已经存在**的
+# 任务（把 execute_at 提前到现在），既不创建任务，也不接受 handler 名。
 protected_router.include_router(
     tasks_router,
 )
@@ -281,4 +306,17 @@ protected_router.include_router(
 protected_router.include_router(
     memory_query_router,
     dependencies=[Depends(require_admin)],
+)
+
+# Mock Model Stress Eval（压测运行与聚合指标）。
+#
+# 前缀 /stress-runs 与上面任何一个都不重叠，也没有宽匹配兄弟，注册顺序
+# 在这里不承载语义。契约权威是 design_agent_eval/openapi.yaml，实现入口
+# 在 app/services/stress/。
+#
+# ⚠️ 当前没有真实 Runner：运行由本地模拟器推进（不发出任何网络请求），
+# 指标里的 aggregation_algorithm 为 simulated-v1。详见
+# app/services/stress/application/simulated_runner.py。
+protected_router.include_router(
+    stress_runs_router,
 )

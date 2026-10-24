@@ -3,7 +3,10 @@
 
 这是运行事件的**唯一投影层**：节点不再各自 `import publish_run_event`
 （以前的埋点在 agent_node.py 四处 + agent_run_dispatch.py 两处），
-而是由这一个 transformer 从协议事件里推出 `node.*` / `message.*` / `tool.*`。
+而是由这一个 transformer 推出 `node.*` / `message.*` / `tool.*`。
+
+`node.*` / `message.*` 来自 v3 协议事件；`tool.*` 来自工具节点写进
+**自定义流**的生命周期（与 trace 的 `fanout.*` 同一条路）。
 
     协议事件（v3 流）──RunEventProjector──▶ publish_run_event ──▶ Redis Stream
 
@@ -12,10 +15,9 @@ type / topic / topic_id / node 平铺 + data），变的是谁在生产它们。
 
 为什么必须是 StreamTransformer（而不是在节点里继续埋点）
 --------------------------------------------------------
-`tool.*` 至今没接（app/common/event/event.py:103 自己标了账：「来源：
-tools/processor 的 ToolEventObserver，未接」），因为要接就得在**每个**
-工具处理器里埋一遍。协议事件把它变成一处投影规则。
-`node.*` 更是如此 —— 见下面「tasks 只在 transformer 通道里」。
+`node.*` 只走 transformer 通道 —— 见下面「tasks 只在 transformer 通道里」。
+`tool.*` 由工具节点写自定义流、这里统一投影：节点负责"发生了什么"，
+投影层负责"怎么对外说"，两边都不直接写 Redis。
 
 ⚠️ 前提：驱动必须是 v3
 ----------------------
@@ -28,13 +30,27 @@ langgraph/pregel/main.py:3533(sync)/:3589(async) 构造，`ainvoke`/`invoke`
 
 from __future__ import annotations
 
+import json
 from collections.abc import Collection, Mapping
+from datetime import datetime, timezone
 from typing import Any, ClassVar, Final
 
 from langgraph.stream import StreamTransformer
 
 from app.agent.event import RunEventType, publish_run_event
+from app.agent.event.trace_publisher import RedisTracePublisher
 from app.agent.model.leaked_tool_call import LeakGate, strip_leaked_tool_calls
+from app.common.event import (
+    SUBAGENT_STREAM_KIND,
+    TASK_STREAM_KIND,
+    TOOL_STREAM_KIND,
+    EventType as TraceEventType,
+    SpanKind,
+    SpanStatus,
+    TraceError,
+    TraceEvent,
+)
+from app.common.event.trace_emitter import tool_span_id as _tool_span_id
 
 __all__ = [
     "RunEventProjector",
@@ -205,6 +221,73 @@ class _PendingTask:
 
 
 # ============================================================
+# Trace 小工具
+# ============================================================
+
+
+def _ms_to_datetime(value: Any) -> datetime | None:
+    """协议事件的 timestamp 是毫秒整数；转成带时区的 UTC。"""
+
+    if not isinstance(value, int):
+        return None
+
+    try:
+        return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _span_elapsed_ms(started: Any, ended: Any) -> int | None:
+    if not (isinstance(started, int) and isinstance(ended, int)):
+        return None
+    return max(0, ended - started)
+
+
+def _trace_error(value: Any) -> TraceError | None:
+    """
+    把任务结果里的 error 压成结构化错误。
+
+    `data["error"]` 可能是异常对象，也可能是字符串。只留类型名与截断后的
+    消息 —— 完整堆栈与业务参数不进 Trace。
+    """
+
+    if not value:
+        return None
+
+    if isinstance(value, BaseException):
+        message = str(value)
+        kind = type(value).__name__
+        code = getattr(value, "code", None)
+    else:
+        message = str(value)
+        kind = "Error"
+        code = None
+
+    if len(message) > 500:
+        message = message[:497] + "..."
+
+    return TraceError(
+        type=kind,
+        code=code if isinstance(code, str) else None,
+        message=message,
+    )
+
+
+def _output_size(output: Any) -> int | None:
+    """工具结果的大小（UTF-8 字节）。拿不到就是 None，不编 0。"""
+
+    try:
+        return len(
+            json.dumps(output, ensure_ascii=False, default=str).encode("utf-8")
+        )
+    except Exception:  # noqa: BLE001
+        try:
+            return len(str(output).encode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return None
+
+
+# ============================================================
 # 投影层
 # ============================================================
 
@@ -249,7 +332,13 @@ class RunEventProjector(StreamTransformer):
 
     #: 要额外请求的 stream mode。
     #:
-    #: ⚠️ 不声明就**根本不会产生** `tools` 事件，不是"产生了但不发"。
+    #: `custom` **始终**要：工具节点不直接写 Redis，它把
+    #: tool.called / tool.completed 写进图的自定义流，由这里投影 ——
+    #: 与 trace 的 fanout.* 同一条路。不请求 custom，writer 就是 no-op，
+    #: 前端会一条工具事件都收不到（静默，不报错）。
+    #:
+    #: `tools` 只在开了 trace 时加（见 __init__）：它是 trace 工具 span
+    #: 的来源。**不声明就根本不会产生**该通道事件，不是"产生了但不发"：
     #: 底层 `astream(stream_mode=...)` 取的是所有已注册 transformer 的
     #: `required_stream_modes` 并集（pregel/main.py:398-414），而
     #: `ToolCallTransformer` **不是**默认内置（它会声明 "tools"）。
@@ -257,7 +346,7 @@ class RunEventProjector(StreamTransformer):
     #: `values` / `messages` / `tasks` 不用在这里列 —— 三个默认内置
     #: （ValuesTransformer / MessagesTransformer / LifecycleTransformer）
     #: 已经把它们的模式请求过了。
-    required_stream_modes: ClassVar[tuple[str, ...]] = ("tools",)
+    required_stream_modes: ClassVar[tuple[str, ...]] = ("custom",)
 
     def __init__(
             self,
@@ -267,6 +356,8 @@ class RunEventProjector(StreamTransformer):
             message_nodes: Collection[str] = (),
             message_roles: Collection[str] = (),
             node_facts: Mapping[str, Mapping[str, Any]] | None = None,
+            trace_id: str | None = None,
+            session_id: str | None = None,
     ) -> None:
         """
         Parameters
@@ -336,6 +427,47 @@ class RunEventProjector(StreamTransformer):
         super().__init__(scope)
 
         self._run_id = run_id
+
+        # ---- Trace ----
+        #
+        # trace_id 来自客户端、已落 agent_run 行；None = 这次运行不采
+        # trace。custom 模式仍然要请求（工具事件走它），只是额外再开
+        # tools 通道来收工具 span。
+        self._trace_id = trace_id or None
+        self._session_id = None if session_id is None else str(session_id)
+        self._trace_enabled = bool(self._trace_id)
+        self._trace_publisher = RedisTracePublisher()
+
+        #: 同一 node_name 在一整次运行里的执行序号（从 0 开始）。
+        #: 投影层按 scope 实例化；Send 分支也在同一个根 scope，因此
+        #: 这里的计数与"同一 Run 内"的口径一致。
+        self._trace_node_index: dict[str, int] = {}
+
+        #: tasks 里 tools 分支的映射：tool_call_id -> 分支信息。
+        #: 分支信息来自 `tasks.data.input`（Send payload，业务数据，不是
+        #: trace 数据），用于给 tool.* 找真实的父 span。
+        self._trace_tool_tasks: dict[str, dict[str, Any]] = {}
+
+        #: fanout 分支：branch_id -> {fanout_id, branch_span_id, branch_index}
+        self._trace_fanout_branches: dict[str, dict[str, Any]] = {}
+
+        #: fanout 父：fanout span_id -> 计数状态
+        self._trace_fanouts: dict[str, dict[str, Any]] = {}
+
+        #: 已经发过 first_output 的标记（每个投影实例一次）。
+        self._trace_first_output = False
+
+        #: LLM run_id -> message-start 时刻 / model span 关联。
+        self._trace_llm: dict[str, dict[str, Any]] = {}
+
+        #: 已经发过 first_token 的 LLM run_id。
+        self._trace_first_token: set[str] = set()
+
+        #: tool_call_id -> 开始时刻 / span 信息。
+        self._trace_tools_inflight: dict[str, dict[str, Any]] = {}
+
+        #: task_id -> 该次执行的 trace 信息（span / index / 分支）。
+        self._trace_tasks: dict[str, dict[str, Any]] = {}
         self._message_nodes = frozenset(message_nodes)
         #: 正文放行的角色集合（见 __init__ 的 message_roles）。
         self._message_roles = frozenset(str(role) for role in message_roles)
@@ -353,18 +485,11 @@ class RunEventProjector(StreamTransformer):
         #: 见 `_on_messages` 里对"整条消息"去重的说明。
         self._completed: set[str] = set()
 
-        #: tool_call_id -> 工具名。
-        #:
-        #: ⚠️ 必需的一跳，不是优化：`tool-finished` 的载荷里**没有**
-        #: `tool_name`（实测只有 `tool_call_id` 与 `output`）——
-        #:
-        #:     tool-started   {"tool_call_id": ..., "tool_name": ..., "input": ...}
-        #:     tool-finished  {"tool_call_id": ...,                  "output": ...}
-        #:
-        #: 所以名字只能在 start 时抓下来，到 finish 时按 id 取回。
-        #: `tool_call_id` 正是"这条事件与图里那次调用对上号"的唯一凭据
-        #: （tool_processor/observer/events.py 的模块 docstring 也是这么用的）。
-        self._tool_names: dict[str, str] = {}
+        # ⚠️ 这是**实例属性**，不是类属性：langgraph 的
+        # `_collect_stream_modes` 是对 mux 里的实例 `getattr`。
+        # custom 是基类就有的（工具事件），tools 只在采 trace 时才多要。
+        if self._trace_enabled:
+            self.required_stream_modes = ("custom", "tools")
 
     def init(self) -> dict[str, Any]:
         return {}
@@ -411,12 +536,264 @@ class RunEventProjector(StreamTransformer):
         method = event.get("method")
         data = params.get("data")
 
+        timestamp = params.get("timestamp")
+
         if method == "tasks":
-            await self._on_tasks(data, params.get("timestamp"))
+            await self._on_tasks(data, timestamp)
         elif method == "messages":
-            await self._on_messages(data)
+            await self._on_messages(data, timestamp)
         elif method == "tools":
-            await self._on_tool(data)
+            await self._on_tool(data, timestamp)
+        elif method == "custom":
+            await self._on_custom(data, timestamp)
+
+    # ----------------------------------------------------------
+    # Trace 出口
+    # ----------------------------------------------------------
+
+    async def _emit_trace(
+            self,
+            event_type: TraceEventType,
+            *,
+            span_id: str,
+            span_kind: SpanKind,
+            span_name: str,
+            parent_span_id: str | None = None,
+            status: SpanStatus | None = None,
+            attempt: int = 1,
+            duration_ms: int | None = None,
+            payload: Mapping[str, Any] | None = None,
+            error: TraceError | None = None,
+            occurred_at: datetime | None = None,
+            fanout_id: str | None = None,
+            branch_id: str | None = None,
+            branch_index: int | None = None,
+    ) -> None:
+        """把一条投影出来的事件写进 trace topic。未开启时直接返回。"""
+
+        if not self._trace_enabled:
+            return
+
+        await self._trace_publisher.emit(
+            event_type,
+            trace_id=self._trace_id,
+            run_id=self._run_id,
+            thread_id=self._session_id,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            span_kind=span_kind,
+            span_name=span_name,
+            status=status,
+            attempt=attempt,
+            duration_ms=duration_ms,
+            fanout_id=fanout_id,
+            branch_id=branch_id,
+            branch_index=branch_index,
+            payload=payload,
+            error=error,
+            occurred_at=occurred_at,
+        )
+
+    async def _on_custom(self, data: Any, timestamp: Any) -> None:
+        """
+        节点 / 自有 runtime 通过 custom stream 发来的东西，有两种：
+
+            1. 工具生命周期（`kind == TOOL_STREAM_KIND`）
+               工具节点写的，这里投影成 `tool.called` / `tool.completed`。
+               **与 trace 无关**，未采 trace 时也照常发。
+
+            2. TraceEvent
+               节点侧已经决定了 span_id / parent_span_id / attempt，
+               这里只做二次校验与转发。丢弃条件：
+
+                   - 不是完整 TraceEvent（schema_version 不对 / 校验失败）
+                   - trace_id / run_id 与当前投影实例不一致（跨运行串线的保险）
+        """
+
+        if not isinstance(data, dict):
+            return
+
+        if data.get("kind") == TOOL_STREAM_KIND:
+            await self._on_tool_stream_event(data)
+            return
+
+        if data.get("kind") == TASK_STREAM_KIND:
+            await self._on_task_stream_event(data)
+            return
+
+        if data.get("kind") == SUBAGENT_STREAM_KIND:
+            await self._on_subagent_stream_event(data)
+            return
+
+        if not self._trace_enabled:
+            return
+
+        try:
+            event = TraceEvent.model_validate(data)
+
+        except Exception:  # noqa: BLE001 —— 非法事件只丢这一条
+            return
+
+        if event.trace_id != self._trace_id or event.run_id != self._run_id:
+            return
+
+        try:
+            await self._trace_publisher.publish(event)
+        except Exception:  # noqa: BLE001
+            return
+
+        # fanout 记账：branch_created 之后，tools 分支的 task 才能把
+        # branch_id 映射到真实的 branch_span_id / fanout_id。
+        if event.event_type is TraceEventType.FANOUT_STARTED:
+            self._trace_fanouts[event.span_id] = {
+                "expected": event.payload.get("expected_branch_count"),
+                "parent_span_id": event.parent_span_id,
+                "created": 0,
+                "completed": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "branches": set(),
+                "done": set(),
+            }
+
+        elif event.event_type is TraceEventType.FANOUT_BRANCH_CREATED:
+            self._trace_fanout_branches[str(event.payload["branch_id"])] = {
+                "fanout_id": event.span_id,
+                "branch_span_id": event.payload["branch_span_id"],
+                "branch_index": event.payload["branch_index"],
+            }
+
+            state = self._trace_fanouts.get(event.span_id)
+            if state is not None:
+                state["created"] += 1
+                state["branches"].add(str(event.payload["branch_id"]))
+
+    # ----------------------------------------------------------
+    # custom(tool) -> tool.called / tool.completed
+    # ----------------------------------------------------------
+    #
+    # 工具节点不直接写 Redis（见 graph/react/tools.py 的
+    # `_publish_tool_event`）：它把下面这两条写进自定义流，与 trace 的
+    # fanout.* 同一条路。这里只做形状转换，不改字段。
+    #
+    # ⚠️ `node` 只能是 `None`
+    # ---------------------------
+    # 工具事件没有节点名这个字段（与原来的契约一致）。写死 "tools" 会让
+    # `RunEvent.node` 从事实变成猜测，订阅端可能拿它做分组。
+
+    async def _on_tool_stream_event(self, data: Mapping[str, Any]) -> None:
+        event = data.get("event")
+
+        if event == RunEventType.TOOL_CALLED.value:
+            await self._emit(
+                RunEventType.TOOL_CALLED,
+                node=None,
+                data={
+                    "tool_call_id": data.get("tool_call_id"),
+                    "tool_name": data.get("tool_name"),
+                    "input": data.get("input"),
+                },
+            )
+            return
+
+        if event == RunEventType.TOOL_COMPLETED.value:
+            payload: dict[str, Any] = {
+                "tool_call_id": data.get("tool_call_id"),
+                "tool_name": data.get("tool_name"),
+                "output": data.get("output"),
+            }
+
+            # 成功与失败共用一条事件（契约里没有 tool.error）：失败带
+            # `error`，成功不带 —— 不要给成功补一个 `error: None`。
+            if "error" in data:
+                payload["error"] = data.get("error")
+
+            await self._emit(
+                RunEventType.TOOL_COMPLETED,
+                node=None,
+                data=payload,
+            )
+
+    async def _on_task_stream_event(self, data: Mapping[str, Any]) -> None:
+        """custom kind=task -> plan.published / task.updated / plan.cleared。"""
+
+        mapping = {
+            RunEventType.PLAN_PUBLISHED.value: (
+                RunEventType.PLAN_PUBLISHED
+            ),
+            RunEventType.TASK_UPDATED.value: RunEventType.TASK_UPDATED,
+            RunEventType.PLAN_CLEARED.value: RunEventType.PLAN_CLEARED,
+        }
+
+        event_type = mapping.get(str(data.get("event") or ""))
+
+        if event_type is None:
+            return
+
+        payload = {
+            key: value
+            for key, value in data.items()
+            if key not in {"kind", "event", "node"}
+        }
+
+        await self._emit(
+            event_type,
+            node=(
+                str(data["node"])
+                if data.get("node") is not None
+                else None
+            ),
+            data=payload,
+        )
+
+    async def _on_subagent_stream_event(
+            self,
+            data: Mapping[str, Any],
+    ) -> None:
+        """
+        custom kind=subagent -> subagent.created / claimed / task.updated /
+        completed。
+
+        与任务板那组同形：只做 kind/event 的形状转换，载荷原样保留
+        （`worker_id` / `task` / `previous_state` / `status` 都是前端
+        需要的字段，不在投影层筛选）。
+        """
+
+        mapping = {
+            RunEventType.SUBAGENT_CREATED.value: (
+                RunEventType.SUBAGENT_CREATED
+            ),
+            RunEventType.SUBAGENT_CLAIMED.value: (
+                RunEventType.SUBAGENT_CLAIMED
+            ),
+            RunEventType.SUBAGENT_TASK_UPDATED.value: (
+                RunEventType.SUBAGENT_TASK_UPDATED
+            ),
+            RunEventType.SUBAGENT_COMPLETED.value: (
+                RunEventType.SUBAGENT_COMPLETED
+            ),
+        }
+
+        event_type = mapping.get(str(data.get("event") or ""))
+
+        if event_type is None:
+            return
+
+        payload = {
+            key: value
+            for key, value in data.items()
+            if key not in {"kind", "event", "node"}
+        }
+
+        await self._emit(
+            event_type,
+            node=(
+                str(data["node"])
+                if data.get("node") is not None
+                else None
+            ),
+            data=payload,
+        )
 
     # ----------------------------------------------------------
     # tasks -> node.started / node.completed
@@ -454,11 +831,26 @@ class RunEventProjector(StreamTransformer):
             }
 
             await self._emit(RunEventType.NODE_STARTED, node=name, data=payload)
+
+            await self._trace_task_started(
+                task_id=task_id,
+                name=name,
+                data=data,
+                timestamp=timestamp,
+            )
             return
 
         # ---- 结束 ----
         pending = self._tasks.pop(task_id, None)
         result = data.get("result")
+
+        # ⚠️ 节点结束 = 它名下的模型调用不可能还在跑
+        # ----------------------------------------
+        # 兜住"最后一次调用失败、没有下一次 message-start 来触发
+        # _close_superseded"的情况。放在 node.completed **之前**：订阅端
+        # 先收到 message.completed（收起 loading）、再收到 node.completed，
+        # 顺序与正常结束时一致。
+        await self._close_node_pending(node=name)
 
         completed: dict[str, Any] = {
             "node_id": name,
@@ -492,11 +884,261 @@ class RunEventProjector(StreamTransformer):
 
         await self._emit(RunEventType.NODE_COMPLETED, node=name, data=completed)
 
+        await self._trace_task_finished(
+            task_id=task_id,
+            name=name,
+            data=data,
+            timestamp=timestamp,
+        )
+
+    # ----------------------------------------------------------
+    # Trace: node.* / fanout 收口
+    # ----------------------------------------------------------
+
+    async def _trace_task_started(
+            self,
+            *,
+            task_id: str,
+            name: Any,
+            data: Mapping[str, Any],
+            timestamp: Any,
+    ) -> None:
+        if not self._trace_enabled:
+            return
+
+        node_name = str(name)
+        facts = self._node_facts.get(node_name, {})
+
+        # 同一 node_name 在本次运行里的执行序号（从 0 开始）。
+        index = self._trace_node_index.get(node_name, 0)
+        self._trace_node_index[node_name] = index + 1
+
+        span_id = task_id
+        parent_span_id = self._run_id
+        fanout_id: str | None = None
+        branch_id: str | None = None
+        branch_index: int | None = None
+
+        if node_name == "tools" or facts.get("group") == "fanout":
+            tip = self._record_tool_branch(task_id, data)
+            if tip is not None:
+                # tools 节点的 span 是分支节点（task_id）；fanout 是它的
+                # 父，tool 执行是它的子 span（见 _tool_refs）。
+                parent_span_id = tip["fanout_id"] or self._run_id
+                fanout_id = tip["fanout_id"]
+                branch_id = tip["branch_id"]
+                branch_index = tip["branch_index"]
+
+        self._trace_tasks[task_id] = {
+            "name": node_name,
+            "node_type": facts.get("group") or facts.get("node_type"),
+            "index": index,
+            "started_ms": timestamp if isinstance(timestamp, int) else None,
+            "span_id": span_id,
+            "parent_span_id": parent_span_id,
+            "fanout_id": fanout_id,
+            "branch_id": branch_id,
+            "branch_index": branch_index,
+        }
+
+        await self._emit_trace(
+            TraceEventType.NODE_STARTED,
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            span_kind=SpanKind.NODE,
+            span_name=node_name,
+            status=SpanStatus.RUNNING,
+            occurred_at=_ms_to_datetime(timestamp),
+            fanout_id=fanout_id,
+            branch_id=branch_id,
+            branch_index=branch_index,
+            payload={
+                "node_name": node_name,
+                "node_type": facts.get("group") or facts.get("node_type"),
+                "node_execution_index": index,
+            },
+        )
+
+    def _record_tool_branch(
+            self,
+            task_id: str,
+            data: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """
+        从 tools 分支的 Send payload 里读出 tool_call_id / call_scope。
+
+        Send payload 是**业务数据**（ToolBranchPayload），不是 trace 数据；
+        这里只是用它做关联，不往 state 里写任何 trace 字段。
+        """
+
+        raw_input = data.get("input")
+
+        if not isinstance(raw_input, dict):
+            return None
+
+        call = raw_input.get("call")
+        call_id = call.get("id") if isinstance(call, dict) else None
+        call_scope = raw_input.get("call_scope")
+
+        branch = (
+            self._trace_fanout_branches.get(str(call_scope))
+            if call_scope is not None
+            else None
+        )
+
+        tip: dict[str, Any] = {
+            "task_id": task_id,
+            "call_scope": None if call_scope is None else str(call_scope),
+            "branch_span_id": branch["branch_span_id"] if branch else None,
+            "fanout_id": branch["fanout_id"] if branch else None,
+            "branch_index": branch["branch_index"] if branch else None,
+            "branch_id": None if call_scope is None else str(call_scope),
+        }
+
+        if call_id is not None:
+            self._trace_tool_tasks[str(call_id)] = tip
+
+        return tip
+
+    async def _trace_task_finished(
+            self,
+            *,
+            task_id: str,
+            name: Any,
+            data: Mapping[str, Any],
+            timestamp: Any,
+    ) -> None:
+        if not self._trace_enabled:
+            return
+
+        info = self._trace_tasks.pop(task_id, None)
+
+        if info is None:
+            return
+
+        duration_ms = _span_elapsed_ms(info.get("started_ms"), timestamp)
+        error = data.get("error")
+        interrupts = data.get("interrupts") or ()
+
+        common = {
+            "span_id": info["span_id"],
+            "parent_span_id": info["parent_span_id"],
+            "span_kind": SpanKind.NODE,
+            "span_name": str(name),
+            "duration_ms": duration_ms,
+            "occurred_at": _ms_to_datetime(timestamp),
+            "fanout_id": info.get("fanout_id"),
+            "branch_id": info.get("branch_id"),
+            "branch_index": info.get("branch_index"),
+        }
+
+        outcome = "completed"
+
+        if error:
+            outcome = "failed"
+            await self._emit_trace(
+                TraceEventType.NODE_FAILED,
+                status=SpanStatus.FAILED,
+                payload={
+                    "node_name": str(name),
+                    "node_type": info.get("node_type"),
+                },
+                error=(
+                    _trace_error(error)
+                    or TraceError(type="NodeError", message="")
+                ),
+                **common,
+            )
+
+        elif interrupts:
+            outcome = "interrupted"
+            for interrupt in interrupts:
+                interrupt_id = (
+                    interrupt.get("id")
+                    if isinstance(interrupt, dict)
+                    else getattr(interrupt, "id", None)
+                )
+                await self._emit_trace(
+                    TraceEventType.NODE_INTERRUPTED,
+                    status=SpanStatus.INTERRUPTED,
+                    payload={
+                        "node_name": str(name),
+                        "interrupt_id": str(interrupt_id),
+                        "interrupt_type": "hitl",
+                    },
+                    **common,
+                )
+
+        else:
+            await self._emit_trace(
+                TraceEventType.NODE_COMPLETED,
+                status=SpanStatus.COMPLETED,
+                payload={
+                    "node_name": str(name),
+                    "node_type": info.get("node_type"),
+                },
+                **common,
+            )
+
+        await self._trace_fanout_progress(info, outcome)
+
+    async def _trace_fanout_progress(
+            self,
+            info: Mapping[str, Any],
+            outcome: str,
+    ) -> None:
+        """一个分支结束时记账；收齐后发 fanout.completed。"""
+
+        fanout_id = info.get("fanout_id")
+        branch_id = info.get("branch_id")
+
+        if not fanout_id or not branch_id:
+            return
+
+        state = self._trace_fanouts.get(str(fanout_id))
+
+        if state is None or str(branch_id) in state["done"]:
+            return
+
+        if outcome == "interrupted":
+            # 暂停不是结束：既不算 completed 也不算 failed，等 resume
+            # 后同一个 branch_id 再交结果。不能在这里计入 done。
+            return
+
+        state["done"].add(str(branch_id))
+
+        if outcome == "failed":
+            state["failed"] += 1
+        else:
+            state["completed"] += 1
+
+        expected = state.get("expected")
+
+        if expected is None or len(state["done"]) < int(expected):
+            return
+
+        self._trace_fanouts.pop(str(fanout_id), None)
+
+        await self._emit_trace(
+            TraceEventType.FANOUT_COMPLETED,
+            span_id=str(fanout_id),
+            parent_span_id=state.get("parent_span_id"),
+            span_kind=SpanKind.FANOUT,
+            span_name="tool_fanout",
+            status=SpanStatus.COMPLETED,
+            payload={
+                "created_branch_count": state["created"],
+                "completed_branch_count": state["completed"],
+                "failed_branch_count": state["failed"],
+                "cancelled_branch_count": state["cancelled"],
+            },
+        )
+
     # ----------------------------------------------------------
     # messages -> message.started / message.delta / message.completed
     # ----------------------------------------------------------
 
-    async def _on_messages(self, data: Any) -> None:
+    async def _on_messages(self, data: Any, timestamp: Any = None) -> None:
         # ⚠️ 是 **tuple**，不是 list
         # --------------------------
         # `MessagesTransformer` 的 docstring 写的是
@@ -516,6 +1158,16 @@ class RunEventProjector(StreamTransformer):
             return
 
         node = meta.get("langgraph_node")
+
+        # trace 的 first_token / first_output 必须在 **message_nodes 门之前**
+        # 处理：它们要覆盖内部调用（压缩 / 分类）产生的模型请求，而门只
+        # 决定"哪些消息算给用户看的正文"。
+        await self._trace_on_llm_event(
+            payload=payload,
+            meta=meta,
+            node=node,
+            timestamp=timestamp,
+        )
 
         if str(node) not in self._message_nodes:
             # 不属于"给用户看的助手正文"的节点（比如 builder 的结构化输出）。
@@ -545,6 +1197,22 @@ class RunEventProjector(StreamTransformer):
         sub = payload.get("event")
 
         if sub == _EV_MESSAGE_START:
+            # ⚠️ 同一节点、同一角色的上一条还开着，就先把它收尾
+            # ------------------------------------------------
+            # 重试 / 降级会开一条新的 LLM run，而**失败的那次不会发
+            # message-finish**（协议的终态只由成功路径产出）。若不在这里
+            # 关掉，事件流上会留下一条永远 `started` 的消息 —— 订阅端把
+            # 这一条的 delta 接在它后面，就是"一步的消息跨到下一步"。
+            #
+            # 判据是"节点 + 角色"而不是只有节点：同一节点的模型调用目前
+            # 是串行的（压缩 -> 主循环），但将来若出现同节点并发调用，
+            # 不同角色各有各的在途消息，不该被彼此误关。
+            await self._close_superseded(
+                node=node,
+                role=role,
+                run_key=run_key,
+            )
+
             self._messages[run_key] = _PendingMessage(
                 node=node,
                 message_id=payload.get("id"),
@@ -604,6 +1272,119 @@ class RunEventProjector(StreamTransformer):
 
         if sub == _EV_MESSAGE_FINISH:
             await self._on_message_finish(run_key, payload)
+
+    async def _trace_on_llm_event(
+            self,
+            *,
+            payload: Any,
+            meta: Mapping[str, Any],
+            node: Any,
+            timestamp: Any,
+    ) -> None:
+        """
+        Trace 侧的模型级事件：
+
+            model.first_token   首条 token（按 LLM run 分别计算 ttft）
+            run.first_output    第一条**可见**正文
+        """
+
+        if not self._trace_enabled:
+            return
+
+        run_key = str(meta.get("run_id"))
+        role = meta.get("model_role")
+        role = str(role) if role is not None else None
+
+        # 与 run 事件的两道门同口径：节点 + 角色。
+        visible = (
+            str(node) in self._message_nodes
+            and role in self._message_roles
+        )
+
+        if not isinstance(payload, dict):
+            # 整条消息（on_chain_end）：没有 delta，不可能是流式
+            # first_token；只有可见正文才可能补 first_output。
+            if visible and not self._trace_first_output:
+                text = _message_text(payload)
+
+                if text:
+                    await self._emit_first_output(timestamp)
+            return
+
+        sub = payload.get("event")
+
+        if sub == _EV_MESSAGE_START:
+            self._trace_llm[run_key] = {
+                "started_ms": timestamp if isinstance(timestamp, int) else None,
+                # 由 ModelRuntime 写进 run metadata（见 model/runtime.py）。
+                "span_id": meta.get("trace_span_id"),
+                "parent_span_id": (
+                    meta.get("trace_parent_span_id") or self._run_id
+                ),
+                "streaming": bool(meta.get("trace_streaming", True)),
+            }
+            return
+
+        if sub == _EV_BLOCK_DELTA:
+            state = self._trace_llm.get(run_key)
+            delta = payload.get("delta")
+            kind = delta.get("type") if isinstance(delta, dict) else None
+
+            if (
+                    kind in (_DELTA_TEXT, _DELTA_REASONING)
+                    and state is not None
+                    and run_key not in self._trace_first_token
+            ):
+                started_ms = state.get("started_ms")
+                span_id = state.get("span_id")
+
+                if (
+                        isinstance(started_ms, int)
+                        and isinstance(timestamp, int)
+                        and span_id
+                        and state.get("streaming", True)
+                ):
+                    await self._emit_trace(
+                        TraceEventType.MODEL_FIRST_TOKEN,
+                        span_id=str(span_id),
+                        parent_span_id=state.get("parent_span_id"),
+                        span_kind=SpanKind.MODEL,
+                        span_name="model.invoke",
+                        occurred_at=_ms_to_datetime(timestamp),
+                        payload={
+                            "ttft_ms": max(0, timestamp - started_ms),
+                        },
+                    )
+                    self._trace_first_token.add(run_key)
+
+            if (
+                    kind == _DELTA_TEXT
+                    and visible
+                    and not self._trace_first_output
+            ):
+                await self._emit_first_output(timestamp)
+
+            return
+
+        if sub == _EV_MESSAGE_FINISH:
+            self._trace_llm.pop(run_key, None)
+
+    async def _emit_first_output(self, timestamp: Any) -> None:
+        """run.first_output：整个运行只发一次（每个投影实例）。"""
+
+        if self._trace_first_output:
+            return
+
+        self._trace_first_output = True
+
+        await self._emit_trace(
+            TraceEventType.RUN_FIRST_OUTPUT,
+            span_id=self._run_id,
+            span_kind=SpanKind.RUN,
+            span_name="run",
+            occurred_at=_ms_to_datetime(timestamp),
+            payload={"output_channel": "message"},
+        )
 
     async def _on_block_delta(self, run_key: str, payload: dict[str, Any]) -> None:
         pending = self._messages.get(run_key)
@@ -728,6 +1509,72 @@ class RunEventProjector(StreamTransformer):
 
         metadata = payload.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
+
+        await self._complete_message(pending, metadata)
+
+    async def _close_superseded(
+            self,
+            *,
+            node: Any,
+            role: str | None,
+            run_key: str,
+    ) -> None:
+        """
+        关闭同节点、同角色、更早的那条在途消息。
+
+        调用点：新的一条 `message-start` 到达时（见 `_on_messages`）。
+        那时旧的那条只可能是**已经死掉但没发终态**的那次调用（重试 /
+        降级换掉了它）—— 同节点同角色同时在跑的两次调用在本仓库不存在。
+        """
+
+        for other_key, pending in list(self._messages.items()):
+
+            if other_key == run_key:
+                continue
+
+            if str(pending.node) != str(node) or pending.role != role:
+                continue
+
+            await self._close_one(other_key, pending)
+
+    async def _close_node_pending(self, *, node: Any) -> None:
+        """关闭一个节点名下所有在途消息。节点结束时调用（见 `_on_tasks`）。"""
+
+        for other_key, pending in list(self._messages.items()):
+
+            if str(pending.node) != str(node):
+                continue
+
+            await self._close_one(other_key, pending)
+
+    async def _close_one(self, run_key: str, pending: _PendingMessage) -> None:
+        """
+        给一条没等到 `message-finish` 的消息补上终态。
+
+        ⚠️ 正文用**已经累积的那一份**（不重发 delta）
+        --------------------------------------------
+        订阅端此前收到的 delta 就是它拼出来的东西；这里再发一遍全文会让
+        正文出现两份。completed 的正文与 delta 的拼接**对得上**（本来就
+        是同一份），对不上也以 completed 为准 —— 与正常结束同一条规则。
+
+        `finish_reason` 传空：这次调用没有正常的终态，不能编一个。
+        """
+
+        self._messages.pop(run_key, None)
+
+        if run_key in self._completed:
+            return
+
+        self._completed.add(run_key)
+
+        await self._complete_message(pending, {})
+
+    async def _complete_message(
+            self,
+            pending: _PendingMessage | None,
+            metadata: Mapping[str, Any],
+    ) -> None:
+        """收尾一条消息：flush 两个闸、发 reasoning.completed（如有）与 completed。"""
 
         #: 这条消息的正文给不给用户看（判据在 message-start 那一刻就定了）。
         #: pending 拿不到（没见过 start 就收到 finish）时按**不可见**处理：
@@ -882,60 +1729,208 @@ class RunEventProjector(StreamTransformer):
         )
 
     # ----------------------------------------------------------
-    # tools -> tool.called / tool.completed
+    # tools -> trace 的 tool.*（**不**发 RunEvent）
     # ----------------------------------------------------------
     #
-    # ⚠️ `node` 这里只能是 `None`
-    # ---------------------------
-    # `tools` 通道的事件载荷里**没有**节点名：
-    #     {"event": "tool-started", "tool_call_id": ..., "tool_name": ..., "input": {...}}
-    # 硬猜一个（比如写死 "tools"）会让 RunEvent.node 从"事实"变成"猜测"，
-    # 而订阅端可能拿它做分组。宁可缺，不要编。
+    # ⚠️ 这里**只给 trace 用**，不再发 RunEvent
+    # -------------------------------------
+    # `tools` 通道的事件由 langchain 的 `on_tool_*` 回调产生
+    # （langgraph/pregel/_tools.py）。本仓的 tools 节点是自定义扇出
+    # 节点，执行时直接 `spec.tool.ainvoke(...)`，没带 tool_call_id：
+    # 回调里 langgraph 会回退成 `str(run_id)`（一个 UUID）、名字取
+    # 工具函数名（`search` / `current_time`）。
+    #
+    # 前端的 tool.called / tool.completed 走**另一条**：工具节点写
+    # 自定义流（`_on_tool_stream_event`），带模型的 tool_call_id 与
+    # tool_key。这里若再发一遍，订阅端会看到两次调用 —— 而两次的 id
+    # 还对不上（上一版就是这么漏成 4 条的）。
+    #
+    # trace 仍走这里：工具 span 本来就是挂在这条回调链上的，去掉就没了。
 
-    async def _on_tool(self, data: Any) -> None:
+    async def _on_tool(self, data: Any, timestamp: Any = None) -> None:
         if not isinstance(data, dict):
             return
 
         sub = data.get("event")
         call_id = data.get("tool_call_id")
 
-        if sub == _TC_STARTED:
-            name = data.get("tool_name")
-            if call_id and name:
-                # 存起来给 finish 用（finish 的载荷里没有名字，见 __init__）。
-                self._tool_names[str(call_id)] = str(name)
+        tip = (
+            self._trace_tool_tasks.get(str(call_id))
+            if call_id is not None
+            else None
+        )
 
-            await self._emit(
-                RunEventType.TOOL_CALLED,
-                node=None,
-                data={
-                    "tool_call_id": call_id,
-                    "tool_name": name,
-                    "input": data.get("input"),
-                },
+        if sub == _TC_STARTED:
+            await self._trace_tool_started(
+                call_id=call_id,
+                name=data.get("tool_name"),
+                tip=tip,
+                timestamp=timestamp,
             )
             return
 
         if sub in (_TC_FINISHED, _TC_ERROR):
-            # 名字从 start 那一跳取回；取不到（比如中途才开始收、或
-            # finish 先到）就退化成 None，而不是编一个。
-            name = data.get("tool_name")
-            if not name and call_id:
-                name = self._tool_names.pop(str(call_id), None)
-
-            payload: dict[str, Any] = {
-                "tool_call_id": call_id,
-                "tool_name": name,
-                "output": data.get("output"),
-            }
-            if sub == _TC_ERROR:
-                payload["error"] = str(data.get("error") or "")
-
-            await self._emit(RunEventType.TOOL_COMPLETED, node=None, data=payload)
+            # `tool-finished` 的载荷里没有名字（见 __init__），取不到
+            # 就退化成 None，由 trace 那边用在途记录里的名字兜底。
+            await self._trace_tool_finished(
+                call_id=call_id,
+                name=data.get("tool_name"),
+                tip=tip,
+                data=data,
+                failed=sub == _TC_ERROR,
+                timestamp=timestamp,
+            )
 
         # `tool-output-delta` 刻意不发：它是工具产出的**流式**分片，
         # 频率与 message.delta 同量级，而契约里没有对应的工具增量事件。
         # 不做比编一个更诚实。
+
+    # ----------------------------------------------------------
+    # Trace: tool.*
+    # ----------------------------------------------------------
+
+    def _tool_refs(
+            self,
+            *,
+            call_id: Any,
+            name: Any,
+            tip: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """tool 的 span / parent / 分支信息（拿不到的字段留 None）。"""
+
+        # ⚠️ 用 tool_call_id 而不是 call_scope：工具执行链（幂等 / 重试
+        # 埋点）只知道 tool_call_id，两边必须算出同一个 span_id。
+        tool_key = (
+            str(call_id)
+            if call_id is not None
+            else ((tip or {}).get("call_scope") or str(name or "tool"))
+        )
+
+        # 工具 Span 是 tools 分支节点（task_id）的子 Span；它的 id 优先
+        # 用 route 预先算好的 branch_span_id（与执行链的确定性 id 一致）。
+        node_span_id = None
+        branch_span_id = None
+        if tip is not None:
+            node_span_id = tip.get("task_id")
+            branch_span_id = tip.get("branch_span_id")
+
+        return {
+            "span_id": (
+                branch_span_id
+                or _tool_span_id(self._trace_id or "", str(tool_key))
+            ),
+            "parent_span_id": node_span_id or self._run_id,
+            "fanout_id": (tip or {}).get("fanout_id"),
+            "branch_id": (tip or {}).get("branch_id"),
+            "branch_index": (tip or {}).get("branch_index"),
+        }
+
+    async def _trace_tool_started(
+            self,
+            *,
+            call_id: Any,
+            name: Any,
+            tip: Mapping[str, Any] | None,
+            timestamp: Any,
+    ) -> None:
+        if not self._trace_enabled or call_id is None:
+            return
+
+        refs = self._tool_refs(call_id=call_id, name=name, tip=tip)
+
+        self._trace_tools_inflight[str(call_id)] = {
+            **refs,
+            "started_ms": timestamp if isinstance(timestamp, int) else None,
+            "tool_name": None if name is None else str(name),
+        }
+
+        await self._emit_trace(
+            TraceEventType.TOOL_STARTED,
+            span_id=refs["span_id"],
+            parent_span_id=refs["parent_span_id"],
+            span_kind=SpanKind.TOOL,
+            span_name=str(name or "tool"),
+            status=SpanStatus.RUNNING,
+            occurred_at=_ms_to_datetime(timestamp),
+            fanout_id=refs["fanout_id"],
+            branch_id=refs["branch_id"],
+            branch_index=refs["branch_index"],
+            payload={
+                "tool_name": str(name or ""),
+                "tool_call_id": str(call_id),
+            },
+        )
+
+    async def _trace_tool_finished(
+            self,
+            *,
+            call_id: Any,
+            name: Any,
+            tip: Mapping[str, Any] | None,
+            data: Mapping[str, Any],
+            failed: bool,
+            timestamp: Any,
+    ) -> None:
+        if not self._trace_enabled or call_id is None:
+            return
+
+        info = self._trace_tools_inflight.pop(str(call_id), None)
+
+        if info is None:
+            refs = self._tool_refs(call_id=call_id, name=name, tip=tip)
+            started_ms = None
+        else:
+            refs = {
+                "span_id": info["span_id"],
+                "parent_span_id": info["parent_span_id"],
+                "fanout_id": info.get("fanout_id"),
+                "branch_id": info.get("branch_id"),
+                "branch_index": info.get("branch_index"),
+            }
+            started_ms = info.get("started_ms")
+
+        tool_name = str(name or (info or {}).get("tool_name") or "")
+
+        common = {
+            "span_id": refs["span_id"],
+            "parent_span_id": refs["parent_span_id"],
+            "span_kind": SpanKind.TOOL,
+            "span_name": tool_name or "tool",
+            "duration_ms": _span_elapsed_ms(started_ms, timestamp),
+            "occurred_at": _ms_to_datetime(timestamp),
+            "fanout_id": refs["fanout_id"],
+            "branch_id": refs["branch_id"],
+            "branch_index": refs["branch_index"],
+        }
+
+        if failed:
+            await self._emit_trace(
+                TraceEventType.TOOL_FAILED,
+                status=SpanStatus.FAILED,
+                payload={
+                    "tool_name": tool_name,
+                    "tool_call_id": str(call_id),
+                },
+                error=(
+                    _trace_error(data.get("error"))
+                    or TraceError(type="ToolError", message="")
+                ),
+                **common,
+            )
+            return
+
+        output = data.get("output")
+
+        await self._emit_trace(
+            TraceEventType.TOOL_COMPLETED,
+            status=SpanStatus.COMPLETED,
+            payload={
+                "tool_name": tool_name,
+                "tool_call_id": str(call_id),
+                "result_size_bytes": _output_size(output),
+            },
+            **common,
+        )
 
     # ----------------------------------------------------------
     # 出口
@@ -948,6 +1943,9 @@ class RunEventProjector(StreamTransformer):
             node: Any,
             data: Mapping[str, Any],
     ) -> None:
+        # 所有出站事件（run / trace）都走同一个 EventPublisher 抽象；
+        # 写线程池在 publisher.py 内部按 stream key 分片维护，投影层只
+        # 负责入队，绝不直接碰 Redis。
         await publish_run_event(
             type,
             self._run_id,
@@ -982,6 +1980,8 @@ def projector_factory(
         message_nodes: Collection[str],
         message_roles: Collection[str] = (),
         node_facts: Mapping[str, Mapping[str, Any]] | None = None,
+        trace_id: str | None = None,
+        session_id: str | None = None,
 ) -> Any:
     """
     `astream_events(..., transformers=[...])` 要的是 `factory(scope) -> StreamTransformer`，
@@ -1007,6 +2007,8 @@ def projector_factory(
             message_nodes=message_nodes,
             message_roles=message_roles,
             node_facts=node_facts,
+            trace_id=trace_id,
+            session_id=session_id,
         )
 
     return _factory

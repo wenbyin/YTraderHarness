@@ -11,7 +11,11 @@ from __future__ import annotations
 from enum import Enum
 
 __all__ = [
+    "ExecutionDecision",
+    "ExecutionMatch",
     "ExecutionMode",
+    "ExecutionScope",
+    "GuardAction",
     "ProcessorHook",
     "ProcessorType",
     "RETRYABLE_EXECUTION_STATUSES",
@@ -38,11 +42,13 @@ class SourceType(str, Enum):
         从一份 OpenAPI spec 里抽出来的 operation。
         entrypoint 是 operationId，source_ref 是 spec 的位置。
 
-    ⚠️ 本期只实现了 LOCAL_METHOD（见 discoverer.py 的注册表）。
-    另外两个先把值占好：它们是"同一件事的另一些来源"，不是"以后
-    可能要支持"—— 表结构、sync 的比对逻辑、source_state 的语义
-    对三种来源完全一样，区别只在扫描器。占好值可以避免将来
-    加一个来源就要动一次枚举与已有数据。
+    LOCAL_METHOD 与 MCP 都已有扫描器：前者扫代码（见
+    registry/scanner.py），后者按 mcp.yaml 连 server 取
+    `tools/list`（见 registry/mcp_scanner.py）。OPENAPI 仍只占
+    枚举值。
+
+    三种来源是"同一件事的另一些来源"：表结构、sync 的比对逻辑、
+    source_state 的语义完全一样，区别只在扫描器与执行入口。
     """
 
     LOCAL_METHOD = "local_method"
@@ -141,6 +147,84 @@ class ExecutionMode(str, Enum):
     ASYNC = "ASYNC"
 
 
+# ============================================================
+# 执行守卫（Execution Guard）
+# ============================================================
+#
+# 守卫回答的是「同一个维度上已经发生过几次、这次还让不让做」。
+# 它不是幂等判重：幂等是「这件事只能发生一次」，守卫是「同一维度
+# 最多发生 N 次」。两者可以用同一套配置表达（limit=1 + invoke），
+# 但概念上必须分开 —— 混在一起会让「为什么第 2 次被拦」有两种
+# 完全不同的答案。
+
+
+class ExecutionScope(str, Enum):
+    """
+    计数按什么维度聚合。
+
+        SESSION   同一会话
+        RUN       同一次运行（pipeline_run_id）
+        USER      同一个用户（caller_identity.user_id）
+        GLOBAL    所有用户
+
+    ⚠️ GLOBAL 是跨租户的：一个用户刷满额度会把所有人挡住。
+    除非业务明确要「全局熔断」，否则不要把它当默认值。
+    """
+
+    SESSION = "SESSION"
+    RUN = "RUN"
+    USER = "USER"
+    GLOBAL = "GLOBAL"
+
+
+class ExecutionMatch(str, Enum):
+    """
+    哪些调用算「同一个调用」。
+
+        METHOD    只看工具（方法），不同参数合并计数
+        INVOKE    工具 + 参数摘要，只有完全相同才合并
+
+    INVOKE 的参数摘要由服务层用 `_execution.param_hash_of` 计算，
+    与执行记录的 param_hash 是同一个算法。
+    """
+
+    METHOD = "METHOD"
+    INVOKE = "INVOKE"
+
+
+class GuardAction(str, Enum):
+    """
+    守卫命中后的动作。
+
+        BLOCK   不执行工具，返回一条拒绝结果
+        ALLOW   放行；计数仍然发生，只是不拦（用于灰度 / 告警模式）
+
+    「超过上限」「已有 UNKNOWN」「已有 ERROR」各有一个独立的动作，
+    因此同一个守卫可以做到「上限拦截、错误放行、未知拦截」。
+    """
+
+    BLOCK = "BLOCK"
+    ALLOW = "ALLOW"
+
+
+class ExecutionDecision(str, Enum):
+    """
+    一次预占请求的判定结果。
+
+        EXECUTE  允许执行；调用方拿到一条 PENDING 记录，跑完要 settle
+        BLOCK    不执行；reason 说明原因
+        REPLAY   同一次工具调用（run_id + tool_call_id）已经成功过，
+                 直接回放当时的结果，**不再执行**
+
+    REPLAY 不是「拦截」：它返回的是一条真实成功过的结果。把它记成
+    失败会让模型基于一个不存在的结果继续编。
+    """
+
+    EXECUTE = "EXECUTE"
+    BLOCK = "BLOCK"
+    REPLAY = "REPLAY"
+
+
 class ToolExecutionStatus(str, Enum):
     """
     一次工具调用在 `tool_execution` 里的一生。
@@ -155,27 +239,30 @@ class ToolExecutionStatus(str, Enum):
         RUNNING     执行中，或**无法确认**是否执行过   重试：拒绝
                     （fail-closed：不确定就当副作用可能已发生）
         SUCCESS     执行成功，结果已落库            重试：拒绝（工具确实跑过了）
-        FAILED      确认失败，**且没有产生副作用**   重试：允许
-        UNKNOWN     无法确认操作是否成功            重试：拒绝
+        FAILED      工具明确报错                    重试：由守卫的 error 配额决定
+                    ⚠️ 它**不承诺**没有副作用 —— 新账本里它只表示
+                    「工具抛了异常」，是否重试是配置项，不再是状态本身
+        UNKNOWN     无法确认操作是否成功            重试：由守卫的 unknown 配额决定
+                    来源：执行开始后被取消、进程崩溃遗留、审批之后的
+                    中断（见下）
+        BLOCKED     守卫**主动**拦下，工具未执行      重试：允许（重算一次决策）
         CANCELLED   执行前已取消，确认无副作用       重试：允许
         REJECTED    执行前被权限 / 参数 / 业务规则拒绝 重试：允许（让链再判一次）
         INTERRUPT   HITL 中断，**工具未执行**        重试：允许
 
-    ⚠️ 本期有**两个取值没有任何写入方**：FAILED 与 UNKNOWN
-    ----------------------------------------------------
-    与 SourceType 把 MCP / OPENAPI 先占好是同一套做法
-    （见上面那个枚举）—— 表结构与策略对它们已经完全成立，少的
-    只是一个产生它们的时机：
+    ⚠️ FAILED 与 UNKNOWN 的写入方现在有了，但语义变了
+    ------------------------------------------------
+    旧账本把「未分类异常」一律落 RUNNING，因为 FAILED 背着
+    「确认无副作用」的承诺。新账本把「是什么状态」与「要不要重试」
+    拆开：状态只描述**发生了什么**，重试由守卫的 success / error /
+    unknown 三种独立配额决定。因此：
 
-        FAILED    它背着"确认无副作用"这个承诺，而我们判不出它是否
-                  成立（工具可能已经产生外部副作用，例如下单走了外部
-                  接口——那不在 factory.scope 的事务里，回滚不了）。
-                  要写它，得先有一个"这个工具没有外部副作用"的声明。
-        UNKNOWN   进程被杀才会产生（没有异常可抓）。要写它，得有一个
-                  扫描遗留行的 reaper，而"多久算死"是个必须有人拍的数。
+        FAILED    工具抛了异常（可能已经产生副作用，配置方自己判断）
+        UNKNOWN   连异常都没有：执行开始后被取消、进程崩溃遗留；
+                  这是真正的「不知道跑没跑」
 
-    在那之前，未分类的异常一律落 RUNNING（不确定），而不是 FAILED
-    —— 后者会错误地**许可**重试一个有副作用的操作。
+    这个拆分是刻意的：旧模型没有地方表达「部署方想对 error 放行、
+    对 unknown 拦截」，而守卫的配置正好需要这两个独立的档位。
 
     ⚠️ INTERRUPT 等价于"未执行"，只因为今天所有中断都在执行之前
     ---------------------------------------------------------
@@ -183,15 +270,10 @@ class ToolExecutionStatus(str, Enum):
     `interrupt()` 在工具跑之前抛出。因此中断时工具**一定**没执行，
     放行是安全的。
 
-    将来若加一个 AFTER 中断（"确认结果"那类），同一个 except 会把
-    **已经执行过**的中断也记成 INTERRUPT → resume 放行 → 重复执行
-    一个有副作用的工具，正好把这张表的用途反过来。
-
-    靠状态名分不开这两件事。要根治，得让"已开始执行"成为一个
-    独立可查的事实 —— 即在工具方法真正被调用的前一刻把 PENDING
-    推成 RUNNING（那一步在 infra/agent/tool_executor.py 里，不在
-    本表这一层）。**本期没做**，所以在那里加 AFTER 中断之前，
-    先把这条读完。
+    守卫会额外检查 `ToolInvocation.context["tool.started"]`：
+    只有**没有**开始执行的中断才记 INTERRUPT；已经开始的中断记
+    UNKNOWN（可能已产生副作用）。这样将来加 AFTER 中断时不会把
+    「已经执行过」误记成「未执行」。
 
     取值是**大写**，与同模块的 ProcessorHook / ExecutionMode 一致，
     也与 models.sql 的 DB 约束一致。
@@ -202,6 +284,7 @@ class ToolExecutionStatus(str, Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
     UNKNOWN = "UNKNOWN"
+    BLOCKED = "BLOCKED"
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
     INTERRUPT = "INTERRUPT"
@@ -221,8 +304,14 @@ class ToolExecutionStatus(str, Enum):
 #:
 #: 四个都不是能安全重跑的情形。而这个集合一旦被误改宽，后果是
 #: 「一个副作用被执行两遍」，且不会有任何报错。
+#:
+#: ⚠️ 新守卫**不再用这个集合做判定**：它用的是每次记录上的
+#: `counted` 位与配置里的 success / error / unknown 三种独立配额。
+#: 保留这个集合是
+#: 为了旧调用方与测试的兼容，别把它当成新逻辑的判据。
 RETRYABLE_EXECUTION_STATUSES: frozenset[ToolExecutionStatus] = frozenset({
     ToolExecutionStatus.FAILED,
+    ToolExecutionStatus.BLOCKED,
     ToolExecutionStatus.CANCELLED,
     ToolExecutionStatus.REJECTED,
     ToolExecutionStatus.INTERRUPT,

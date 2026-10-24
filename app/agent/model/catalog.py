@@ -44,8 +44,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,7 @@ __all__ = [
     "load_model_catalog",
     "reset_model_registry",
     "set_model_registry",
+    "with_mock_bindings",
 ]
 
 logger = logging.getLogger(__name__)
@@ -350,6 +352,99 @@ def build_model_registry(
 
 
 # ============================================================
+# Mock overlay
+# ============================================================
+
+
+def _mock_role_key(model_role: str) -> str:
+    """`memory.atom.extract` -> `memory-atom-extract`（可放进模型名）。"""
+
+    key = re.sub(r"[^a-z0-9]+", "-", model_role.strip().lower())
+    return key.strip("-") or "unknown"
+
+
+def with_mock_bindings(
+        catalog: ModelCatalog,
+) -> ModelCatalog:
+    """
+    每个 `model_role` 生成一个独立的 mock 模型，并把 binding 指过去。
+
+    为什么不共用一个 `mock-chat`
+    --------------------------
+    HTTP 请求里没有 `model_role` 字段；如果所有角色共用一个模型名，mock
+    server 只能靠 system prompt 猜角色。主 agent 的上下文里会注入 L3 画像
+    （含 "# User Narrative Profile" 一类标题），猜错的后果是主回复变成
+    `{"no_change": true}` —— 这是实际发生过的串线。
+
+    每个角色一个模型名（`mock-role-<model_role>`）后，mock server 直接
+    从请求的 `model` 字段得到准确角色，不再需要任何提示词启发式。
+
+    **不改** primary / fallbacks 之外的模型：mock 只在启动时覆盖 binding，
+    关闭后原目录原样可用。
+    """
+
+    models = list(catalog.models)
+    profiles = list(catalog.profiles)
+    bindings: list[ModelRoleBinding] = []
+    by_role: dict[str, str] = {}
+
+    for binding in catalog.bindings:
+        key = _mock_role_key(binding.model_role)
+        profile_id = f"mock_role_{key}"
+
+        if profile_id not in by_role:
+            model_id = f"mock:{key}"
+            model_name = f"mock-role-{key}"
+
+            models.append(
+                ModelDefinition(
+                    id=model_id,
+                    provider="mock",
+                    model=model_name,
+                    display_name=f"Mock {binding.model_role}",
+                    capabilities=ModelCapabilities(
+                        tool_calling=True,
+                        structured_output=True,
+                        streaming=True,
+                        vision=False,
+                        reasoning=False,
+                    ),
+                    context_window=65536,
+                    config={"max_tokens": 4096},
+                )
+            )
+            profiles.append(
+                ModelProfile(
+                    id=profile_id,
+                    primary=model_id,
+                    fallbacks=(),
+                    policy=ModelRuntimePolicy(
+                        timeout=120.0,
+                        max_retries=0,
+                        total_timeout=180.0,
+                        fallback_enabled=False,
+                    ),
+                    display_name=f"Mock {binding.model_role}",
+                    description=(
+                        "开发 / 前端联调的 mock 模型；按 model_role 分名，"
+                        "不重试、不降级。"
+                    ),
+                )
+            )
+            by_role[profile_id] = profile_id
+
+        bindings.append(replace(binding, profile=profile_id))
+
+    return replace(
+        catalog,
+        models=tuple(models),
+        profiles=tuple(profiles),
+        bindings=tuple(bindings),
+        source=f"{catalog.source} (mock per-role bindings)",
+    )
+
+
+# ============================================================
 # 进程级单例
 # ============================================================
 #
@@ -373,7 +468,20 @@ def get_model_registry() -> DefaultModelRegistry:
     global _registry
 
     if _registry is None:
-        _registry = build_model_registry()
+        catalog = load_model_catalog()
+
+        # 延迟 import：只有 mock 打开时才需要读 mock_model.yaml；
+        # 关闭时不让开发功能进入启动路径。
+        from app.mock.settings import is_mock_enabled
+
+        if is_mock_enabled():
+            catalog = with_mock_bindings(catalog)
+            logger.warning(
+                "Mock model 已启用：每个 model_role 使用独立的 "
+                "mock-role-* 模型；不会调用真实云模型。"
+            )
+
+        _registry = build_model_registry(catalog)
 
     return _registry
 

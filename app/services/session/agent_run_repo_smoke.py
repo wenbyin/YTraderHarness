@@ -112,6 +112,8 @@ def _run_entity(session_id: UUID, now: datetime, **overrides: object) -> AgentRu
         "error_message": "冒烟用的错误文本",
         "caller_identity": dict(_SNAPSHOT),
         "user_id": "smoke-user",
+        # 后加的列（trace 开关）。给非空值，漏映射 add() 时能红。
+        "trace_id": "smoke-trace",
         "created_at": now,
         "updated_at": now,
     }
@@ -169,7 +171,7 @@ async def main() -> int:
             for field in (
                 "run_id", "session_id", "status", "input", "meta",
                 "error_type", "error_message", "user_id",
-                "caller_identity",
+                "caller_identity", "trace_id",
             ):
                 check(
                     f"{field} 往返一致",
@@ -188,7 +190,7 @@ async def main() -> int:
 
             empty = _run_entity(
                 session_id, now, caller_identity={}, error_type=None,
-                error_message=None, user_id=None,
+                error_message=None, user_id=None, trace_id=None,
             )
             await repository.add(empty)
             await session.commit()
@@ -210,7 +212,9 @@ async def main() -> int:
                 # duty_key 是后加的列，且服务层**总是**会写它 —— 因此
                 # "不写时读回来是 None"这条只有这里盯得住。仓储 add() 里
                 # 漏掉那一句映射的话，这一条会红（否则静默写 NULL）。
-                and empty_back.duty_key is None,
+                and empty_back.duty_key is None
+                # trace_id 同理：空 = 未开启 Trace。
+                and empty_back.trace_id is None,
             )
 
             print("\n全部通过。")

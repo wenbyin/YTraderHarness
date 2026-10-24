@@ -259,6 +259,7 @@ class ToolDefinitionRepositoryImpl(ToolDefinitionRepository):
             *,
             keyword: str | None = None,
             source_type: SourceType | None = None,
+            source_ref: str | None = None,
             source_state: SourceState | None = None,
             classification_code: str | None = None,
             offset: int = 0,
@@ -282,6 +283,11 @@ class ToolDefinitionRepositoryImpl(ToolDefinitionRepository):
             conditions.append(
                 ToolDefinitionModel.source_type
                 == source_type.value
+            )
+
+        if source_ref is not None:
+            conditions.append(
+                ToolDefinitionModel.source_ref == source_ref
             )
 
         if source_state is not None:
@@ -335,6 +341,50 @@ class ToolDefinitionRepositoryImpl(ToolDefinitionRepository):
         )
 
         return [self._to_entity(m) for m in result.scalars()], total
+
+    async def count_by_source_refs(
+            self,
+            source_refs: list[str],
+    ) -> dict[str, dict[str, int]]:
+
+        counts: dict[str, dict[str, int]] = {
+            ref: {"active": 0, "missing": 0}
+            for ref in source_refs
+        }
+
+        if not source_refs:
+            # 空列表不能落成 `IN ()`（SQL 语法错误），而"没有 provider"
+            # 是完全正常的输入。
+            return counts
+
+        statement = (
+            select(
+                ToolDefinitionModel.source_ref,
+                ToolDefinitionModel.source_state,
+                func.count(),
+            )
+            .where(ToolDefinitionModel.source_ref.in_(source_refs))
+            .group_by(
+                ToolDefinitionModel.source_ref,
+                ToolDefinitionModel.source_state,
+            )
+        )
+
+        result = await self._session.execute(statement)
+
+        for ref, state, total in result:
+            bucket = counts.setdefault(
+                ref, {"active": 0, "missing": 0}
+            )
+
+            key = str(state).lower()
+
+            if key == SourceState.ACTIVE.value.lower():
+                bucket["active"] = total
+            elif key == SourceState.MISSING.value.lower():
+                bucket["missing"] = total
+
+        return counts
 
     async def list_active_by_classification_codes(
             self,

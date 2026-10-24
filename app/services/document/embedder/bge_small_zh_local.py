@@ -69,7 +69,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.common.model_factory import get_model_factory
 
-from ..const import BGE_SMALL_ZH_LOCAL_MODEL
+from ..const import BGE_SMALL_ZH_LOCAL_DIMENSIONS, BGE_SMALL_ZH_LOCAL_MODEL
 from ..domain.schemas.enum import EmbeddingOutput
 from ..tokenization import tokenizer_for
 from .base import DocumentEmbedder
@@ -222,9 +222,10 @@ class LocalBgeSmallZhEmbedder(DocumentEmbedder):
     #: Ollama 走常规 embedding 模型，产出定长稠密向量。
     output_kind = EmbeddingOutput.DENSE
 
-    #: 512 维。建 Milvus collection 需要它在调用前就可得，
-    #: 因此是类属性字面量而不是运行时探测出来的值。
-    dimensions = 512
+    #: 取值：`app/config/app.yaml` 的 `models.embedding.dimensions`。
+    #: 建 Milvus collection 需要它在调用前就可得，因此是类属性而不是
+    #: 运行时探测出来的值。
+    dimensions = BGE_SMALL_ZH_LOCAL_DIMENSIONS
 
     #: 度量输入长度时用**本模型自己的词表**（见基类上的说明）。
     #: 这就是本地加载换来的那件事 —— 走 Ollama 时词表在服务端，

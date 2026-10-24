@@ -12,7 +12,8 @@ POST /tasks。理由见 task.yaml 的 info.description：一个公开的提交�
 等于把"任意已注册 Handler 都能被任意已认证调用方触发"打开成一条通路，
 而那条通路绕过了业务接口自己的授权与限流。
 
-所以本文件只做三件事：看（列表 / 详情）、追（执行链）、干预（取消 / 重试）。
+所以本文件只做三件事：看（列表 / 详情）、追（执行链）、
+干预（取消 / 重试 / 立即触发）。
 """
 
 from __future__ import annotations
@@ -215,6 +216,40 @@ async def cancel_task(
         task_id=task_id,
         status=status,
     )
+
+
+@router.post(
+    "/tasks/{task_id}/invoke",
+    response_model=TaskDetail,
+    tags=["Tasks"],
+)
+async def invoke_task(
+        task_id: UUID,
+        service: TaskService = Service[TaskService],
+):
+    """
+    让一条**还没开始跑**的定时任务立即执行。
+
+    前端「直接触发」按钮的落点：任务已经由业务代码提交（`execute_at`
+    在未来），这里只把那个时刻提前到现在，不新建任务、不清 attempt ——
+    它仍是同一轮执行，只是不等定时了。
+
+    执行仍是异步的：返回时 `execute_at` 为 null、任务已投递，真正跑完
+    要看 `GET /tasks/{task_id}`。
+
+    两种情况会 409：
+        正在跑          执行者马上就写回结果了
+        已终结          再触发会变成第二次外部副作用
+                        （失败/取消的重跑用 retry）
+    """
+
+    try:
+        task = await service.invoke(task_id)
+
+    except ValueError as exc:
+        raise to_http_error(exc) from exc
+
+    return build_task_detail(task)
 
 
 @router.post(

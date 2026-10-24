@@ -201,8 +201,30 @@ class ToolDiscoveryServiceImpl(ToolDiscoveryService):
 
         active = await self._definitions.list_active()
 
+        # ⚠️ 按**本次同步的范围**对账，而不是全表
+        # ------------------------------------
+        # source_types / source_refs 是"这次只扫这一部分"的意思。
+        # 若拿全表去比对，一次 `source_types=["mcp"]` 的同步会把所有
+        # 本地工具判成「没扫到」并全部转 MISSING —— 它们只是这次
+        # 没被扫，不是消失了。MCP 接入后这条路径会变得常见（前端
+        # 刷新单个 provider），所以必须在这里收窄。
+        wanted_types = set(
+            self._parse_source_types(request.source_types) or []
+        )
+        wanted_refs = set(request.source_refs or [])
+
         stale = [
-            d for d in active if d.tool_key not in scanned_keys
+            d
+            for d in active
+            if d.tool_key not in scanned_keys
+            and (
+                not wanted_types
+                or d.source_type in wanted_types
+            )
+            and (
+                not wanted_refs
+                or d.source_ref in wanted_refs
+            )
         ]
 
         if not stale:

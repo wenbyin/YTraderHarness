@@ -1,19 +1,21 @@
 """
-Context Builder 的契约：固定 11 步的调度 + 六个 type 基类。
+Context Builder 的契约：固定 13 步的调度 + 六个 type 基类。
 
 流水线是**固定**的，顺序不变
 ------------------------------
     1. Context Resolver     读 builder_type + state，输出 skip 列表 + 参数
-    2. Profile Loader       ┐
-    3. Summary Loader       │
-    4. History Selector     │
-    5. Memory Retriever     ├ 可能 skip
-    6. Knowledge Retriever  │
-    7. Capability Loader    │
-    8. Prompt Assembler     ┘ 按 state 决定层序，产出 ModelRequest
-    9. Token Budgeter
-   10. Context Compactor    可能 skip（唯一会自己调 LLM 的阶段）
-   11. Context Validator
+    2. Task Resolver        有 current_task 时注入任务执行指令
+    3. Skill Loader         按 skill_key 渲染 prompt、解析 capabilities
+    4. Profile Loader       ┐
+    5. Summary Loader       │
+    6. History Selector     │
+    7. Memory Retriever     ├ 可能 skip
+    8. Knowledge Retriever  │
+    9. Capability Loader    │
+   10. Prompt Assembler     ┘ 按 state 决定层序，产出 ModelRequest
+   11. Token Budgeter
+   12. Context Compactor    可能 skip（唯一会自己调 LLM 的阶段）
+   13. Context Validator
 
 顺序由 `contracts.PIPELINE_TEMPLATE` 定死，**具体实现改不了** ——
 规格里写明 stage order 由服务器定义、客户端必须当作不可变。
@@ -66,9 +68,9 @@ builder 实例是**共享的**（每个类型只构造一次，见 registry.py�
 阶段**不是图节点**
 ------------------
 规格的 `PipelineNode.independent_lifecycle` 明写："does not automatically
-make it a LangGraph node"。十一个阶段在同一次 build() 调用里顺序跑完，
+make it a LangGraph node"。十三个阶段在同一次 build() 调用里顺序跑完，
 不进 checkpoint、不跨节点、不扇出。把阶段摊成图节点会让一次上下文构建
-变成十一个 super-step，而它们之间只有顺序没有并行度。
+变成十三个 super-step，而它们之间只有顺序没有并行度。
 
 ⚠️ 六个 type 基类**都不是** `inspect.isabstract()`
 --------------------------------------------------
@@ -209,7 +211,7 @@ class BaseContextBuilder(ABC):
     # 阶段 -> 方法名
     # ========================================================
 
-    #: 十一个阶段各自对应的方法名。
+    #: 十三个阶段各自对应的方法名。
     #:
     #: 单列成映射而不是靠命名约定现推，是为了让"某个阶段没有对应
     #: 方法"在**这里**就能看出来 —— 而 `__init_subclass__` 也会
@@ -217,6 +219,8 @@ class BaseContextBuilder(ABC):
     #: import 期校验保证模板不漂移，这里由下面的自检保证映射不漏。
     _STAGE_METHODS: ClassVar[Mapping[StageId, str]] = {
         StageId.CONTEXT_RESOLVER: "_stage_context_resolver",
+        StageId.TASK_RESOLVER: "_stage_task_resolver",
+        StageId.SKILL_LOADER: "_stage_skill_loader",
         StageId.PROFILE_LOADER: "_stage_profile_loader",
         StageId.SUMMARY_LOADER: "_stage_summary_loader",
         StageId.HISTORY_SELECTOR: "_stage_history_selector",
@@ -393,7 +397,7 @@ class BaseContextBuilder(ABC):
         把它们与固定模板对照着念一遍。将来 `/context-builders`
         接口要的 `stage_policies` 就是这个形状。
 
-        十一个阶段全给出来（包括没参与的），而不是只给参与的那些：
+        十三个阶段全给出来（包括没参与的），而不是只给参与的那些：
         前端要画的是**完整流水线**，并标出哪些节点这次不亮 —— 只给
         参与的，它就无从知道"少了哪一步"。
         """
@@ -572,6 +576,22 @@ class BaseContextBuilder(ABC):
 
         state.resolution = StageResolution()
 
+    @_no_default(StageId.TASK_RESOLVER)
+    async def _stage_task_resolver(
+            self, state: ContextBuildState
+    ) -> None:
+        """阶段 2：有 current_task 时注入任务执行指令。"""
+
+        raise self._unsupported(StageId.TASK_RESOLVER)
+
+    @_no_default(StageId.SKILL_LOADER)
+    async def _stage_skill_loader(
+            self, state: ContextBuildState
+    ) -> None:
+        """阶段 3：按 task.skill_key 切换 prompt 与 tool_keys。"""
+
+        raise self._unsupported(StageId.SKILL_LOADER)
+
     @_no_default(StageId.PROFILE_LOADER)
     async def _stage_profile_loader(
             self, state: ContextBuildState
@@ -698,7 +718,26 @@ class BaseContextBuilder(ABC):
 
         method = getattr(self, self._STAGE_METHODS[stage])
 
-        await method(state)
+        # 阶段 Span：只有真正走到 _run_stage 的 stage 才发（build 的循环
+        # 已经跳过了未启用 / resolver 声明 skip 的阶段）。
+        from app.agent.context.trace import stage_metrics, stage_span
+
+        span = stage_span(
+            getattr(state.request, "trace", None),
+            stage,
+        )
+
+        try:
+            await method(state)
+
+        except BaseException as exc:
+            if span is not None:
+                span.fail(exc)
+            raise
+
+        else:
+            if span is not None:
+                span.complete(payload=stage_metrics(state))
 
     def _unsupported(self, stage: StageId) -> Exception:
         """

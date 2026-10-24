@@ -235,6 +235,8 @@ class SummaryProcessor(ContextProcessor):
             text=summary.text.strip(),
             source_ids=(f"summary@{summary.revision}",),
             token_estimate=counter.count_text(summary.text),
+            # 摘要由原始对话（含用户输入与工具结果）压缩而来，按引用数据定界。
+            untrusted=True,
         )
 
         return context

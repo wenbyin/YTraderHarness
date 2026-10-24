@@ -34,8 +34,9 @@
     STARTED / SUCCEEDED / FAILED / DENIED                   run.started / message.delta / …
     只服务同一个进程里的订阅者                                服务任何连得上的消费者
 
-工具事件将来会成为这里 tool.called / tool.completed 的**来源之一**，
-但那是一次"进程内 -> 外面"的翻译，不是把两个东西合并成一个。
+ToolEventBus **不是** tool.called / tool.completed 的来源：那两条由
+工具节点写进图的自定义流（`TOOL_STREAM_KIND`），再经
+`RunEventProjector` 投影出来 —— 与 trace 的 fanout.* 同一条路。
 """
 
 from __future__ import annotations
@@ -44,11 +45,12 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Final, Mapping
 
 __all__ = [
     "STREAM_CLOSING_EVENT_TYPES",
     "TERMINAL_EVENT_TYPES",
+    "TOOL_STREAM_KIND",
     "RunEvent",
     "RunEventType",
     "stream_key",
@@ -181,9 +183,41 @@ class RunEventType(str, Enum):
     MESSAGE_REASONING_DELTA = "message.reasoning.delta"
     MESSAGE_REASONING_COMPLETED = "message.reasoning.completed"
 
-    # ---- 工具调用（来源：tools/processor 的 ToolEventObserver，未接）----
+    # ---- 工具调用（来源：工具节点的自定义流，经 RunEventProjector 投影）----
     TOOL_CALLED = "tool.called"
     TOOL_COMPLETED = "tool.completed"
+
+    # ---- 任务板（来源：planner / task_listener 的自定义流）----
+    #
+    # plan.published  planner 产出完整计划与任务快照（一次性）
+    # task.updated    listener claim / 完成某一任务（按 task id 更新）
+    # plan.cleared    任务列表清空（完成或 deadlock），前端收起任务面板
+    #
+    # 三条都是**加法**，不影响 TERMINAL / STREAM_CLOSING；SSE 订阅端
+    # 不认识就忽略，认识就按 task id 合并。
+    PLAN_PUBLISHED = "plan.published"
+    TASK_UPDATED = "task.updated"
+    PLAN_CLEARED = "plan.cleared"
+
+    # ---- 子代理（来源：create_team / subagent_dispatch 的自定义流）----
+    #
+    # subagent.created       一个 worker 实例创建（父图预 claim 成功、
+    #                        Send 之前；每 worker 一条）
+    # subagent.claimed       某个 worker 预 claim 了一个任务
+    # subagent.task.updated  子任务状态变化（SUBMITTED/WORKING -> 终态）
+    # subagent.completed     某个 worker 执行完一个任务
+    #
+    # 与任务板那三条的区别是 **scope**：task.* 是主 agent 的执行进度，
+    # subagent.* 带 `worker_id`，前端按 worker 分组渲染并行泳道。不把
+    # 它们并进 task.updated 的理由与 message.reasoning.* 一样 —— 事件名
+    # 是字面契约，加法比改字段安全。
+    #
+    # ⚠️ 它们**不在** TERMINAL / STREAM_CLOSING 里：子代理只是运行中间
+    # 的并行分支，运行还没结束。
+    SUBAGENT_CREATED = "subagent.created"
+    SUBAGENT_CLAIMED = "subagent.claimed"
+    SUBAGENT_TASK_UPDATED = "subagent.task.updated"
+    SUBAGENT_COMPLETED = "subagent.completed"
 
     # ---- 人工介入（来源：interceptor/approval.py，已在图里）----
     #
@@ -192,6 +226,35 @@ class RunEventType(str, Enum):
     # hitl.resolved   某个中断被回答了，运行接着跑
     HITL_REQUESTED = "hitl.requested"
     HITL_RESOLVED = "hitl.resolved"
+
+
+#: custom 流里"工具执行"事件的信封标记。
+#:
+#: 工具节点**不直接写 Redis**：它把工具生命周期写进图的自定义流
+#: （`get_stream_writer()`），由 `RunEventProjector` 投影成上面的
+#: `tool.called` / `tool.completed` —— 与 trace 的 `fanout.*` 同一条路。
+#: `kind` 用来和同一条 custom 通道上的 TraceEvent 区分（后者没有这个键）。
+TOOL_STREAM_KIND: Final[str] = "tool"
+
+
+#: custom 流里“任务板”事件的信封标记。
+#:
+#: planner / task_listener 不直接写 Redis：把任务生命周期写进图的
+#: 自定义流，由 RunEventProjector 投影成 plan.published / task.updated /
+#: plan.cleared，再经 publish_run_event 进 SSE 流。
+TASK_STREAM_KIND: Final[str] = "task"
+
+
+#: custom 流里“子代理”事件的信封标记。
+#:
+#: create_team / subagent_dispatch 不直接写 Redis：把子代理生命周期写进
+#: 图的自定义流，由 RunEventProjector 投影成 subagent.created /
+#: subagent.claimed / subagent.task.updated / subagent.completed。
+#:
+#: ⚠️ 子图内部**不要**用这个 kind：这些事件由**父图节点**在派发 / 收波
+#: 时统一发。worker 现在虽然是编译进父图的子图（事件会进父流），但它的
+#: listener 只写任务板，不重复发这一组，避免同一状态出现两个来源。
+SUBAGENT_STREAM_KIND: Final[str] = "subagent"
 
 
 #: 表示"这次运行结束了"的事件。

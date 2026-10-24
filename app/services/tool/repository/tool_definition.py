@@ -159,6 +159,7 @@ class ToolDefinitionRepository(BaseRepository):
             *,
             keyword: str | None = None,
             source_type: SourceType | None = None,
+            source_ref: str | None = None,
             source_state: SourceState | None = None,
             classification_code: str | None = None,
             offset: int = 0,
@@ -169,6 +170,24 @@ class ToolDefinitionRepository(BaseRepository):
 
         classification_code 需要连到关联表与分类表上过滤 ——
         因此它不是简单的一列条件，见实现里的 join。
+
+        source_ref 是来源对象（MCP provider 名、模块名），
+        前端按 provider 过滤工具时用它。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    async def count_by_source_refs(
+            self,
+            source_refs: list[str],
+    ) -> dict[str, dict[str, int]]:
+        """
+        `{source_ref: {"active": n, "missing": m}}`。
+
+        给 provider 列表用：一个 provider 名下同步了多少工具、
+        有多少已经 MISSING。一次 group_by 取完，不在 Python 里
+        逐条 count（N+1）。没出现过的 ref 也会以零计数出现在结果里。
         """
 
         raise NotImplementedError

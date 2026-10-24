@@ -27,8 +27,10 @@ from types import SimpleNamespace
 from typing import Annotated, Any, TypedDict
 
 import pytest
+from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -125,6 +127,84 @@ def _fake_factory_with_reasoning(**kwargs: Any) -> GenericFakeChatModel:
             * 4
         )
     )
+
+
+class _ToolCallOnlyChatModel(BaseChatModel):
+    """
+    一次**纯工具调用**的回复：正文为空，只有一个 tool_call。
+
+    `GenericFakeChatModel` 的 `_stream` 只切正文（与 additional_kwargs 里的
+    function_call），**不会**产出 tool_call_chunks —— 拿它测这条路径，模型
+    一块都流不出来，`_agenerate_with_cache` 直接报"没有产生任何 chunk"。
+    所以这里自己实现 `_stream`，钉住真实的形状：
+
+        message-start -> content-block-start(tool_call)
+                      -> content-block-delta(tool_call_chunk)
+                      -> content-block-finish(tool_call) -> message-finish
+
+    正文一个 delta 都没有，**边界事件仍然成对** —— 这正是前端"一步的消息
+    不该跨到下一步"依赖的东西。
+    """
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-tool-call-only"
+
+    def _generate(
+            self,
+            messages: Any,
+            stop: Any = None,
+            run_manager: Any = None,
+            **kwargs: Any,
+    ) -> ChatResult:
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "search",
+                                "args": {"query": "x"},
+                                "id": "call-1",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                )
+            ]
+        )
+
+    def _stream(
+            self,
+            messages: Any,
+            stop: Any = None,
+            run_manager: Any = None,
+            **kwargs: Any,
+    ) -> Any:
+        chunk = ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="",
+                tool_call_chunks=[
+                    {
+                        "name": "search",
+                        "args": '{"query": "x"}',
+                        "id": "call-1",
+                        "index": 0,
+                        "type": "tool_call_chunk",
+                    }
+                ],
+            )
+        )
+
+        if run_manager:
+            run_manager.on_llm_new_token("", chunk=chunk)
+
+        yield chunk
+
+
+def _tool_call_factory(**kwargs: Any) -> _ToolCallOnlyChatModel:
+    return _ToolCallOnlyChatModel()
 
 
 def _registry(factory: Any = _fake_factory) -> Any:
@@ -324,6 +404,47 @@ async def test_empty_role_whitelist_sends_boundaries_but_no_content(
 
     started = _of(published, "message.started")
     assert [item.data["visible"] for item in started] == [False]
+
+
+async def test_a_tool_call_only_step_has_paired_message_boundaries(
+        published: list[Any],
+) -> None:
+    """
+    纯工具调用步骤：正文一个 delta 都没有，`message.started` / `completed`
+    仍然成对。
+
+    前端按"completed 到了才算这一步结束"切分消息。一旦只有 started 没有
+    completed，下一条消息的 delta 就会接在上一条后面 —— 症状是**一步的
+    消息跨到下一步**，而事件流上没有任何异常。
+
+    所以这里钉住的是成对性本身，不是正文：
+
+        message.started  1 条（visible=true，role 是主循环）
+        message.delta    0 条（tool-call 参数碎片不进正文）
+        message.completed 1 条（content 空串、tool_calls 带名字）
+    """
+
+    compiled = _compiled(
+        _registry(factory=_tool_call_factory),
+        node="agent",
+        roles=(ModelRole.REASONING,),
+    )
+
+    await _drive(compiled, message_nodes={"agent"}, message_roles={ModelRole.REASONING})
+
+    message_types = [
+        item.type for item in published if item.type.startswith("message.")
+    ]
+
+    # 只有边界，没有正文 —— 且必须成对、顺序不能倒。
+    assert message_types == ["message.started", "message.completed"]
+
+    completed = _of(published, "message.completed")[0]
+
+    assert completed.data["content"] == ""
+    assert completed.data["visible"] is True
+    assert completed.data["tool_calls"] == ["search"]
+    assert completed.node == "agent"
 
 
 async def test_a_leaked_tool_call_never_reaches_the_client(
@@ -566,3 +687,125 @@ async def test_reasoning_completed_is_a_real_reconciliation_point(
 
     assert _of(published, "message.reasoning.completed") == []
     assert _of(published, "message.reasoning.delta") == []
+
+
+async def test_a_superseded_attempt_is_closed_before_the_next_starts(
+        published: list[Any],
+) -> None:
+    """
+    重试 / 降级：失败的那次只有 `message-start`（协议终态由成功路径产出），
+    新一次开始时**先把它关掉**，再开新的。
+
+    不变量是订阅端看到的事件序列：
+
+        message.started(A) -> message.completed(A) -> message.started(B)
+        -> message.completed(B)
+
+    少了 completed(A)，A 的 loading 永远收不起来，B 的 delta 会被接在 A
+    后面 —— 这正是"一步的消息跨到下一步"。
+    """
+
+    projector = projector_module.RunEventProjector(
+        (),
+        run_id="run-under-test",
+        message_nodes={"agent"},
+        message_roles={ModelRole.REASONING},
+    )
+
+    def _meta(run_id: str) -> dict[str, Any]:
+        return {
+            "langgraph_node": "agent",
+            "model_role": ModelRole.REASONING,
+            "run_id": run_id,
+        }
+
+    # ---- 第一次尝试：吐了半截，然后失败（没有 message-finish）----
+    await projector._on_messages((
+        {"event": "message-start", "id": "lc-1"},
+        _meta("attempt-1"),
+    ))
+
+    await projector._on_messages((
+        {
+            "event": "content-block-delta",
+            "delta": {"type": "text-delta", "text": "半截"},
+        },
+        _meta("attempt-1"),
+    ))
+
+    # ---- 第二次尝试：重新开始，正常结束 ----
+    await projector._on_messages((
+        {"event": "message-start", "id": "lc-2"},
+        _meta("attempt-2"),
+    ))
+
+    await projector._on_messages((
+        {"event": "message-finish", "metadata": {}},
+        _meta("attempt-2"),
+    ))
+
+    message_types = [
+        item.type for item in published if item.type.startswith("message.")
+    ]
+
+    assert message_types == [
+        "message.started",
+        "message.delta",
+        "message.completed",   # attempt-1 在这里被关掉
+        "message.started",
+        "message.completed",
+    ]
+
+    completed = _of(published, "message.completed")
+
+    # 第一条用已经累积的那份（订阅端收到的 delta 与它一致），不重发全文。
+    assert [item.data["content"] for item in completed] == ["半截", ""]
+
+
+async def test_a_node_that_ends_with_an_open_message_closes_it(
+        published: list[Any],
+) -> None:
+    """
+    节点结束是兜底：最后一次调用失败（不会有下一次 message-start）时，
+    在 node.completed **之前**补一条 message.completed。
+
+    顺序不是随手定的：前端先收 loading、再收节点结束；反过来会让节点
+    已经结束而消息还在转圈。
+    """
+
+    projector = projector_module.RunEventProjector(
+        (),
+        run_id="run-under-test",
+        message_nodes={"agent"},
+        message_roles={ModelRole.REASONING},
+    )
+
+    meta = {
+        "langgraph_node": "agent",
+        "model_role": ModelRole.REASONING,
+        "run_id": "llm-run-1",
+    }
+
+    # 节点开跑 -> 模型开跑 -> 模型失败（没有 message-finish）
+    await projector._on_tasks({"id": "task-1", "name": "agent"}, 1000)
+
+    await projector._on_messages((
+        {"event": "message-start", "id": "lc-1"},
+        meta,
+    ))
+
+    # 节点结束
+    await projector._on_tasks(
+        {"id": "task-1", "name": "agent", "result": {"messages": []}},
+        2000,
+    )
+
+    types = [item.type for item in published]
+
+    assert types.index("message.completed") < types.index("node.completed")
+
+    completed = _of(published, "message.completed")
+
+    assert len(completed) == 1
+    assert completed[0].node == "agent"
+    assert completed[0].data["visible"] is True

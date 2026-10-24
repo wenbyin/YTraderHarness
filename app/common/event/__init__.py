@@ -3,7 +3,7 @@
 
 这里只放两样东西：
 
-    event.py      事件的**词汇**：RunEventType（11 个事件名）、
+    event.py      事件的**词汇**：RunEventType（运行 / 消息 / 工具 / 任务）、
                   RunEvent（一条事件）、stream_key（键怎么拼），
                   以及两个集合：TERMINAL_EVENT_TYPES（运行终止）
                   与 STREAM_CLOSING_EVENT_TYPES（订阅该收尾，含暂停）
@@ -21,18 +21,43 @@
 
 __all__ = [
     "EventPublisher",
+    "EventType",
     "RunEvent",
     "RunEventType",
     "STREAM_CLOSING_EVENT_TYPES",
+    "SUBAGENT_STREAM_KIND",
+    "TASK_STREAM_KIND",
+    "TOOL_STREAM_KIND",
+    "SpanKind",
+    "SpanLink",
+    "SpanStatus",
     "TERMINAL_EVENT_TYPES",
+    "TraceEmitter",
+    "TraceError",
+    "TraceEvent",
+    "TraceSpan",
     "stream_key",
+    "trace_stream_key",
 ]
 
 from .event import (
     STREAM_CLOSING_EVENT_TYPES,
+    SUBAGENT_STREAM_KIND,
+    TASK_STREAM_KIND,
     TERMINAL_EVENT_TYPES,
+    TOOL_STREAM_KIND,
     RunEvent,
     RunEventType,
     stream_key,
 )
 from .publisher import EventPublisher
+from .trace import (
+    EventType,
+    SpanKind,
+    SpanLink,
+    SpanStatus,
+    TraceError,
+    TraceEvent,
+    trace_stream_key,
+)
+from .trace_emitter import TraceEmitter, TraceSpan

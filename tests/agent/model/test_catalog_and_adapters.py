@@ -48,12 +48,19 @@ def test_shipped_catalog_loads() -> None:
     catalog = load_model_catalog()
 
     assert catalog.source.endswith("model.yaml")
-    assert {item.name for item in catalog.providers} == {"deepseek", "kimi"}
+    assert {item.name for item in catalog.providers} == {
+        "deepseek",
+        "kimi",
+        "qwen",
+        "mock",
+    }
     assert "deepseek:deepseek-v4-flash" in catalog.model_ids()
     assert {item.id for item in catalog.profiles} == {
         "reasoning_default",
         "fast_default",
         "evaluation_default",
+        "classification_default",
+        "mock_default",
     }
 
     # 核心绑定必须在
@@ -96,7 +103,12 @@ def test_shipped_registry_assembles() -> None:
 
     registry = build_model_registry()
 
-    assert [item.name for item in registry.providers()] == ["deepseek", "kimi"]
+    assert [item.name for item in registry.providers()] == [
+        "deepseek",
+        "kimi",
+        "mock",
+        "qwen",
+    ]
 
     runtime = registry.get_runtime(agent_type="react", model_role="reasoning")
 
@@ -424,6 +436,64 @@ async def test_adapter_does_not_bind_tools_when_absent() -> None:
     assert model.output_format is None
 
 
+def test_thinking_off_extra_body_precedence() -> None:
+    """
+    ReAct 主循环默认保留思考；JSON schema / 显式关闭仍然优先。
+    """
+
+    from dataclasses import replace
+
+    from app.agent.model import ModelRequest
+    from app.agent.model.adapters import thinking_off_extra_body
+
+    definition = replace(
+        ModelDefinition.make("deepseek", "chat"),
+        structured_output_extra_body={"thinking": {"type": "disabled"}},
+    )
+
+    tool = object()
+
+    # 主循环：带 tools，但显式要求思考 -> 不关。
+    assert thinking_off_extra_body(
+        definition,
+        ModelRequest(
+            messages=(),
+            tools=(tool,),
+            enable_thinking=True,
+        ),
+    ) == {}
+
+    # JSON schema 优先：即使 enable_thinking=True 也关。
+    assert thinking_off_extra_body(
+        definition,
+        ModelRequest(
+            messages=(),
+            tools=(tool,),
+            response_format=object(),
+            enable_thinking=True,
+        ),
+    ) == {"extra_body": {"thinking": {"type": "disabled"}}}
+
+    # 普通工具调用（没有 enable_thinking）-> 关。
+    assert thinking_off_extra_body(
+        definition,
+        ModelRequest(messages=(), tools=(tool,)),
+    ) == {"extra_body": {"thinking": {"type": "disabled"}}}
+
+    # 纯文本 -> 不关。
+    assert thinking_off_extra_body(
+        definition,
+        ModelRequest(messages=()),
+    ) == {}
+
+    # 模型级硬开关优先于 enable_thinking。
+    forced_off = replace(definition, disable_thinking=True)
+    assert thinking_off_extra_body(
+        forced_off,
+        ModelRequest(messages=(), enable_thinking=True),
+    ) == {"extra_body": {"thinking": {"type": "disabled"}}}
+
+
 async def test_adapter_reads_usage_from_both_places() -> None:
     """用量可能在 usage_metadata，也可能在 response_metadata.token_usage。"""
 
@@ -581,13 +651,17 @@ def test_real_clients_are_constructed_from_the_shipped_catalog() -> None:
     pytest.importorskip("langchain_deepseek")
     pytest.importorskip("langchain_moonshot")
 
+    from app.common.deepseek_chat import ReasoningChatDeepSeek
+
     registry = build_model_registry()
 
     flash = registry.factory.get(
         registry.definition("deepseek:deepseek-v4-flash"), timeout=15
     )
 
-    assert type(flash.client).__name__ == "ChatDeepSeek"
+    # DeepSeek 用子类补回 reasoning_content（思考模式多轮要求），
+    # 见 app/common/deepseek_chat.py。
+    assert isinstance(flash.client, ReasoningChatDeepSeek)
     assert flash.client.model_name == "deepseek-v4-flash"
     # 16384 而不是 4096 或 8192：`max_tokens` 是**思考与正文共用**的额度，
     # 而这条端点的推理占比约九成 —— 4096 被思考吃光时正文一个字都写不出来

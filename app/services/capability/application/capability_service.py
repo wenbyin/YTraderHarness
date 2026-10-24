@@ -127,9 +127,14 @@ class CapabilityService(BaseService):
         它们再删本节点（自引用外键刻意不加 CASCADE，理由见
         models/sqlalchemy/capability.py）。
 
+        它同样**不能**覆盖 Skill 绑定：skill_capability 的外键是
+        RESTRICT，删除会先被 count_skill_links 挡成 409。解除绑定
+        请走 PUT /skills/{skill_id}/capabilities。
+
         Raises:
             NotFoundError: 能力不存在。
-            ConflictError: 还有子能力；或仍被 Tool 引用且未给 force。
+            ConflictError: 还有子能力；仍被 Skill 绑定；
+                或仍被 Tool 引用且未给 force。
         """
 
         raise NotImplementedError
