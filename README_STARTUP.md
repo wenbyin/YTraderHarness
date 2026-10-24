@@ -257,7 +257,7 @@ OAuth 登录流（`/auth/login` → Casdoor → `/auth/callback`）、claim 名�
 | `document/pipeline.yaml` | 1562 | Document Pipeline | `/pipeline-runs`、`/{run_id}/nodes`、`/document-progress` |
 | `document/processor_capability.yaml` | 485 | Document Processor Capability | `/document-processor-capabilities` |
 | `file/file.yaml` | 648 | File Service | `/files`、`/{file_id}/content` |
-| `evaluate/evaluation.yaml` | 1349 | RAG Evaluation | `/evaluation/datasets`、`/metrics`、`/runs`、`/results` |
+| `tool/mcp_provider.yaml` | 116 | MCP Provider Management（只读） | `/mcp/providers` |
 | `user/user.yaml` | 480 | User & Authentication | `/auth/login`、`/auth/callback`、`/auth/refresh`、`/auth/me` |
 
 **几处值得单独记的**：

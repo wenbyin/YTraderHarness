@@ -607,7 +607,6 @@ route_after_planner -> END          # 仅当 YTRADER_PLAN_STOP_AFTER_PLANNER=1
 | **目录只取前 100 条** | 技能与能力目录都截断到 `_CATALOG_LIMIT`，超出部分模型看不到 |
 | **planner 不发布任务板** | 发布在 `create_team`。若 `create_team` 从未被调用，`tasks` 只在 state 里，Redis 上什么都没有 |
 | **`task_generator` 失败保留旧计划** | 首次规划时"旧计划"就是空 —— 结果是本轮无计划，父图按无任务继续 |
-| **`STOP_AFTER_PLANNER` 是开发开关** | `routing.py:139-140` 明确写：接上 team_decision / worker 派发后应当删掉 |
 | **跨图 Command 只有运行时兜底** | `PLANNER_EXCLUDED_TOOL_KEYS` 是"提前不给"，`planner_tool` 的拦截是"给了也拦住"。新增返回父图 Command 的工具时，两处都该看 |
 
 ---

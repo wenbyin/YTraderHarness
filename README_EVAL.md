@@ -1,7 +1,7 @@
 # EVAL_README.md — Retrieval Eval（检索评测）子系统
 
 > YTraderHarness · 检索评测子系统事实手册
-> 覆盖范围：`app/api/v1/retrieval_eval.py`、`app/services/document/{application,domain,models,repository}/retrieval_eval*`、`app/services/document/eval/`、`rag_eval_design/`。
+> 覆盖范围：`app/api/v1/retrieval_eval.py`、`app/services/document/{application,domain,models,repository}/retrieval_eval*`、`app/services/document/eval/`。
 > 本文只描述**代码里真实存在**的东西；注释与代码冲突处一律以代码为准并显式标注。
 
 ---
@@ -29,26 +29,23 @@
 | # | 位置 | 是什么 | 状态 |
 |---|---|---|---|
 | 1 | `app/api/v1/retrieval_eval.py` + `app/services/document/*retrieval_eval*` + `app/services/document/eval/` | **检索评测（retrieval eval）**：本文件的主角。DTD 均衡抽样 → LLM 造题 → 固定数据集上跑真实检索 → 出指标 + 逐阶段丢因 | ✅ **已实现**（12 端点 / 9 表 / 2 冒烟 / 68 pytest） |
-| 2 | `app/services/evaluate/evaluation.yaml`（1349 行） | **"RAG Evaluation API" 设计态契约**：datasets / cases / metric registry / benchmarks / runs / results，14 个 `/evaluation/*` 端点，提到 ragas 作为 metric provider | ❌ **只有 yaml，无任何实现**（`app/api/v1/` 下无 `evaluation.py`，`app/services/evaluate/` 下无 models/services 目录；无任何代码 import 或 `$ref` 它） |
-| 3 | `app/services/document/qa/` + `app/api/v1/qa_datasets.py` | **QA 数据集生成**：另一套，产出对齐 `evaluation.yaml` 里 `EvaluationCase` 形状的数据，服务于 ragas 式**单文档**评测 | ✅ 已实现，但**与 retrieval eval 是两套东西** |
+| 2 | ~~`app/services/evaluate/evaluation.yaml`~~ | 曾有一份 "RAG Evaluation API" 设计稿（datasets / cases / metric registry / benchmarks / runs / results，14 个 `/evaluation/*` 端点，提到 ragas 作为 metric provider） | ❌ **已不存在**：`app/services/evaluate/` 与 `evaluation.yaml` 都不在当前代码树（设计稿已移出仓库）。做 ragas 式评测要从头起 |
+| 3 | `app/services/document/qa/` + `app/api/v1/qa_datasets.py` | **QA 数据集生成**：另一套，产出 `user_input` / `reference` / `reference_spans` / `reference_chunk_ids` 形状的数据，服务于 ragas 式**单文档**评测 | ✅ 已实现，但**与 retrieval eval 是两套东西** |
 
 判断依据（不是猜）：
 
-- 第 2 项的 14 个 path 全是 `/evaluation/*`（`evaluation.yaml:44-423`），与 `/retrieval-eval/*` **完全不重叠**；
-- 检索评测的**契约权威**是 `rag_eval_design/retrieval_eval_openapi.yaml`（48239 字节），不是 `evaluation.yaml` —— 见 `app/api/v1/retrieval_eval.py:4` 与 `domain/schemas/retrieval_eval.py:4` 的模块头；
+- 第 2 项现在只剩历史结论：那 14 个 path 全是 `/evaluation/*`，与 `/retrieval-eval/*` **完全不重叠**，且从未有实现；
+- 检索评测的**契约权威就是实现本身**：`app/api/v1/retrieval_eval.py` + `app/services/document/domain/schemas/retrieval_eval.py`（原 `rag_eval_design/retrieval_eval_openapi.yaml` 已随设计稿移出仓库）；
 - `qa/` 与 `eval/` 的**唯一共享**是 `qa/locate.py` 的逐字定位原语（`eval/generator.py:50`、`eval/adjudication.py:51` 都 `from ..qa.locate import Span, locate_quotes`）；`qa/` **不 import `eval/`**。两目录无任何 `deprecated` / `replaced` / "将来" 字样。
 
-> 📌 结论：**`evaluation.yaml` 是一份未被接线、也未被取代的广义设计**（含 LLM 判分 + ragas）。它与检索评测目标层不同，属并列关系。要写新评测功能前先读它，别当它不存在。
+> 📌 结论：三处"评测"里**只有检索评测与 QA 造题是真的**；那份广义 RAG Evaluation 设计稿已移出仓库，不要再去找它。
 
 ---
 
 ## 2. 阅读地图
 
 ```
-rag_eval_design/                          ← 设计态权威（三份）
-├── retrieval_eval_codegen_prompt.md      ← 设计说明：目标 / 非目标 / 关键决策 / 测试场景清单
-├── retrieval_eval_openapi.yaml            ← 权威契约（11 path / 12 operation）
-└── retrieval_eval_schema.sql              ← 权威 DDL（9 张表）
+（原 rag_eval_design/ 三份设计稿已移出仓库；下文的"权威契约/DDL"一律以代码为准）
 
 app/api/v1/retrieval_eval.py              ← HTTP 层（413 行）
 
@@ -146,9 +143,9 @@ flowchart TB
 
 **三个 202 的理由**：造题与评测都是**分钟级后台任务**，不能立刻给出结果。契约注释明说用 202 而非 201（`retrieval_eval_codegen_prompt.md:21`）。
 
-**没有 PUT / PATCH / DELETE**。数据集建后**不可变**——改参数必须新建 bundle。这是"基准可比"的前提（§16.9）。
+**没有 PUT / PATCH / DELETE**。数据集建后**不可变**——改参数必须新建 bundle。这是"基准可比"的前提。
 
-权威契约 `rag_eval_design/retrieval_eval_openapi.yaml` 与实现的 12 个 operation **一一对应，无多出、无缺失**。
+端点清单以 `app/api/v1/retrieval_eval.py` 的路由为准：**12 个 operation / 11 个 path**（原设计稿的 OpenAPI 已移出仓库）。
 
 ### 4.3 关键请求字段
 
@@ -201,13 +198,13 @@ flowchart TB
 
 - **没有 stage 名枚举** —— `stage_key` / `source_key` 是**自由串**，取值由检索侧 trace 决定（§12.2）。词表未收敛是潜在鸿沟。
 - **没有 case 来源枚举**（人工 / 生成）—— 题一律 LLM 逆向生成，最接近的概念是"金标校验方式" `EvalGoldValidationMethod`。
-- **没有指标名枚举** —— 指标是**固定字段**（`hit_rate_at_1` 等），不是注册表。这一点与 `evaluation.yaml` 的 metric registry 设计**正相反**。
+- **没有指标名枚举** —— 指标是**固定字段**（`hit_rate_at_1` 等），不是注册表。这一点与已移出的那份 RAG Evaluation 设计稿（metric registry）**正相反**。
 
 ---
 
 ## 6. 数据模型（9 张表）
 
-ORM：`models/sqlalchemy/retrieval_eval.py`；权威 DDL：`rag_eval_design/retrieval_eval_schema.sql`。**两者列/约束/索引/SQL 语义一致**，仅两处刻意偏差见 §6.4。
+ORM：`models/sqlalchemy/retrieval_eval.py`（**表结构的唯一来源** —— 原设计稿的 `retrieval_eval_schema.sql` 已移出仓库，建表走 ORM）。两处刻意偏差见 §6.4。
 
 ### 6.1 表结构
 
@@ -274,14 +271,16 @@ ORM：`models/sqlalchemy/retrieval_eval.py`；权威 DDL：`rag_eval_design/retr
 
 > 📌 **删一个 bundle 不会级联删任何子行** —— 因为它的子表全部是 RESTRICT，直接 `DELETE` 会被数据库拒绝。要清必须先删 run（级联带走 result → observation/candidate）、再删 generation_run（级联带走 window）、再删 case（级联带走 gold_chunk）。
 
-### 6.5 ORM 与 SQL 的刻意偏差（两处）
+### 6.5 与设计稿 DDL 的两处偏差（设计稿已移出仓库）
 
-| 项 | SQL | ORM | 后果 |
+`retrieval_eval_schema.sql` 已不在仓库，**建表完全由 ORM 决定**。历史上那两处偏差，现在的实际后果只剩一条：
+
+| 项 | 当时的设计稿 | 现在（ORM / `create_all`） | 后果 |
 |---|---|---|---|
-| `status` 列长度 | `VARCHAR(24)` | `String(32)` | `create_all` 实际建 `VARCHAR(32)`。功能无碍，但 DDL 与运行库声明不一致 |
-| `status` 的 `CHECK` 约束 | **有** `CHECK (status IN (...))` | **未镜像**（约束落在 Python 枚举上） | `create_all` 建的库**不含**这些 CHECK，仅应用层兜底 |
+| `status` 列长度 | `VARCHAR(24)` | `String(32)` | 无碍 |
+| `status` 的 `CHECK` 约束 | 有 `CHECK (status IN (...))` | **没有**（约束落在 Python 枚举上） | 库里不含 CHECK，仅应用层兜底 |
 
-两条 intra-row CHECK（`ck_retrieval_eval_answer_offsets`、`ck_retrieval_eval_stage_candidate_has_rank`）双方都有。SQL 尾部还有给既有库补列的增量 `ALTER` 段（`:271-286`）——对**已有库** `create_all` 不会加列，需手动执行。
+两条 intra-row CHECK（`ck_retrieval_eval_answer_offsets`、`ck_retrieval_eval_stage_candidate_has_rank`）在 ORM 里仍声明，由 `create_all` 建出。
 
 ---
 
@@ -702,7 +701,7 @@ cd C:/Users/尹文彬/PycharmProjects/YTraderHarness
 
 ---
 
-## 15. 设计目标与非目标（摘自 `rag_eval_design/retrieval_eval_codegen_prompt.md`）
+## 15. 设计目标与非目标（摘自早期设计稿，作者已移出仓库，仅存档）
 
 ### 15.1 目标
 
@@ -734,27 +733,18 @@ cd C:/Users/尹文彬/PycharmProjects/YTraderHarness
 
 | # | 项 | 说明 |
 |---|---|---|
-| 1 | **`evaluation.yaml` 整体未实现** | 1349 行的 "RAG Evaluation API"（含 ragas metric provider、benchmark、metric registry）无任何代码落地。属死设计或未来 spec |
-| 2 | **`dataset_sha256` 生产路径从不写入** | bundle 的列存在（`sqlalchemy:193`）、实体有（`entities:95`）、summary 暴露（`_to_summary:2922`）、SQLA docstring 称"冻结在同一行上"；但 `create_bundle` 从不写它，`export_bundle` 只**在响应里实时算**、不回写。**后果：生产环境 summary 的 `dataset_sha256` 恒为 `None`**（只有冒烟的 `"0"*64` 造过值）。属"字段已暴露但未持久化" |
-| 3 | **`max_k` 与返回条数口径可能错位** | `cutter.top_k = min(cutter.top_k, max_k)` **不保证二者相等**。默认阶梯 round1/round2 的 `cutter.top_k` 是 10/20，若 `max_k=50`，则标签写 `at_50` 实际只量到 `at_10`，**且不报错**。`retrieval_eval_service_impl.py:959-972` 自陈为已知限制 |
-| 4 | **过期注释** | `app/api/v1/retrieval_eval.py:257-259` 写"评测执行（尚未实现）"，但 `/runs` 等端点已注册、handler `retrieval_eval.evaluate` 已注册、冒烟全过。**实测确认该注释与代码不一致，建议删除** |
-| 5 | **`error_code="truncated"` 不在受控词表里** | `generator.py:72-81` 的 `ERROR_CODES` 元组只有 `llm_error` / `parse_error` / `no_valid_case` / `empty_window`，但 `:499-503` 会返回 `"truncated"`。词表不完整 |
-| 6 | **`status` 的 CHECK 约束 ORM 未镜像** | SQL 有 `CHECK (status IN (...))`，ORM 没有 → `create_all` 建的库不含这些 CHECK，仅应用层枚举兜底（§6.5） |
-| 7 | **`EvalScoreDirection` 实际只用 `higher_is_better`** | 其余两个值为将来"下推索引层原始分"预留。`score_name_*` / `score_direction_*` 列当前**几乎不携带信息** |
-| 8 | **无 `stage_key` / `source_key` 枚举** | 自由串，词表未收敛。阶段名一旦漂移，历史数据与新数据不可比 |
-| 9 | **`list_bundles` 按 DTD 筛 + 分页被明确拒绝** | 内存后置过滤会少返回行（`retrieval_eval_service_impl.py:517`）。设计取舍，非 bug |
-| 10 | **身份字段留空** | `created_by` / `tenant_id` 暂为 NULL，等 Casdoor subject → UUID 映射方案（`retrieval_eval.py:27-36`） |
-| 11 | **`add_windows` 非幂等** | 与其余写入路径的 `DO NOTHING` 风格不一致，但属有意为之（双切同 run 不该发生） |
-| 12 | `eval/output.py` 与 `memory/domain/schemas/_model_output.py` **有意重复** | output.py 的 docstring 自陈"解析四步一致"，解法应是提到 `app/common/`。属未偿还的技术债 |
-| 13 | `generator.py` **不设 `response_format`** | `:448-453` 称 adapters 行为不一致，属有意 |
-
-### 16.2 未确认
-
-| 项 | 为什么没确认 |
-|---|---|
-| `rag_eval_design/retrieval_eval_openapi.yaml` 的 `info.description` 全文 | 只读了 paths 与结构 |
-| `root` 上 `evaluation.yaml` 的 metric registry 字段级细节 | 只判断了"未实现"这一结论 |
-| `aggregate_stage_stats` 的 SQL 聚合细节 | 未逐行读该函数体 |
+| 1 | **`dataset_sha256` 生产路径从不写入** | bundle 的列存在（`sqlalchemy:193`）、实体有（`entities:95`）、summary 暴露（`_to_summary:2922`）、SQLA docstring 称"冻结在同一行上"；但 `create_bundle` 从不写它，`export_bundle` 只**在响应里实时算**、不回写。**后果：生产环境 summary 的 `dataset_sha256` 恒为 `None`**（只有冒烟的 `"0"*64` 造过值）。属"字段已暴露但未持久化" |
+| 2 | **`max_k` 与返回条数口径可能错位** | `cutter.top_k = min(cutter.top_k, max_k)` **不保证二者相等**。默认阶梯 round1/round2 的 `cutter.top_k` 是 10/20，若 `max_k=50`，则标签写 `at_50` 实际只量到 `at_10`，**且不报错**。`retrieval_eval_service_impl.py:952-972` 自陈为已知限制 |
+| 3 | **过期注释** | `app/api/v1/retrieval_eval.py:260-262` 写"评测执行（尚未实现）"，但 `/runs` 等端点已注册、handler `retrieval_eval.evaluate` 已注册、冒烟全过。**实测确认该注释与代码不一致，建议删除** |
+| 4 | **`error_code="truncated"` 不在受控词表里** | `generator.py:72-81` 的 `ERROR_CODES` 元组只有 `llm_error` / `parse_error` / `no_valid_case` / `empty_window`，但 `:499-503` 会返回 `"truncated"`。词表不完整 |
+| 5 | **`status` 没有 DB 级约束** | ORM 未声明 `CHECK`，建表走 ORM `create_all` → 库里没有任何 CHECK（原设计稿写过 `CHECK (status IN (...))`，但那份 DDL 已移出仓库）；非法状态只靠应用层枚举拦，直接改库拦不住 |
+| 6 | **`EvalScoreDirection` 实际只用 `higher_is_better`** | 其余两个值为将来"下推索引层原始分"预留。`score_name_*` / `score_direction_*` 列当前**几乎不携带信息** |
+| 7 | **无 `stage_key` / `source_key` 枚举** | 自由串，词表未收敛。阶段名一旦漂移，历史数据与新数据不可比 |
+| 8 | **`list_bundles` 按 DTD 筛 + 分页被明确拒绝** | 内存后置过滤会少返回行（`retrieval_eval_service_impl.py:517`）。设计取舍，非 bug |
+| 9 | **身份字段留空** | `created_by` / `tenant_id` 在 service 层已是可选入参，但 `app/api/v1/retrieval_eval.py` 仍不传，等 Casdoor subject → UUID 映射方案（`retrieval_eval.py:27-36`） |
+| 10 | **`add_windows` 非幂等** | 与其余写入路径的 `DO NOTHING` 风格不一致，但属有意为之（双切同 run 不该发生） |
+| 11 | `eval/output.py` 与 `memory/domain/schemas/_model_output.py` **有意重复** | output.py 的 docstring 自陈"解析四步一致"，解法应是提到 `app/common/`。属未偿还的技术债 |
+| 12 | `generator.py` **不设 `response_format`** | `:448-453` 称 adapters 行为不一致，属有意 |
 
 ---
 
@@ -782,9 +772,8 @@ cd C:/Users/尹文彬/PycharmProjects/YTraderHarness
 
 | 关注点 | 先读 |
 |---|---|
-| 设计意图 / 目标与非目标 | `rag_eval_design/retrieval_eval_codegen_prompt.md` |
-| 权威契约 | `rag_eval_design/retrieval_eval_openapi.yaml` |
-| 权威 DDL | `rag_eval_design/retrieval_eval_schema.sql` |
+| 设计意图 / 目标与非目标 | `README_EVAL.md` §15（原设计稿已移出仓库） |
+| 契约与 DDL 的权威 | 代码本身：`app/api/v1/retrieval_eval.py` + `models/sqlalchemy/retrieval_eval.py` |
 | HTTP 层 | `app/api/v1/retrieval_eval.py` |
 | 服务接口 | `app/services/document/application/retrieval_eval_service.py` |
 | 编排主体 | `app/services/document/application/retrieval_eval_service_impl.py` |

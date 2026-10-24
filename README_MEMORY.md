@@ -6,17 +6,7 @@
 **阅读方式**：第 1–4 节给全貌与表结构，第 6–9 节逐层展开（L0→L3），第 10–14 节是触发、注入、检索、API、契约，
 第 15 节是实测验证命令，**第 16 节「已知缺口与注释失真」建议优先读** —— 它列出当前**不能**工作的能力。
 
-**⚠️ 一个必须先说明的前提**：仓库根目录的 `memory_l0.md` / `memory_l1.md` / `memory_l2.md` / `memory_l3.md` /
-`memory_injection.md` / `agentic_memory.md` **描述的是原项目（TypeScript 版）的参考设计**，不是本仓库实现的规格：
-
-| 维度 | 根目录文档（原项目） | 本仓库（Python 实现） |
-|---|---|---|
-| 存储 | SQLite + `vec0` / `fts5` 虚表；L2/L3 走 MongoDB collection | **PostgreSQL** + `pgvector` + `tsvector` |
-| 分词 | jieba | 自研 CJK 分词器（`tokenization.py`），复刻 ES `cjk` 语义 |
-| 表组织 | L2/L3 **共用一张** `profiles` 表，靠 `type` 列区分 | **两张独立表** `memory_scene` / `memory_persona` |
-| 字段名 | `team_id` / `session_key` / `message_text` | `org_id` / `session_id` / `content` / `tokens` |
-
-照根目录文档读代码会全面错位。本文的结论一律以**代码与实测为准**（方法见第 15 节）。
+本文的结论一律以**代码与实测为准**（方法见第 15 节）。早期那批 TypeScript 版参考设计稿（`memory_l*.md` 等）已移出仓库，不再作为对照基准。
 
 ---
 
@@ -556,16 +546,17 @@ L0 / L1 **默认关**，按需真召回（贵）。
 
 | stage | order | 作用 | 现状 |
 |---|---|---|---|
-| `profile.py` | 20 | 注入**用户档案**（label "用户档案"，注意与 L3 的"用户画像"不是一个东西） | `profile_source` 端口**无实现** |
+| `profile.py` → `user_profile` | 20 | 注入**用户档案**（label "用户档案"，注意与 L3 的"用户画像"不是一个东西） | `profile_source` 端口**无实现** → 这段恒空 |
+| `profile.py` → `memory_profile` | 45 | 注入 **L3 画像 + L2 场景索引**（`retrieval_preview` 的 `l2/l3`，L2、L3 分键缓存） | **活的**，直接调服务，不经端口 |
 | `summary.py` | 30 | 只注入**既有**摘要（不生成） | — |
 | `history.py` | 40 | 纯窗口选择器 | 已删除 `ConversationSource` / `HistoryRetriever`，更早内容归 L0 |
 | `knowledge.py` | 60 | 注入知识库检索结果（RAG 在 document 模块） | `knowledge_source` 端口**无实现** |
-| `compaction.py` | 95 | 达阈值才触发摘要压缩 | 有 `TODO(memory_budget)`，见第 16 节 |
+| `compaction.py` | 95 | 达阈值才触发摘要压缩 | `memory_budget` 已计入 `TokenBudget` |
 
 > ⚠️ **`ProfileSource` / `KnowledgeSource` / `MemorySource` 三个端口只有 Protocol 定义、全仓没有任何实现**，
-> 且 ReAct 循环构造 `ContextDependencies` 时**只传了 `model_registry` 与 `tool_source`**。
+> 且 ReAct 循环构造 `ContextDependencies` 时只填了端口之外的那几项（`model_registry` / `tool_source` / `skill_source` / `capability_resolver`）。
 > 因此：**用户档案注入与知识库 RAG 注入当前是空的**（走 state 兜底路径或直接跳过）。
-> 这一点很容易被"处理器存在"误导。
+> 这一点很容易被"处理器存在"误导 —— 但记忆画像不同，它走的是直接调服务，是活的。
 
 ---
 
@@ -737,11 +728,11 @@ ALL PASS
 
 ## 16. 已知缺口与注释失真
 
-**这一节优先读。** 其中第 16.1 条与第 16.3 条是本次探查中**纠正了两个相互矛盾的说法**后确认的。
+**这一节优先读。** 以下每条都对着代码核过，不是推测。
 
 ### 16.1 触发 B / 触发 C **确实未实现**（纠正一处误读）
 
-根目录 `memory_l2.md` 列了 L2 的三条触发路径：
+L2 的原规格列了三条触发路径（设计稿 `memory_l2.md` 已移出仓库，此处只保留结论）：
 
 | 触发 | 原规格 | 当前实现状态 |
 |---|---|---|
@@ -760,12 +751,7 @@ ALL PASS
 
 **后果**：一个会话只要不再产生新的 L1，就**不会再排 L2** —— 触发 B 缺位导致"活跃会话保底轮询"这件事不存在。
 
-### 16.2 根目录 `memory_l*.md` 是原项目设计，不是本仓库规格
-
-见文首对照表。具体差异：SQLite/`vec0`/`fts5`/jieba/MongoDB/TS 字段名 → Postgres/pgvector/tsvector/自研分词/`org_id`。
-**引用这些文档前必须先对照代码**。
-
-### 16.3 三个 context 端口无实现 → 知识库 RAG 与用户档案**未注入**
+### 16.2 三个 context 端口无实现 → 知识库 RAG 与用户档案**未注入**
 
 | 端口 | 定义 | 实现 |
 |---|---|---|
@@ -787,14 +773,7 @@ ContextDependencies(
 
 **记忆注入不受影响**：`MemoryProcessor` 直接调 `retrieval_preview`，不经端口。
 
-### 16.4 L2 / L3 未开启注入（与"默认关"是两件事）
-
-| 层 | 状态 | 区别 |
-|---|---|---|
-| L0 / L1 | **默认关，可按需开** | 打开即生效（`MemoryProcessor` 支持） |
-| L2 / L3 | **代码里就没写** | `MemoryProcessor` 的取值只写了 `l0` 与 `l1`；只有手动经 HTTP `retrieval` 接口显式打开 `retrieve.l2/l3` 才生效 |
-
-### 16.5 其它硬缺口
+### 16.3 其它硬缺口
 
 | # | 缺口 | 证据 | 表现 |
 |---|---|---|---|
@@ -808,11 +787,10 @@ ContextDependencies(
 | 8 | **全量重跑无入口** | `models.sql` 注释：L0 按 run_id 逐轮索引，全量重建暂无入口 | 换模型 / 换分词器时只能手工 |
 | 9 | **挂载表无外键、无级联** | 两张索引表建表语句均无 FK | 删除靠 `delete_by_run`；绕过即**悬空行** |
 | 10 | **`L3` 提示词 `SYSTEM_PROMPT` 是空串** | `prompts/memory_retrieval.py:84`（管理端预览呈现 `prompt.system: null`） | — |
-| 11 | **`memory_budget` 策略无消费者** | `compaction.py` 的 `TODO(memory_budget)`：压缩账只算 messages，不含注入分节 | 长画像可能吃掉窗口却**不触发压缩** |
-| 12 | **`tests/` 无 memory 测试** | 目录里只有 agent/api/infra | 回归全靠 4 个冒烟 |
-| 13 | **应用未配置 logging** | 多处用 `print` 代替 `logger.info`（注释自述） | 可观测性差 |
+| 11 | **`tests/` 无 memory 测试** | 目录里只有 agent/api/infra | 回归全靠 4 个冒烟 |
+| 12 | **应用未配置 logging** | 多处用 `print` 代替 `logger.info`（注释自述） | 可观测性差 |
 
-### 16.6 待校准的常量（代码自述"不是实测值"）
+### 16.4 待校准的常量（代码自述"不是实测值"）
 
 | 常量 | 现值 | 症状 |
 |---|---|---|
@@ -821,12 +799,6 @@ ContextDependencies(
 | `DEFAULT_CONSOLIDATE_BATCH` | `200` | 单轮消费的 L1 条数 |
 | `PERSONA_TRIGGER_TURNS` | `50` | 调大 → 画像更新慢；调小 → 频繁重写 |
 | `SCENE_AFTER_L1_DELAY_SECONDS` / `SCENE_MIN_INTERVAL_SECONDS` | `90` / `900` | L2 的时效 vs 成本 |
-
-### 16.7 注释失真（说"还没接"但其实已接）
-
-`memory_scene.py` / `memory_persona.py` 的注释写着"读取方还没接 / 只有生产侧"，
-但**已经有** `memory_query_service`（浏览 + 水位 + 溯源）与 `retrieval_preview`（四段装配）。
-准确的说法是：**读取接口已接，但实时注入主模型的那条路径只开了 L0/L1**（见 16.4）。
 
 ---
 
@@ -938,7 +910,8 @@ app/
 │   │   ├── dependencies.py                     # ContextDependencies
 │   │   └── processors/
 │   │       ├── memory.py                       # ⭐ 记忆注入（直调服务，只开 l0/l1）
-│   │       ├── profile.py / knowledge.py       # ⚠️ 端口无实现，当前拿不到数据
+│   │       ├── profile.py                      # memory_profile 直调服务注入 L2/L3（用户档案段仍空）
+│   │       ├── knowledge.py                    # ⚠️ 端口无实现，当前拿不到数据
 │   │       └── summary.py / history.py / compaction.py
 │   └── prompt/prompts/
 │       ├── memory_atom_extract.py / memory_atom_dedup.py
@@ -946,9 +919,6 @@ app/
 │       └── memory_retrieval.py                 # ⚠️ SYSTEM_PROMPT 是空串
 │
 └── bootstrap/task.py                           # 4 个 memory.* handler 的注册处
-
-根目录（⚠️ **原项目参考设计，非本仓库规格**）
-memory_l0.md / memory_l1.md / memory_l2.md / memory_l3.md / memory_injection.md / agentic_memory.md
 ```
 
 ---

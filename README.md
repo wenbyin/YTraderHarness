@@ -632,29 +632,14 @@ POST /sessions/{id}/runs
 
 | 缺口 | 症状 |
 |---|---|
-| **工具指标无出口** | 事件/指标只在进程内，**无查询接口、无 Prometheus、重启清零**；`tool_execution` 无 API 读、无 latency、无 token 记账、无 reaper |
-| **运行时改不了处理器实现** | 只能挂载已有处理器；新增处理器要发版 |
 | **能力树的 `is_active` 不级联** | 停用父节点**不会**停用子树；工具查找按 code 精确匹配、不向下递归 |
-| **加新工具要发版** | 能力树可改"选择"，但 tool_key 没有注册描述符就会被 `select_specs` 静默跳过 |
-| **发现同步拾取不了代码修改** | 只能发现"从未 import 的新模块"，改已加载模块仍需重启 |
-| `modules` 恒为空 / `capability_config` 无消费者 | 分类五维里只有 3 维真正起作用 |
-| Graph 检索 | 端到端未实现；`index/fiass.py` 是 **0 字节** |
 | `retrieval_type=document` | 召回未实现（无外部容器） |
-| 文档格式 | **只支持 `.txt` / `.md`**；`format_detection` 是占位 |
 | 逻辑删除 | **不清外部索引** —— 删了文档，chunk 仍可被召回 |
 | 成本估算 | `model.yaml` 的 `pricing:` 段全部被注释 → `estimated_cost` 恒为 `None` |
-| 结构化输出不能流式 | `_can_stream` 要求 `response_format is None` |
-| **计划任务没有 HTTP 端点** | A2A 计划任务只活在 graph state / Redis 任务板 / 事件流；`/api/v1/tasks` 是**异步作业**，另一套东西（名字撞车，别混） |
 | **4 个任务工具是占位** | `create_task` / `claim_task` / `update_task` / `complete_task` 全返回 `not_implemented=true`；只有 `create_team` 接了真实副作用 |
 | **claim lease 只写不续租** | `lease_expires_at` 写进 claim，但 `app/agent/plan/` 下**没有续租 / 过期回收**；`is_ready` 也不看 lease → worker 崩溃后任务永久停在 `WORKING` |
-| **worker 不是独立进程** | 是同一进程内的 `Send` 分支（Pregel super-step 并发），**不能跨机扩容** |
 | **`subagent_mode` 只写 `on`/`off`** | `pending` / `denied` 仅存在于 `ReactState` 注释；团队决策用的是另一个字段 `team_decision` |
 | **`block_policy` 只有一种** | `all_succeeded`；其他值直接拒绝（`contracts.py`） |
-| Context 的三个 Source 端口 | `ProfileSource` / `KnowledgeSource` / `MemorySource` **全仓零实现** |
-| L2 / L3 消费侧 | 场景与画像**只有写入方**，还没有检索/注入 |
-| L1 背景对话 | 只喂增量，从对话中间开始时指代没有先行词（漏抽或猜，**两类都不报错**） |
-| Neo4j | 已接为 DataSource 但**尚未被消费** |
-| `tool_span` | react 图的节点级 span **只打日志不落库**（文档管线才落表） |
 | 契约一致性 | 只有 document 域有 `spec_check` 自动闸，其余域靠人守 |
 
 更大的方向性未做项（sandbox、agent eval、trace、比 orchestrator-worker 更复杂的协作拓扑）见仓库根 `todolist`。

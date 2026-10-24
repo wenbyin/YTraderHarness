@@ -326,7 +326,7 @@ app.agent.tools
 |---|---|---|
 | `tool_documentation` | `tool_id`(PK, FK CASCADE), `description_override`, `return_description_override`, `updated_by` | 与工具一对一 |
 | `tool_parameter_documentation` | `id`, `tool_id`(FK), `parameter_path`(JSON Pointer), `description_override` | `UNIQUE(tool_id, parameter_path)` |
-| `tool_definition_classification` | `tool_id`(PK, FK CASCADE), `classification_id`(PK, FK→`capability.id` CASCADE) | 双列主键；**该表不在 `models.sql`**，是手写补的（`tool_classification.py:22`） |
+| `tool_definition_classification` | `tool_id`(PK, FK CASCADE), `classification_id`(PK, FK→`capability.id` CASCADE) | 双列主键（`models.sql:96` 建表，ORM 见 `tool_classification.py`） |
 | `tool_execution` | `id`, `session_id`, `run_id`, `user_id`, `tool_key`, `scope_type`/`scope_key`, `execution_type`/`param_hash`, `match_key`, `status`, `counted`, `tool_call_id`, `result`, `error` | 一次执行一行（append-only）；`UNIQUE(run_id, tool_call_id)` 部分索引做 replay/resume 去重；`(match_key, created_at) WHERE counted` 做守卫计数；**`run_id` 刻意无 FK**。⚠️ 沿用旧表名，旧唯一约束由手工迁移脚本删除 |
 | `tool_processor` | `id`, `tool_id`(FK CASCADE), `processor_key`, `sequence`, `execution_mode`, `hook`, `config`(JSONB), `enabled` | `UNIQUE(tool_id, sequence)`；`CHECK(sequence >= 1)`、`CHECK(AROUND ⇒ SYNC)` |
 
@@ -824,7 +824,6 @@ SELECT status, count(*) FROM tool_execution
 
 | 项 | 说明 |
 |---|---|
-| `tool_definition_classification` 不在 `models.sql` | 与其它 5 张表**来源不一**，由 ORM 手写（`tool_classification.py:22`） |
 | `tool.yaml` 的 `Classification` schema 是 `Capability` 的**手工复制** | `tool.yaml:457` 自注 `"Kept in sync by hand"`，无跨文件 `$ref` → 字段易漂移 |
 | `tool_processor.sql` 的 `updated_at` 触发器 vs ORM | ORM **故意不镜像**，统一用 `onupdate`（`tool_processor.py:57`） |
 
@@ -837,7 +836,7 @@ SELECT status, count(*) FROM tool_execution
 
 | 脚本 | 失败断言 | 根因 | 是否链路缺陷 |
 |---|---|---|---|
-| `app.agent.prompt_smoke` | `两个 model_role 都登记了` | 断言 `keys == {CLASSIFICATION, SUMMARIZATION}`，但 `found_prompts()` 现返回 **7 个**键（另加 5 个 `memory.*` 提示词） | **否**，目录正常增长 |
+| `app.agent.prompt_smoke` | `两个 model_role 都登记了` | 断言 `keys == {CLASSIFICATION, SUMMARIZATION}`，但 `found_prompts()` 返回的键已远超这两个（`prompts/` 下已有十余份提示词，含 `eval_*` / `planner*` / `retrieve_rerank` 等） | **否**，目录正常增长 |
 
 `app.agent.tool_smoke` 那条 `source_ref == "agent.platform"` 的过期断言已修：现在断言"模块路径推导，只有显式声明 `TOOL_SOURCE_REF` 的才是自定义分组"。
 

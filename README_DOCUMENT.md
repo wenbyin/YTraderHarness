@@ -733,9 +733,6 @@ parser / cleaner / chunker / embedder / normalizer / enricher
   理由：数据集是给人看、给外部工具（ragas）读的，需要一个稳定可预期的文件名；
   而 File 模块的 artifact_store 是**内容寻址**的（按 checksum 去重、落在 `./data/files/<uuid>/source`），适合中间产物，不适合这种用法。
 - **接口**：仅 `POST /api/v1/qa-datasets:generate` 一个端点，**手动触发、同步阻塞**，不挂管线、无 job / 轮询。
-- **评测契约**：`app/services/evaluate/evaluation.yaml` 定义了 Datasets / Cases / Benchmarks / Metrics(native / ragas / custom，6 类) /
-  Runs / Results 的 API 规格，`BenchmarkTarget.top_k` 默认 10。
-  ⚠️ 该文件目前**只是规格**，后端实现未接线（见第 14 节）。
 
 ---
 
@@ -907,12 +904,10 @@ keyword 路 / 稠密向量召回 / 稀疏向量召回 / 缺 embedder / only_acti
 | 2 | **`retrieval_type=document` 召回未实现** | `application/document_retrieve_service_impl.py`：`external_container("document")` 返回 `None`，"走它需要一条按 keyword 查 chunk 表的召回路径，目前没实现" | 该路只记 warning 并跳过 |
 | 3 | **FAISS 后端不存在** | `index/fiass.py` 是 **0 字节空文件**（文件名疑似 `faiss` 笔误） | 无 `FaissIndexBackend` 类，反射发现不到 |
 | 4 | **`ENRICH_METADATA` 阶段（阶段 6）无实现** | 无任何 `role=ENRICH_METADATA` 的实现者；`registry.processor_by_role` 返回 `None` | `metadata_extraction` 节点在元数据抽取上走**透传**（但它仍会算扇出计划，所以不是空转） |
-| 5 | **`llm` / `custom` 精排未实现** | `retrieve/rerank.py` 的 `PassthroughReranker` | 原序降级 + warning，不报错 |
+| 5 | **`custom` 精排未实现** | `retrieve/rerank.py` 的 `PassthroughReranker` 只声明 `reranker_types = (CUSTOM,)`；`llm` 已由 `rerank_llm.py` 的 `LlmReranker` 实现 | 配成 `custom` 时原序降级 + warning，不报错 |
 | 6 | **分层切分未做** | `parent_chunk_id` 恒为 `None` | 无父子 chunk 结构 |
-| 7 | **`evaluation.yaml` 只有规格** | 该文件是 OpenAPI 契约，未见对应后端实现 | 评测集 / run / result 接口不可用 |
-| 8 | **版本的 chunker 配置不回传** | `api/v1/document_versions.py` 注明 chunker 当前恒为 `null` | 前端拿不到"当时用的什么 chunker"，只能靠 `pipeline_config` 快照 |
-| 9 | **逻辑删除不清理外部索引** | `document_service_impl.delete_document` 内有 `TODO`：逻辑删除后应通知 Cleanup Job 清理对象存储与各 Index | 删除 Document 后，ES / Milvus 里的 chunk 仍可被召回（若 `only_active=false` 或用历史版本过滤） |
-| 10 | **产物与用户上传无字段区分** | `app/bootstrap/pipelines.py` 注明：产物会出现在 `GET /files` 列表里 | 文件列表被流水线中间产物污染，需加 `origin` 字段并默认过滤 |
+| 7 | **版本的 chunker 配置不回传** | `api/v1/document_versions.py` 注明 chunker 当前恒为 `null` | 前端拿不到"当时用的什么 chunker"，只能靠 `pipeline_config` 快照 |
+| 8 | **逻辑删除不清理外部索引** | `document_service_impl.delete_document` 内有 `TODO`：逻辑删除后应通知 Cleanup Job 清理对象存储与各 Index | 删除 Document 后，ES / Milvus 里的 chunk 仍可被召回（若 `only_active=false` 或用历史版本过滤） |
 
 ### 14.2 注释失真（文档说的与代码做的不一致）
 
@@ -921,8 +916,7 @@ keyword 路 / 稠密向量召回 / 稀疏向量召回 / 缺 embedder / only_acti
 | 1 | `pipeline/registry.py` 模块 docstring | "现在全是空的 / `index/es.py`、`index/milvus.py`、`index/fiass.py` 目前是 0 字节 / `parser/`、`policy/` 下也没有任何具体实现" | **已过时**：ES（624 行）与 Milvus（648 行）均已实现；注册表实测有 9 个 processor 与 1 个 parser。只有 `fiass.py` 仍是 0 字节 |
 | 2 | `api/v1/documents.py` 的 `create_document` docstring | "解析 / 切分 / 建索引**尚未接入**，创建成功后版本不做后续状态流转" | **已过时**：实现里确实调用了 `_enqueue_pipeline(trigger_source="create_document")`，创建后会登记并触发流水线 |
 | 3 | `app/agent/pipeline_smoke.py` 模块 docstring | "真实节点全是 TODO / Parser / Chunker / IndexBackend 目前都还是空的" | **已过时**：parser / chunker / embedder / cleaner / normalizer / enricher 均有实现 |
-| 4 | `retrieve/base.py` | 标注"融合 / 精排未实现、全项目无引用" | 该处是**退役的历史遗留**（`policy/base.py` 的 `FusionStrategy` / `RerankStrategy` 全项目无引用）；查询期的真实实现在 `retrieve/processor.py` + `retrieve/fusion.py` + `retrieve/rerank.py` |
-| 5 | `document_service_impl.py` 创建流程 | `# 指向当前版本` 之后是被注释掉的赋值 | 指针由 `finalize.py` 在流水线结束时回填；create 请求内不回填，这是**刻意**的 |
+| 4 | `document_service_impl.py` 创建流程 | `# 指向当前版本` 之后是被注释掉的赋值 | 指针由 `finalize.py` 在流水线结束时回填；create 请求内不回填，这是**刻意**的 |
 
 ### 14.3 一个真实可复现的缺陷：`pipeline_smoke stub-run` 已失效
 
@@ -954,15 +948,6 @@ KeyError: 'chunker_digest'
 **修法**：在 `pipeline_smoke.py` 的桩分支字典里补上 `"chunker_digest": <任意稳定字符串>`（桩场景不需要真实摘要，
 只要保证同一 chunker 的多个分支拿到**相同**值，才能验证"只切一次"的收敛行为）。
 
-### 14.4 边界的 `[待核实]` 项
-
-| 项 | 为什么无法在当前代码中确认 | 核实方式 |
-|---|---|---|
-| `version_mode=IMMUTABLE` 是否有强制点 | update 路径只校验了 `allow_update`，未见对 `version_mode` 的显式校验 | 读 schema 层校验，或直接跑一次配 `IMMUTABLE` 的 DTD 传 `file_id` |
-| `RetryPolicy` 的退避参数是否可配 | `graph.py` 只设了 `max_attempts`，未见 `backoff` / `initial_delay` | 读 LangGraph `RetryPolicy` 签名 + 确认是否有环境变量接线 |
-| 检索是否有租户 / 权限过滤 | 请求 schema 中无 `tenant` / `workspace` / `org` 字段，仅有 `only_active` 与 `FilterConfig.document_ids` | 结合 Auth 层（`app/common/auth/`）与 `document_type_definition_ids` 的获取方式确认；**当前实现看起来没有独立的权限过滤层** |
-| ES / Milvus 的索引创建时机 | 只读了客户端与字段映射，未确认索引是由本服务创建还是外部预建 | 读 `infra/datasource/*.py` + 实际 `GET _cat/indices` |
-
 ---
 
 ## 15. 关键设计取舍
@@ -993,7 +978,7 @@ KeyError: 'chunker_digest'
 ### 15.3 产物即 File，不另建存储
 
 `FileArtifactStore` 复用 File 模块的存储与表，按 `(tenant, checksum)` 去重 —— 因此 reprocess 同一文件不会重复落盘。
-代价是产物会混进 `GET /files`（见 14.1 第 10 项）。
+代价是产物会混进 `GET /files` —— 已用 `FileOrigin`（`USER_UPLOAD` / `PIPELINE_ARTIFACT`）区分，查询时按 `origin` 过滤。
 
 ### 15.4 观测写入与业务事务分离
 

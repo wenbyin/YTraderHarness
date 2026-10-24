@@ -557,7 +557,7 @@ limit = min(max, min + T // 10)    # 摘要是"随对话变长而放宽"的节�
 | `KnowledgeSource` | `sources.py:71` | ❌ **无实现** |
 | `MemorySource` | `sources.py:90` | ❌ **无实现**（且**根本没人读**） |
 
-`ContextDependencies` 的三个源字段**默认 `None`**（`dependencies.py:84-87`），而 ReAct 构造依赖时**只传 `model_registry` + `tool_source`**（`agent_node.py:214-236`、`agent_builder_node.py:408-425`）。
+`ContextDependencies` 的三个源字段**默认 `None`**（`dependencies.py:86-89`），ReAct 构造依赖时只填了**端口之外**的那几项（`model_registry` / `tool_source` / `skill_source` / `capability_resolver`，见 `agent_node.py:356-365`），三个 source 字段从未被赋值。
 
 分两层看后果：
 
@@ -573,14 +573,12 @@ limit = min(max, min + T // 10)    # 摘要是"随对话变长而放宽"的节�
 | 项 | 说明 |
 |---|---|
 | `ContextUpdater` | 仅 `Protocol`（`updater.py:59-92`），**无实现、无 Noop**；`ReactContext.context_updater` 恒为 `None` |
-| Builder 类型 | `PLANNER` / `COMPACTION` / `MEMORY` / `SUB_AGENT` 无实现 |
+| Builder 类型 | `COMPACTION` / `MEMORY` 无实现（`PLANNER` / `SUB_AGENT` 已落地，见 `builder/planner.py`、`builder/subagent.py`） |
 | `context_builder.yaml` 三端点 | 未接路由（§16） |
-| `DefaultContextPolicyResolver.BASELINES` | 为空；4 个 builder_type 无实现（`planner` / `compaction` / `memory` / `sub_agent`） |
+| `DefaultContextPolicyResolver.BASELINES` | 为空；只剩 `compaction` / `memory` 两个 builder_type 无实现 |
 | 开放键不在 dataclass | `tool_overrides` / `memory_retrieve` / `response_format` / `model_metadata`（§13.1） |
 | `token_counter` | 默认启发式，tiktoken 预留未启用 |
-| 已删除的端口 | `history.py` 移除 `ConversationSource` / `HistoryRetriever`；`sources.py:22-33` 移除 `ConversationSource` |
 | 嵌套调用 | `nested_invocations` / COMPACTION 自调**仅规格声明**，无代码落地 |
-| `STAGE_SPECS` | **全仓不存在**（任务书里的名字不实） |
 
 ### 17.3 不是缺陷的设计点
 

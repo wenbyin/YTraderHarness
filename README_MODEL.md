@@ -429,11 +429,9 @@ ModelError                                    (基类)
 
 | 项 | 说明 |
 |---|---|
-| **`langchain` 等包未声明** | 见 §6.2。**最高优先级** |
+| **`langchain-core` 未显式 pin** | 代码里直接 `from langchain_core...`，但 `requirements.txt` 只声明了 `langgraph` / `langchain-ollama`，core 靠传递依赖带进来（`requirements.txt:131` 的注释自陈）。升级上游可能被动换版本 |
 | `pricing` 全注释 | `estimated_cost` 恒 `None`，成本无法估算 |
 | `disable_thinking` 模型级开关**全关** | `ModelDefinition.__post_init__` 仍强制"开启必须有 extra_body"（`types.py:539-589`），但无人开启 |
-| `adapters.py:193`、`:214` 残留 `print(...)` | 调试打印残留在生产代码路径（不是密钥泄漏，但是噪声，建议清理） |
-| `max_retries` 不进 `model.yaml` 的 config | adapter 构造时**主动剔除**（`adapters.py:125-129`）；只有 config 显式写时才由 `factory._config_max_retries` 恢复 |
 
 ### 13.2 预留（不是 bug）
 
@@ -442,7 +440,7 @@ ModelError                                    (基类)
 | `ModelRole.VISION` / `FAST` / `EVALUATION` | 无绑定使用 |
 | `ModelRole.MEMORY_RETRIEVAL` | 仅**占位**，不发起调用（`types.py:131-148` 注释） |
 | `vision_default` 别名 | 刻意省略（无模型支持 vision） |
-| `planner` / `evaluator` 图 | 未实现，bindings 是**预备绑定**（`model.yaml:415` 注明） |
+| `evaluator` 图 | 未实现，bindings 是**预备绑定**（`model.yaml:415` 注明）；`planner` 图已落地 |
 
 ---
 
