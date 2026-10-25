@@ -8,7 +8,7 @@ Mock 模型服务的进程级生命周期。
 
 这里额外做两件与"能不能连上"有关的接线：
 
-1. 把 ``MOCK_MODEL_BASE_URL`` 写进环境变量，供 ``llm.yaml`` 的
+1. 把 ``MOCK_MODEL_BASE_URL`` 写进环境变量，供 ``providers.yaml`` 的
    ``mock.base_url: "${MOCK_MODEL_BASE_URL:-...}"`` 展开。这样 app 配置里的
    端口与 LLM 客户端实际请求的地址不会各写一份。
 2. 把回环地址加进 ``NO_PROXY``。Windows 的系统代理会劫持 httpx 对

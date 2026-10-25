@@ -221,7 +221,7 @@ def test_settings_load_from_yaml(
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    path = tmp_path / "web.yaml"
+    path = tmp_path / "providers.yaml"
 
     path.write_text(
         "web:\n"

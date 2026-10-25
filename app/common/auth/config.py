@@ -5,7 +5,7 @@ Casdoor 配置（app/config/casdoor.yaml）的读取与校验。
 app/agent/event/config.py）：`${VAR:-default}` 展开 + pydantic
 `extra="forbid"` + 按路径缓存。改 yaml 要重启才生效。
 
-与 llm.yaml 不同的是验证时机
+与 providers.yaml 不同的是验证时机
 ---------------------------
 llm.py 刻意**不**在加载时校验密钥是否为空（"只跑检索、不跑 LLM 的
 场景不该被一条缺失的 key 拦在门外"）。这里反过来：**启动期就校验**。
@@ -39,7 +39,7 @@ __all__ = [
 #: 默认配置文件位置。
 #:
 #: ⚠️ **全仓唯一一个"配置不在读它的模块旁边"的非数据源配置**
-#: —— llm.yaml / event_stream.yaml / model.yaml 都用 `Path(__file__)
+#: —— providers.yaml / event_stream.yaml / model.yaml 都用 `Path(__file__)
 #: .with_name(...)` 住在模块目录下。这里是刻意的例外：集成配置属于
 #: "部署时要改的东西"，该和 redis.yaml / postgre.yaml 待在一起。
 #:

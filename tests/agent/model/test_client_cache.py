@@ -167,7 +167,7 @@ async def test_credential_rotation_invalidates_cache() -> None:
 async def test_no_credential_ref_means_provider_default() -> None:
     """
     没有 credential_ref 时**什么都不做**：让 provider 用它自己配置里的
-    凭据（app/common/llm.yaml）。默认路径上本模块不认识任何密钥。
+    凭据（providers.yaml 的 llm 段）。默认路径上本模块不认识任何密钥。
     """
 
     adapter = FakeAdapter()

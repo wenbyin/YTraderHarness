@@ -33,7 +33,7 @@ Model 模块：为 Agent / LangGraph 的 LLM Node 提供统一的模型调用能
                     request / response / usage / attempt / resolve context
     errors.py       Model 层异常层级 + provider 异常归一化
     redaction.py    脱敏（日志与观测里不允许出现密钥）
-    credentials.py  credential_ref -> 秘密（默认走 llm.yaml，不重复造配置）
+    credentials.py  credential_ref -> 秘密（默认走 providers.yaml 的 llm 段，不重复造配置）
     provider.py     ProviderAdapter 契约 + ModelClient
     adapters.py     默认适配器：转交 app/common/llm.py 建客户端
     factory.py      ModelClientFactory：建 / 缓存 / 复用客户端

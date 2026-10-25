@@ -31,7 +31,7 @@ provider 的连接参数（可执行文件路径、参数、环境变量、超�
 而不是可执行。这是 MCP 最现实的风险：server 的发布节奏不由我们决定。
 
 配置形状见 `app/config/mcp.yaml.template`。真文件已 gitignore ——
-它装着本机路径与密钥，跟 web.yaml / llm.yaml 同一待遇。
+它装着本机路径与密钥，跟 providers.yaml 同一待遇。
 """
 
 from __future__ import annotations

@@ -119,7 +119,7 @@ class QADatasetGenerateRequest(APIModel):
     provider: str | None = Field(
         default=None,
         description=(
-            "用哪个 LLM 提供方（见 app/common/llm.yaml）。"
+            "用哪个 LLM 提供方（见 app/config/providers.yaml 的 llm 段）。"
             "None = 用那里的 default_provider。"
         ),
     )

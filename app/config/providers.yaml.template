@@ -1,0 +1,172 @@
+# ============================================================
+# providers.yaml — 外部 HTTP provider 的连接配置
+#
+# 这是模板，不是可用配置：
+#
+#     cp app/config/providers.yaml.template app/config/providers.yaml
+#
+# 一份文件、三段：
+#
+#     llm       LLM chat provider（原 llm.yaml）
+#     web       DeepSeek Search & Fetch（原 web.yaml）
+#     rerank    第三方精排（原 rerank.yaml）
+#
+# 为什么要合并：web / rerank 的缺项本来就分别从 llm 段的 deepseek /
+# qwen provider 兜底。同一把 key 抄在三份文件里，抄漏一处的症状是
+# 「某一类调用突然 401」。现在只有一份密钥文件，三个加载器各读自己
+# 那段，回落关系不变。
+#
+# ⚠️ 真文件含明文密钥，已被 .gitignore 按路径排除；本模板里 api_key
+#    一律只留 ${VAR} 名。`${NAME}` / `${NAME:-默认值}` 在加载时展开
+#    （见 app/common/utils/env.py）。
+#
+# 需要设置的环境变量：
+#     DEEPSEEK_API_KEY   https://platform.deepseek.com/
+#     KIMI_API_KEY       https://platform.moonshot.cn/
+#     QWEN_API_KEY       阿里千问
+#     RERANK_*           rerank 段的覆盖项（见下）
+# ============================================================
+
+
+# ============================================================
+# llm — chat 模型连接（读入后校验为 LLMConfig）
+# ============================================================
+
+llm:
+  #: 不指定 provider 时用哪个。
+  default_provider: kimi
+
+  #: 可选的提供方。
+  #:
+  #: 都是 **OpenAI 兼容**接口，只换 base_url / model / api_key。
+  #: 新增一家的步骤：这里加一段 + app/common/llm.py 的枚举加一项。
+  #: base_url 必须带 /v1（OpenAI SDK 会自己拼 /chat/completions）。
+  providers:
+
+    deepseek:
+      label: DeepSeek
+      base_url: https://api.deepseek.com/v1
+      #: deepseek-chat 是非推理模型，快且便宜，适合批量生成。
+      model: deepseek-v4-flash
+      api_key: "${DEEPSEEK_API_KEY}"
+
+    kimi:
+      label: Kimi（月之暗面）
+      base_url: https://api.moonshot.cn/v1
+      #: moonshot-v1 系列按上下文长度分档（8k/32k/128k）。
+      model: kimi-k2.7-code
+      api_key: "${KIMI_API_KEY}"
+
+    qwen:
+      label: qwen（阿里千问）
+      base_url: https://maas.qianwenaiapi.com/compatible-mode/v1
+      model: qwen3.7-flash
+      api_key: "${QWEN_API_KEY}"
+
+    # 开发用的进程内 mock。python run_server.py --mock 时会启动它，
+    # 并把 MOCK_MODEL_BASE_URL 指到实际监听地址（见 app/mock/runtime.py）。
+    # 端口与分布参数在 app/config/mock_model.yaml。
+    mock:
+      label: Mock Model（开发 / 前端联调）
+      base_url: "${MOCK_MODEL_BASE_URL:-http://127.0.0.1:18080/v1}"
+      model: mock-chat
+      api_key: "${MOCK_MODEL_API_KEY:-mock}"
+
+
+# ============================================================
+# web — DeepSeek Search & Fetch（读入后校验为 WebSettings）
+#
+# 端点（2026-10 DeepSeek 官方 API）：
+#
+#     POST https://api.deepseek.com/v1/tools/search
+#     POST https://api.deepseek.com/v1/tools/fetch
+#     Authorization: Bearer <DEEPSEEK_API_KEY>
+#
+# ⚠️ 不要把 llm 段 deepseek 的 base_url（.../v1）直接拿来拼：那是
+#    chat 端点，Search / Fetch 的路径挂在站点根上。实现会自己还原
+#    origin，所以这里写站点根或带 /v1 都行。
+#
+# 没有 `web` 段时，实现会从 llm 段的 deepseek provider 兜底
+# （api_key 与站点根同源），最后再回落环境变量 DEEPSEEK_API_KEY。
+# ============================================================
+
+web:
+  #: 站点根；实现会还原 origin 后拼 /v1/tools/search 或 /v1/tools/fetch。
+  base_url: "${DEEPSEEK_SEARCH_BASE_URL:-https://api.deepseek.com}"
+
+  #: 与 LLM 共用同一把 DeepSeek key。
+  api_key: "${DEEPSEEK_API_KEY}"
+
+  #: 单次 HTTP 的墙钟上限（毫秒）。
+  timeout_ms: 20000
+
+  #: 429 / 5xx / 网络错误的重试次数（不含首次）。
+  max_retries: 1
+
+  #: 搜索不传 count 时的默认条数。
+  default_count: 5
+
+  #: 搜索允许返回的最大条数（DeepSeek 上限 50；这里默认收紧到 20，
+  #: 避免把整页结果塞进上下文）。
+  max_count: 20
+
+  #: Search 的 need_content=true 时每条结果正文的截断长度（字符）。
+  max_content_chars: 4000
+
+  #: Fetch 返回的 Markdown 正文截断长度（字符）。
+  max_fetch_chars: 12000
+
+
+# ============================================================
+# rerank — 第三方精排（读入后校验为 ApiRerankerSettings）
+#
+# ⚠️ 凭据**只在这里**读，不进请求
+# --------------------------------
+# 请求里只带 model id（`RerankerConfig.model`）。把 key 塞进请求体的话，
+# 它会跟着 `effective_config_snapshot` 落库、跟着响应回显，而「哪个请求
+# 带过 key」事后无从审计。
+#
+# 端到端形状（已实测）
+# ------------------
+# 2026-10-16 用本机凭据实测，结论：
+#
+#   1. **OpenAI 兼容的 `/rerank`、`/reranks` 都是 404**（maas host 与
+#      dashscope.aliyuncs.com 都试过）。所以默认 `protocol: dashscope`。
+#   2. DashScope 原生端点 `{站点根}/api/v1/services/rerank/text-rerank/
+#      text-rerank` 返回 200。⚠️ 注意是**站点根**：llm 段 qwen 的
+#      base_url 带 `/compatible-mode/v1`，直接拼会 404 —— 实现里有
+#      `_origin()` 负责还原，不用在这里手工去掉。
+#   3. 认证：`Authorization: Bearer <key>`。
+#   4. 响应：`{"output": {"results": [{"index", "relevance_score"}]},
+#      "usage": {...}}` —— index 是**送进去的顺序**，实现按它映射回候选。
+#
+# 没有 `rerank` 段时，实现会从 llm 段的 qwen provider 兜底（端点与
+# 凭据同源），并降级到内置默认值。
+# ============================================================
+
+rerank:
+  # 与 llm 段的 qwen provider 同一个 host 与 key（都读 QWEN_API_KEY）。
+  base_url: "${RERANK_BASE_URL:-https://maas.qianwenaiapi.com}"
+  api_key: "${QWEN_API_KEY}"
+
+  # dashscope = 原生 text-rerank（实测可用，默认）
+  # openai    = {base_url}{path} + {model, query, documents, top_n}
+  protocol: "${RERANK_PROTOCOL:-dashscope}"
+
+  # openai 协议下的路径（dashscope 协议会忽略它，用内置的固定路径）。
+  path: "${RERANK_PATH:-/rerank}"
+
+  # 默认模型。阶梯里的第三轮也写死了一个同名的 —— 那份进快照
+  # （「这批数字是哪个模型跑的」要可查），这份是真正发请求时用的。
+  model: "${RERANK_MODEL:-qwen3.7-text-rerank}"
+
+  # 单次调用的墙钟上限。精排是逐案一次调用，而评测的单案超时是 60s
+  # （CASE_TIMEOUT_SECONDS），这里要明显小于它。
+  timeout_ms: 20000
+
+  # 5xx / 超时的重试次数（不含首次）。重试期间**不**重算候选文本。
+  max_retries: 1
+
+  # 单次最多送几段候选。服务端有自己的上限，超了会整批被拒 ——
+  # 实现会 clamp 到这里并记一条 warning（「送不满」比「整批失败」好）。
+  max_documents: 50

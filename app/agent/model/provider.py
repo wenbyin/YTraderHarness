@@ -106,7 +106,8 @@ class ProviderSpec:
     """
     注册表里一条 provider 登记。
 
-    `name` 必须与 `app/common/llm.yaml` 里的 provider 键一致（那是连接
+    `name` 必须与 `app/config/providers.yaml` 的 `llm` 段里的 provider
+    键一致（那是连接
     信息与密钥的所在），除非这个 adapter 自己解决连接信息。
 
     ⚠️ 刻意**没有** `options` 之类的"适配器专属配置"

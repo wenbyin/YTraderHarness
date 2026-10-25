@@ -5,7 +5,7 @@
 
     settings.py      配置模型 + 是否启用
     model_server.py  OpenAI-compatible aiohttp 服务（守护线程）
-    runtime.py       启动 / 停止 + 与 app.yaml、llm.yaml 的接线
+    runtime.py       启动 / 停止 + 与 app.yaml、providers.yaml 的接线
 
 设计上的取舍见 model_server.py 的模块 docstring。最重要的两条：
 

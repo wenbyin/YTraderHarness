@@ -6,14 +6,14 @@
 >
 > ***没有任何热加载。*** 改任何 yaml 都必须重启进程。
 
-`15 份运行时配置` · `21 份契约规格` · `lifespan 组合根` · `强制 SelectorEventLoop`
+`14 份运行时配置` · `21 份契约规格` · `lifespan 组合根` · `强制 SelectorEventLoop`
 
 ---
 
 ## 📚 本文结构
 
 - 🚀 **启动** —— 四条命令，以及为什么不能用 `uvicorn app.main:app`
-- ⚙️ **运行时配置一览** —— 15 份，逐个说清「管什么 + 改了会怎样」
+- ⚙️ **运行时配置一览** —— 14 份，逐个说清「管什么 + 改了会怎样」
 - 🔗 **跨文件不变量** —— 改一个必须回头看另一个
 - 🧯 **启动失败速查** —— 排障时直接跳这张表
 - 📖 返回 **[主手册](README.md)** · ⚠️ 缺口见 **[todolist](todolist)**
@@ -25,7 +25,7 @@
 | 问题 | 一句话答案 |
 |---|---|
 | 配置分几类？ | **两类，性质完全不同**：`app/config/` 会被解析；`app/services/**/*.yaml` 一个字节都不读 |
-| 运行时配置在哪？ | 全部集中在 `app/config/`：**顶层 9 份 + `datasource/` 6 份**。不再散落在各模块目录 |
+| 运行时配置在哪？ | 全部集中在 `app/config/`：**顶层 8 份 + `datasource/` 6 份**。不再散落在各模块目录 |
 | 契约规格会被读吗？ | **不会**。真正做校验的是 Python DTO；yaml 是「唯一事实来源」的声明，只有开发期 `spec_check` 会解析 |
 | 改完要重启吗？ | **要**。`@lru_cache` 或启动期单例，无热加载 |
 | 哪个配置错了会起不来？ | `postgre.yaml` 与 `checkpointer.yaml` 都标了 `required: true`；`casdoor.yaml` 在 `APP_ENV=prod` 下强制自检 |
@@ -73,19 +73,18 @@ app/common  ←  app/services  ←  app/infra  ←  app/bootstrap  ←  app/main
 
 ## ⚙️ 运行时配置一览
 
-### 顶层 9 份（`app/config/`）
+### 顶层 8 份（`app/config/`）
 
 | 文件 | 管什么 | 一句话记住 |
 |---|---|---|
 | [`app.yaml`](./app/config/app.yaml) | 应用级开关 | — |
 | [`casdoor.yaml`](./app/config/casdoor.yaml) | JWT 校验、OAuth 登录、管理员门禁 | `APP_ENV=prod` + `enabled: false` = **硬拒绝启动** |
 | [`event_stream.yaml`](./app/config/event_stream.yaml) | SSE 链路的全部节流参数 | `maxlen` 与 `ttl` 管**两件不同的事，两个都要** |
-| [`llm.yaml`](./app/config/llm.yaml) | **怎么建客户端**（provider / base_url / key） | 三家都 OpenAI 兼容，`base_url` 必须带 `/v1` |
+| [`providers.yaml.template`](./app/config/providers.yaml.template) | 外部 provider 连接：`llm` / `web` / `rerank` 三段 | 复制成 `providers.yaml` 再填 key；真文件 gitignore |
 | [`mcp.yaml`](./app/config/mcp.yaml) | MCP 外部工具来源 | 配了才连，连不上不影响启动 |
 | [`model.yaml`](./app/config/model.yaml) | **选哪个模型**（六段目录 + 绑定） | `bindings` 刻意**没有通配兜底** |
 | [`mock_model.yaml`](./app/config/mock_model.yaml) | 离线/测试用的假模型 | 有它才能不接真 key 跑冒烟 |
 | [`stress_eval.yaml`](./app/config/stress_eval.yaml) | 压测与评测参数 | — |
-| [`web.yaml`](./app/config/web.yaml) | HTTP 层（CORS 等） | — |
 
 ### `datasource/` 6 份
 

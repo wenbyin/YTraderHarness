@@ -13,13 +13,14 @@
     CredentialResolver.resolve(ref)  这个名字 -> 秘密本身
     谁都不写明文密钥
 
-与既有 llm.yaml 的关系（**不重复造配置系统**）
---------------------------------------------
-本项目的秘密一直只有一条来源：`app/common/llm.yaml` 里的
-`api_key: "${DEEPSEEK_API_KEY:-}"`，由 `app/common/llm.py` 在构造
+与既有 providers.yaml llm 段的关系（**不重复造配置系统**）
+-------------------------------------------------------
+本项目的秘密一直只有一条来源：`app/config/providers.yaml` 的
+`llm` 段里的 `api_key: "${DEEPSEEK_API_KEY:-}"`，由
+`app/common/llm.py` 在构造
 客户端时展开。本模块**不另建一份秘密配置**，只加一个可选的覆盖口子：
 
-    credential_ref = None（默认）  -> 什么都不做，用 llm.yaml 里那份
+    credential_ref = None（默认）  -> 什么都不做，用 llm 段里那份
     credential_ref = "xxx"        -> 解析出秘密，**覆盖** provider 的默认值
 
 覆盖的用途是多账号 / 多租户（同一个 provider 有两把 key）与"某个模型
@@ -28,7 +29,7 @@
 ⚠️ 解析不到不算错（默认）
 ------------------------
 `EnvVarCredentialResolver` 找不到环境变量时返回 None，而不是抛错：
-那表示"没说要用哪份专用凭据"，于是回落到 llm.yaml 的默认凭据 ——
+那表示"没说要用哪份专用凭据"，于是回落到 llm 段的默认凭据 ——
 这与本模块之前的行为一致。真要"声明的凭据必须存在"，构造时传
 `required=True`，缺了会抛 `ModelConfigurationError`（fail fast）。
 
@@ -72,7 +73,8 @@ class CredentialResolver(Protocol):
 
 class NullCredentialResolver:
     """
-    永远不覆盖 —— 全部凭据走 llm.yaml / provider 自己的配置。
+    永远不覆盖 —— 全部凭据走 providers.yaml 的 llm 段 / provider
+    自己的配置。
 
     这是 Registry 的默认。没有多账号需求时它就该是唯一在用的实现：
     多一层"名字到秘密"的间接，只在该有间接的地方有。
@@ -133,7 +135,7 @@ class EnvVarCredentialResolver:
                 "没有设置。\n"
                 "本解析器被要求「声明的凭据必须存在」（required=True）——"
                 "要么把该环境变量配上，要么去掉这个模型的 credential_ref"
-                "（那样会回落到 app/common/llm.yaml 里的 provider 凭据）。"
+                "（那样会回落到 providers.yaml 的 llm 段里的 provider 凭据）。"
             )
 
         # 只打名字，**绝不打值** —— 这里本来也没有值可打。

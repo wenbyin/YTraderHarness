@@ -26,7 +26,7 @@ mock_model:
   #: 是否启用。--mock / --no-mock 与环境变量优先。
   enabled: "${MOCK_MODEL_ENABLED:-false}"
 
-  #: 监听地址与端口。llm.yaml 的 mock.base_url 默认指向 18080。
+  #: 监听地址与端口。providers.yaml 的 llm.mock.base_url 默认指向 18080。
   #: 只建议 127.0.0.1；0.0.0.0 仅供容器/局域网联调。
   host: "${MOCK_MODEL_HOST:-127.0.0.1}"
   port: "${MOCK_MODEL_PORT:-18080}"

@@ -630,7 +630,8 @@ components:
             `api` — a third-party HTTP rerank service. The model id goes in
             `model` (the default ladder uses Alibaba DashScope
             `qwen3.7-text-rerank`); endpoint, credentials and timeout come
-            from `app/config/rerank.yaml`, never from the request.
+            from the `rerank` section of `app/config/providers.yaml`,
+            never from the request.
             `custom` — still a placeholder: it logs a warning and returns
             the candidates unchanged.
 

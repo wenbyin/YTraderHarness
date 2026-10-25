@@ -674,7 +674,7 @@ def test_real_clients_are_constructed_from_the_shipped_catalog() -> None:
     # 翻倍了，说明更对症的做法是让这类调用别思考）。
     assert getattr(flash.client, "max_tokens", None) == 16384
 
-    # 同一个 provider 的**另一个模型**：定义里的 model 覆盖了 llm.yaml 的
+    # 同一个 provider 的**另一个模型**：定义里的 model 覆盖了 llm 段的
     reasoner = registry.factory.get(
         registry.definition("deepseek:deepseek-reasoner"), timeout=15
     )
@@ -726,7 +726,7 @@ def test_env_resolver_falls_back_to_name_convention(monkeypatch) -> None:
 
 def test_env_resolver_returns_none_when_absent(monkeypatch) -> None:
     """
-    解析不到 -> None（= 不覆盖，用 llm.yaml 里 provider 自己那份）。
+    解析不到 -> None（= 不覆盖，用 llm 段里 provider 自己那份）。
 
     这不是错误：绝大多数模型本来就不需要 credential_ref。
     """

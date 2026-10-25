@@ -665,7 +665,8 @@ class EvalAttemptSpec(APIModel):
 
 #: 默认阶梯第三轮用的精排模型（阿里云 DashScope 的文本精排）。
 #:
-#: 与 `app/config/rerank.yaml` 里的默认值是同一个量 —— 这里给只是为了让
+#: 与 `app/config/providers.yaml` 的 `rerank` 段里的默认值是同一个量 ——
+#: 这里给只是为了让
 #: 阶梯快照能自证"这批数字是用哪个模型跑出来的"；真正发请求时以配置里的
 #: 为准（配置能改，快照不能）。
 QWEN_RERANK_MODEL = "qwen3.7-text-rerank"

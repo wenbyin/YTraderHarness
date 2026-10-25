@@ -2,7 +2,7 @@
 第三方 HTTP 精排（`RerankerType.API`）。
 
 接的是阿里云的精排服务（默认 `qwen3.7-text-rerank`），端点与凭据全在
-`app/config/rerank.yaml` 里 —— 请求里只带 model id。
+`app/config/providers.yaml` 的 `rerank` 段里 —— 请求里只带 model id。
 
 为什么另开一个文件而不是塞进 rerank.py
 --------------------------------------
@@ -30,7 +30,7 @@ aiohttp 不读系统代理。
     请求    dashscope {model, input: {query, documents}, parameters: {top_n, return_documents}}
     响应    dashscope {"output": {"results": [{"index", "relevance_score"}]}, "usage": {...}}
 
-⚠️ `base_url` 可能带 `/compatible-mode/v1`（llm.yaml 里 qwen 的 chat
+⚠️ `base_url` 可能带 `/compatible-mode/v1`（llm 段里 qwen 的 chat
 端点就是它），而原生路径挂在**站点根**上 —— 直接拼会 404 而且 404 不带
 任何提示。`_origin()` 负责还原。
 
@@ -48,10 +48,12 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-import yaml
 from pydantic import BaseModel, Field
 
-from app.common.utils.env import expand_env
+from app.common.providers_config import (
+    get_providers_section,
+    load_providers_document,
+)
 
 from ..domain.schemas import RerankerConfig
 from ..domain.schemas.enum import RerankerType
@@ -66,9 +68,9 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-#: 配置文件路径（与 llm.yaml 同一层，真文件 gitignore、模板入库）。
+#: 配置文件路径（真文件 gitignore、模板入库）。rerank 配置在 `rerank` 段。
 _CONFIG_PATH = (
-    Path(__file__).resolve().parents[3] / "config" / "rerank.yaml"
+    Path(__file__).resolve().parents[3] / "config" / "providers.yaml"
 )
 
 #: dashscope 协议下的固定路径（原生 text-rerank 端点）。
@@ -85,7 +87,7 @@ _MAX_CHARS = 512
 
 
 class ApiRerankerSettings(BaseModel):
-    """`rerank.yaml` 的形状。"""
+    """`providers.yaml` 的 `rerank` 段的形状。"""
 
     base_url: str
     api_key: str
@@ -100,15 +102,17 @@ class ApiRerankerSettings(BaseModel):
 @lru_cache(maxsize=1)
 def get_reranker_settings() -> ApiRerankerSettings:
     """
-    读 `app/config/rerank.yaml`；缺的项从 `llm.yaml` 的 qwen provider 兜。
+    读 `providers.yaml` 的 `rerank` 段；缺的项从同一份文件的 `llm` 段
+    qwen provider 兜。
 
     进程内缓存：它在每次精排调用里被读一次，而文件不会中途变。
     测试要改配置时调 `get_reranker_settings.cache_clear()`。
 
-    ⚠️ 文件不存在时**不抛**，而是走"从 llm.yaml 兜"这条路 —— 抛的话，
-    任何没配 rerank.yaml 的环境（CI、别人的机器）里，只要有一轮阶梯配了
-    `api` 精排就会在装配期炸；而正确的表现是"这次精排降级"（与 rerank /
-    改写的一贯口径一致：能力缺口不该让检索失败）。
+    ⚠️ 文件不存在或没有 `rerank` 段时**不抛**，而是走"从 llm 段兜"
+    这条路 —— 抛的话，任何没配 rerank 段的环境（CI、别人的机器）里，
+    只要有一轮阶梯配了 `api` 精排就会在装配期炸；而正确的表现是
+    "这次精排降级"（与 rerank / 改写的一贯口径一致：能力缺口不该让
+    检索失败）。
     """
 
     defaults = _defaults()
@@ -116,8 +120,9 @@ def get_reranker_settings() -> ApiRerankerSettings:
     if not _CONFIG_PATH.exists():
 
         logger.info(
-            "没有 %s —— 第三方精排用 llm.yaml 的 qwen provider 兜底"
-            "（端点与凭据同源）。要另外配就复制 rerank.yaml.template。",
+            "没有 %s —— 第三方精排用 llm 段的 qwen provider 兜底"
+            "（端点与凭据同源）。要另外配就复制 "
+            "providers.yaml.template 的 rerank 段。",
             _CONFIG_PATH.name,
         )
 
@@ -132,11 +137,10 @@ def get_reranker_settings() -> ApiRerankerSettings:
 
         return ApiRerankerSettings.model_validate(merged)
 
-    raw = yaml.safe_load(
-        _CONFIG_PATH.read_text(encoding="utf-8")
-    ) or {}
-
-    section = expand_env(raw.get("rerank") or {})
+    section = get_providers_section(
+        load_providers_document(_CONFIG_PATH),
+        "rerank",
+    )
 
     # 逐项兜底而不是整体替换：只配了 model 的人不该因此丢掉端点和 key。
     fallback = {
@@ -152,10 +156,10 @@ def get_reranker_settings() -> ApiRerankerSettings:
 
 def _from_llm_config() -> dict[str, str]:
     """
-    从 `llm.yaml` 的 qwen provider 取端点与凭据。
+    从 `providers.yaml` 的 `llm` 段 qwen provider 取端点与凭据。
 
     用户口径是"用现有 QWEN_API_KEY" —— 而那个 key 的实际值就住在
-    llm.yaml 里（`${QWEN_API_KEY:-sk-...}`，该文件 gitignore）。让这里
+    同一份文件的 llm 段里（`${QWEN_API_KEY:-sk-...}`）。让这里
     直接复用它，比让运维把同一个 key 抄进第二个配置文件好：
     抄一份就有两处会漂，而漂的表现是"精排突然 401"。
 
@@ -171,7 +175,7 @@ def _from_llm_config() -> dict[str, str]:
     except Exception as exc:  # noqa: BLE001 —— 兜底而已，不该炸
 
         logger.debug(
-            "读 llm.yaml 的 qwen provider 失败（%s: %s），"
+            "读 providers.yaml 的 qwen provider 失败（%s: %s），"
             "第三方精排将没有默认端点/凭据。",
             type(exc).__name__,
             exc,
@@ -189,7 +193,7 @@ def _from_llm_config() -> dict[str, str]:
 
 
 def _defaults() -> ApiRerankerSettings:
-    """内置默认值（与 rerank.yaml.template 一致）。"""
+    """内置默认值（与 providers.yaml.template 的 rerank 段一致）。"""
 
     return ApiRerankerSettings(
         base_url="https://maas.qianwenaiapi.com/compatible-mode/v1",
@@ -207,7 +211,7 @@ def _origin(base_url: str) -> str:
     """
     把 OpenAI 兼容端点还原成**站点根**。
 
-    `llm.yaml` 里 qwen provider 的 base_url 是
+    `providers.yaml` 的 llm 段里 qwen provider 的 base_url 是
     `https://maas.qianwenaiapi.com/compatible-mode/v1` —— 那是 chat 的
     端点，而 rerank 的原生路径挂在站点根上。不还原就会拼成
     `.../compatible-mode/v1/api/v1/services/...`，实测返回 404（那个
@@ -260,7 +264,7 @@ class ApiReranker(Reranker):
             # 掉比"少排几段"严重得多。
             logger.warning(
                 "精排窗口被服务端上限收窄：要 %d 段、只送 %d 段"
-                "（rerank.yaml 的 max_documents=%d）。",
+                "（providers.yaml 的 rerank.max_documents=%d）。",
                 top_n,
                 window,
                 settings.max_documents,
@@ -331,7 +335,7 @@ class ApiReranker(Reranker):
 
         if not model:
             raise ValueError(
-                "没给精排模型：rerank.yaml 的 model 与请求里的 "
+                "没给精排模型：providers.yaml 的 rerank.model 与请求里的 "
                 "RerankerConfig.model 都是空的。"
             )
 
@@ -491,7 +495,7 @@ class ApiReranker(Reranker):
             raise ValueError(
                 "精排回包里找不到 results 列表"
                 f"（顶层键：{sorted(raw)[:8]}）。"
-                "形状变了要改 _parse_response 与 rerank.yaml 的协议。"
+                "形状变了要改 _parse_response 与 providers.yaml 的 rerank 协议。"
             )
 
         scored: list[tuple[RetrieveCandidate, float]] = []

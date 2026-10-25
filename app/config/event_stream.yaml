@@ -1,11 +1,10 @@
 # 运行事件流（Redis Stream）的配置。
 #
-# 为什么这份配置在代码旁边，而不在 app/config/
-# --------------------------------------------------
-# app/config/ 是被数据源加载器**整目录扫描**的（infra/datasource/loader.py
-# 的 glob("*.yaml")），目录里每个 yaml 都必须带 type 字段，否则**直接让
-# 启动失败**。这份配置不是数据源，所以放在读它的代码旁边 —— 与
-# app/common/llm.yaml 同一条取舍（见 llm.py 开头的说明）。
+# 为什么放在 app/config/ 顶层，而不是 datasource/ 子目录
+# ----------------------------------------------------
+# 数据源加载器只 glob(`app/config/datasource/*.yaml`)（见
+# infra/datasource/loader.py）。这份配置不是数据源，放到那个子目录里
+# 会因为缺少顶层 `type` 被跳过并每次启动打一条 warning。
 
 # 关掉后 publish() 一条 Redis 命令都不发，直接返回 False。
 # 用途：本地没有 Redis、或这版只想把日志压干净时，不必去改 redis.yaml。
