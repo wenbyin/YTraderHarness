@@ -1,431 +1,88 @@
 # YTraderHarness
 
-> 一个**面向生产**的 Agent 运行时：把「模型怎么选、上下文怎么拼、工具怎么放行、审批怎么落地、记忆怎么提炼」
-> 全部做成**显式配置 + 显式失败**的数据，而不是散在 prompt 和 if-else 里的隐性约定。
+> **YTraderHarness** 是一个**面向生产**的 Agent 运行时。它把「模型怎么选、上下文怎么拼、工具怎么放行、审批怎么落地、记忆怎么提炼」从散落在 prompt 与 if-else 里的隐性约定，变成**显式配置 + 显式失败**的数据。
 >
-> Python 3.14 · FastAPI · LangGraph · PostgreSQL(pgvector) · Redis Stream · Milvus · Elasticsearch · Neo4j
+> 大多数 Agent 框架把「能跑通一次对话」当作终点，这个项目把**跑通之后的事**当作起点 —— 改一个工具给模型看的说明要不要发版、给某个工具换前置校验要不要重启、模型漏配会不会静默降级、审批记录重启后还在不在、流式输出里混进模型的私有标记会不会原样发给用户。
+>
+> 这些问题的共同答案是同一条立场：
+>
+> ***静默失败是最贵的失败。*** 宁可显式炸，也不要悄悄跳过。
+
+`Python 3.14` · `FastAPI 0.141` · `LangGraph 1.2` · `PostgreSQL + pgvector` · `Redis Stream` · `Milvus` · `Elasticsearch` · `Neo4j`
 
 ---
 
-## 一句话定位
+## 📚 Quick Links
 
-大多数 agent 框架把"能跑通一次对话"当作终点；这个项目把**跑通之后的事**当作起点：
-改一个工具的说明要不要发版、给某个工具换前置校验要不要重启、模型漏配会不会静默降级、
-审批记录重启后还在不在、流式输出里混进模型的私有标记会不会原样发给用户。
-
-这些问题的共同答案是同一条立场 —— **静默失败是最贵的失败**。
-本仓库几乎每个子系统都在反复做同一个选择：**宁可显式炸，也不要悄悄跳过**（见 [`README_DOCUMENT.md` §15.1](README_DOCUMENT.md)）。
-
----
-
-## 五个核心能力
-
-### 一、工具定义与拦截器链**运行时**可改
-
-**主张：改工具给模型看的说明、换它的前置/后置处理器、调它们的顺序 —— 都不发版、不重启。**
-
-#### 改「说明」：`PUT /tools/{tool_id}/documentation`
-
-可以覆盖工具级 `description`、返回值说明，以及**逐个参数**的 `description_override`。
-
-| 事实 | 说明 |
-|---|---|
-| 生效时机 | **下一次模型调用**（每次 build context 时现读，无缓存） |
-| 覆盖面 | **只改描述文本** —— `input_schema` 的类型 / 必填 / 默认**归代码所有**，运行时改不了 |
-| 隔离性 | `for_wire` 返回描述符的**副本**，进程内注册表**永不被改写** —— 运行时编辑不会污染其他会话或并发 run |
-
-#### 改「链」：`/tools/{tool_id}/processors`
-
-| 操作 | 端点 | 说明 |
+| 入口 | 关键数字 | 什么时候看 |
 |---|---|---|
-| 读链 | `GET /tools/{tool_id}/processors` | 按 `sequence` 升序 |
-| 追加 | `POST …/processors` | `sequence` 只是位置**建议**，实际插入位置会重算 |
-| 改一项 | `PATCH …/processors/{processor_id}` | 只能改 `execution_mode` / `hook` / `config` / `enabled` —— **改不了 `processor_key` 与 `sequence`** |
-| 删一项 | `DELETE …/processors/{processor_id}` | 其余自动重排为 1..N |
-| 整体替换 | `PUT …/processors` | 数组顺序 = 执行顺序 |
-| 重排 | `PUT …/processors/order` | 必须给出**完整** id 集合，否则 409「链已过期」 |
-
-**⚠️ 每次工具调用都重新从 DB 读链，没有任何缓存**（`ToolExecutor._load_chain`）。
-所以改完**下一次调用就生效** —— 这是"运维友好"的实现基础。
-
-**⚠️ 一条重要边界**：处理器**实现**是只读目录（`/processors`）。
-你只能在运行时**挂载已有的**处理器并调整它们的顺序与配置，**不能在运行时新建一个处理器** —— 那需要发版。
-
-#### 六个内置处理器
-
-按反射从 `app.agent.tools.processor` 自动发现：
-
-| processor_key | 类型 | 支持的 hook | 执行模式 |
-|---|---|---|---|
-| `approval_interceptor` | INTERCEPTOR | BEFORE | SYNC |
-| `auth_interceptor` | INTERCEPTOR | BEFORE | SYNC |
-| `cache_interceptor` | INTERCEPTOR | BEFORE + AFTER + AROUND | SYNC |
-| `privacy_transformer` | TRANSFORMER | BEFORE + AFTER | SYNC |
-| `event_observer` | OBSERVER | BEFORE + AFTER | ASYNC |
-| `metrics_observer` | OBSERVER | BEFORE + AFTER | ASYNC |
-
-#### 洋葱折叠模型
-
-`compile_chain` 从链尾往头递归包：每一层把 `inner` 作为自己的 `next_call`，
-**最内层就是真正调 service 方法的 `_base_call`**。
-
-- **BEFORE** 在外层：可以直接返回 `ToolOutcome` **短路**整条链（缓存命中 / 审批拒绝 / 鉴权拒绝 → 工具根本不跑）
-- **AFTER** 在内层：先拿到 `outcome`，可以改写它
-- **AROUND** 占**两行**（进入标记 + 无操作退出标记），把下游整个包起来
-- **ASYNC 观察者**用 `create_task` 甩出去，**不 await** —— 监控不阻塞工具调用
-
-#### 写入即校验：改错了当场被拒，而不是等运行时出事
-
-这是「运维友好」里最实的一块。所有校验在**写链时**跑完：
-
-| 错误 | 结果 |
-|---|---|
-| 未知 `processor_key` | **404** |
-| hook 不被该处理器支持 | **409** |
-| 执行模式不支持 | **409** |
-| AROUND + ASYNC 组合 | **409**（另有 DB `CHECK` 约束兜底） |
-| `config` 不过该处理器的 `config_model` | **400**（pydantic） |
-| **洋葱区间交叉**（区间未正确嵌套） | **409** |
-| 重排时 id 集合不全 | **409** |
-
-**三层防护**：应用层校验 → DB `CHECK` 约束（防手改库）→ **执行期** `build_chain._validate` 再兜一次
-（半条链 / AROUND+ASYNC 会在真正调用前抛错）。
-
-> 洋葱嵌套用**栈式校验**（`validate_onion`）保证区间正确嵌套而非交叉 ——
-> 交叉的区间意味着 AROUND 的进入与退出挂到了不同的层，折叠出来的调用顺序不是你想的那个。
-
-#### 发现同步：`POST /tools/discovery/sync`
-
-重新扫描 `TOOL_SOURCE_PACKAGES`，把 `tool_definition` 表与代码对齐（create / update / unchanged / missing）。
-
-⚠️ **能**发现**新加的**工具（模块从未被 import，扫描器会 import 它）；
-⚠️ **不能**拾取对**已 import 模块**的代码修改 —— Python 不会重新执行已加载的模块。**改代码仍然要重启。**
+| 🚀 [`README_STARTUP.md`](README_STARTUP.md) **启动与配置** | 15 份运行时配置 / 21 份契约 | 第一次跑起来、启动失败排障 |
+| 📄 [`README_DOCUMENT.md`](README_DOCUMENT.md) **文档与 RAG** | 11→16 个节点 / 4 段读取 | 摄入流水线、多路召回、加组件 |
+| 📊 [`README_EVAL.md`](README_EVAL.md) **检索评测** | 9 张表 / 12 个端点 | 评召回、看金标死在哪一段 |
+| 🧠 [`README_CONTEXT.md`](README_CONTEXT.md) **上下文装配** | 13 段 / 14 个处理器 | 流水线段序、处理器的边界 |
+| 🤖 [`README_MODEL.md`](README_MODEL.md) **模型选择** | 6 段目录 / 10 个角色 / 14 条绑定 | 配模型、解析不出来时查什么 |
+| 🛠️ [`README_TOOL.md`](README_TOOL.md) **工具与审批** | 9 个内置处理器 / 6 张表 | 处理器链、HITL、运行时改链 |
+| 💾 [`README_MEMORY.md`](README_MEMORY.md) **四层记忆** | 4 层 / 10 张表 / 只有 L1 不可重建 | L0–L3 分工、什么时候提炼 |
+| 🗺️ [`README_PLAN.md`](README_PLAN.md) **计划模式** | 1 个子图 / 3 个节点 | 请求怎么变成一张 DAG |
+| 👥 [`README_SUB_AGENT.md`](README_SUB_AGENT.md) **子代理** | 1 个 worker 子图 / 3 个节点 | worker 怎么派发、任务板怎么防重复 |
+| ⚠️ [`todolist`](todolist) **已知缺口** | 按子系统分 10 节 | 缺什么、什么时候会骗到你 —— **只在这一处维护** |
 
 ---
 
-### 二、工具级监控
+## 🚀 Quick Start
 
-**主张：每一次工具调用都能回答"跑了没、成功没、花了多久、因为什么失败、是不是重复调用"。**
+### 1. 依赖矩阵
 
-要分清**两层**，它们的持久性完全不同。
+| 依赖 | 必需 | 缺了会怎样 |
+|---|---|---|
+| PostgreSQL（pgvector） | ✅ | **起不来** —— `postgre.yaml` 与 `checkpointer.yaml` 都是 `required: true` |
+| Redis | ✅ | SSE 事件流与子代理任务板不可用 |
+| Milvus / Elasticsearch | 可选 | 对应检索路进 `degraded_routes`，其余照常 |
+| Neo4j | 可选 | 已接为 DataSource，但**尚未被业务消费** |
 
-#### (a) 进程内实时（重启清零）
+### 2. 启动
 
-| | 内容 |
-|---|---|
-| **事件** `ToolEventBus` | `STARTED` / `SUCCEEDED` / `FAILED` / **`DENIED`** |
-| **指标** `ToolMetricsRegistry`（按 tool_key） | `calls`、`errors`、`denied`、`total/min/max/avg_duration_ms`、`error_rate`、`errors_by_type`、`last_called_at` |
+```bash
+# ⚠️ 用 .venv 里的 python，不要用裸 python
+#    （裸 python 是旧 anaconda，SQLAlchemy 太老，直接 ImportError）
+.venv/Scripts/python.exe run_server.py              # 默认 localhost:8080
+.venv/Scripts/python.exe run_server.py --port 8081
 
-> ⚠️ `DENIED` 与 `FAILED` 是**两件事**：`DENIED` = 工具**根本没跑**（被 auth / approval 短路），
-> `FAILED` = 跑了但报错。指标里 `denied` 也**单独计数、不计入 `errors`** —— 否则"审批拒绝"会污染错误率。
-> 默认 `include_arguments=False`（不把参数带进事件）。
-
-#### (b) 落库的权威记录 —— `tool_execution` 表
-
-| 列 | 含义 |
-|---|---|
-| `session_id` / `run_id` | 关联到会话与运行（**刻意不建外键**） |
-| `tool_key` | 工具身份 |
-| **`param_hash`** | `sha256(canonical_json(模型给的原始参数))`，在**链跑之前**算 —— 幂等键 |
-| `status` | 8 值枚举：`PENDING` / `RUNNING` / `SUCCESS` / `FAILED` / `UNKNOWN` / `CANCELLED` / `REJECTED` / `INTERRUPT` |
-| `result` | JSONB，**经处理器链脱敏之后**的结果 |
-| `error` | JSONB `{type, message}` |
-
-**这张表就是幂等的基础**：唯一约束 `(session_id, run_id, tool_key, param_hash)` +
-一条 `INSERT ... ON CONFLICT DO UPDATE WHERE status IN retryable` **原子抢占**。
-重放与并发重复调用交给数据库，应用层不做"先查后写"那种有竞态的判断。
-
-#### (c) 与 run 级记录的关系
-
-- `agent_run` 是 run 级**状态**（`queued/running/waiting_input/completed/failed/cancelled`），**不是可观测表**
-- react 图的 `node_span` 走 `NodeLogRecorder` —— **只打日志、不落库**（对比：文档管线走 `SqlAlchemyRunRecorder` → `document_pipeline_node_run` **表**）
-- `tool_execution.run_id` ↔ `agent_run.run_id` 是同一套运行标识，但是**两张独立的表**，`agent_run` 不汇总 `tool_execution`
-
-#### ⚠️ 运维现实（必须知道）
-
-当前 tool 级可观测性的**边界**：
-
-| 限制 | 后果 |
-|---|---|
-| 指标**没有查询接口** | `snapshot()` / `for_tool()` 只有测试和 smoke 脚本在用，**没有路由暴露** |
-| **没有 Prometheus 导出** | 依赖里没有 Prometheus；注释建议接 Pushgateway 或换掉该模块 |
-| **重启清零** | 事件与指标都是进程内单例 |
-| **`tool_execution` 没有 API 读** | 只有拒绝消息回查时内部读一次 |
-| **不记 latency、不记 token 成本** | `tool_execution` 没有时长列；工具层没有 token 记账 |
-| **没有 reaper** | 僵死的 `PENDING` / `RUNNING` 行不会被清理 |
-| `FAILED` / `UNKNOWN` **没有写入方** | 实际落到 `RUNNING`（枚举值存在但没人写） |
-
-**一句话总结**：**实时诊断能力强，历史可查询能力弱。**
-要做真正的 tool 级监控面板，得自己接一层 —— 数据是有的（`tool_execution` + 指标快照），只是没有出口。
-
----
-
-### 三、渐进式工具暴露：按树型业务分类现算
-
-**主张：不给模型看全部工具。每一轮运行开始时，按业务分类**现算**一遍它该看哪些。**
-
-#### 链路
-
-```
-用户输入
-  └─ builder 节点（每个 run 只跑一次）
-       ├─ 从 DB 现读活跃能力候选集  CapabilityService.list_capabilities(is_active=True)
-       │    └─ 读不到 → 降级为空集 + 记录 note（不炸）
-       ├─ 一次 LLM 调用（agent_type="react" + ModelRole.CLASSIFICATION）
-       │    └─ 候选集**渲染进提示词**：每行 "code：name —— description"
-       ├─ 产出 capability_needs（限制在候选集内，未知落 other）
-       └─ tool_keys = 这些能力 code 映射到的工具
-  └─ 写入 context_policy.tool_keys（随 checkpoint 持久化）
-       └─ 每次模型调用：CapabilityProcessor 重算「可绑定的工具对象」（纯内存、零 DB）
+# ⚠️ 不要用 `uvicorn app.main:app`
+#    psycopg 需要 SelectorEventLoop，而 uvicorn 0.36+ 会忽略 asyncio policy
 ```
 
-#### 两个必须分清的粒度
+### 3. 自检
 
-| | 何时算 | 运维改数据的生效点 |
-|---|---|---|
-| **key 集合** `context_policy.tool_keys` | **每 run 一次**（builder 只跑一次，图里没有回边） | **下一次 run** —— 当前 run 已快照，不受影响 |
-| **可绑定工具对象** | **每次模型调用**重算（INITIAL 与每次 CONTINUATION 各一次） | 立即 |
-
-> 为什么这样做得通：`select_specs` 是**纯内存函数、零 DB 查询**，所以每次模型调用重算的代价可以忽略。
-
-#### 「可见 == 可执行」是构造出来的，不是靠约定
-
-**可见侧**（`CapabilityProcessor` → `RegistryToolExposureSource.resolve`）与
-**执行侧**（tools 节点 `_wrap_tool_call`）调用的是**同一个纯函数 `select_specs`，传同一份 `tool_keys`**。
-因此"模型看得见的工具集合"与"允许执行的工具集合"**按构造相等**。
-
-两条诚实的边界：
-
-1. **在集合里 ≠ 一定会执行。** 通过名称暴露门之后，下游还有：目录解析失败（**fail-closed**）、
-   幂等账本不可用、**参数相同的重复调用被抢占**、处理器链拒绝（审批/鉴权/隐私）。这些都会正确地拒绝。
-2. **`wire_name` 是多对一的**（`a_b.c` 与 `a.b_c` 都会被换成 `a_b_c`）。命中这种碰撞时，
-   工具可能"可见但被执行侧判为未暴露" —— 有 **WARNING**，不是静默选择。
-
-#### 运维能改什么（不发版）
-
-| 改什么 | 端点 |
-|---|---|
-| 能力树增删改（`code` 存在性、`name`/`description`、`parent_id`、`sort_order`、`is_active`） | `/api/v1/capabilities` |
-| 工具 ↔ 能力映射（**整体替换**语义） | `PUT /tools/{tool_id}/classifications` |
-| 工具说明覆盖 | `PUT /tools/{tool_id}/documentation` |
-
-⚠️ 改能力的 `name` / `description` **会直接改变分类提示词的内容** —— 那正是分类器看到的候选集描述。
-改措辞可以改变模型的选择倾向，这是特性也是风险。
-
-#### ⚠️ 两条必须说清的边界
-
-1. **树形结构用于「组织」，门禁本身是「平」的。**
-   `is_active` 只是被查询那一行上的过滤（`CapabilityModel.is_active == is_active`），
-   **不会递归到子树**；工具查找也是 `code IN (...)` **精确匹配、不向下递归**。
-   **想停掉一整块，得逐个节点停用** —— 停用一个父节点不会连带停用它的子节点。
-
-2. **「能配上」≠「能用」。** DB 可以把一个能力映射到某个 `tool_key`，
-   但如果代码里没有注册对应的描述符，`select_specs` 会**静默跳过（WARNING）**。
-   所以"改数据不改代码"只覆盖**选择**维度，**不覆盖可执行入口**维度。加一个**新工具**仍然要发版。
-
-#### 缺口
-
-`modules` **恒为空**（能力表里没有字段区分"业务域"与"能力域"，模型分流时会误判，于是干脆不分）；
-`capability_config` **只落字段、没有消费者**；`exposed_tools` 通道在 react 图里**恒空**
-（`tool_source` 恒在，只走 fallback 分支）；`conversation_id` 传进来了但**被忽略**（预留给未来的按会话/租户过滤）。
-
----
-
-### 四、RAG 流水线：全链条可配置、可拓展
-
-**主张：从文件到可检索索引的每一个环节都是「注册表 + 配置选实现」，换实现不动调用方，加组件不碰中心清单。**
-
-#### 写入链路（LangGraph 状态图，`document_ingestion_pipeline`）
-
-11 个 spec 节点，编译后 16 个（含 3 个扇出汇合屏障）。每个节点按**角色**查注册表选实现：
-
-| # | 节点 | 角色 | 已注册实现 |
-|---|---|---|---|
-| 2 | `parsing` | `LOADER` | `TEXT_TXT_COMMON_PARSER`（**唯一**，`.txt` / `.md`） |
-| 3 | `normalization` | `NORMALIZE` | `TEXT_TXT_COMMON_NORMALIZER`（**13 步**，可逐项开关，幂等，**从不删内容**） |
-| 4 | `cleaning` | `CLEAN` | `TEXT_TXT_COMMON_CLEANER`（**7 类规则**，**会删行**） |
-| 5 | `metadata_extraction` | `ENRICH_METADATA` | ⚠️ **无实现**（passthrough） |
-| 6 | `chunking` | `CHUNK` | **3 个**：递归分块（512/64，中文优先分隔符）/ 不分块 / GraphRAG 分块（1200/100） |
-| 7 | `chunk_enrichment` | `CHUNK_ENRICH` | `TEXT_COMMON_CHUNK_ENRICHMENT` |
-| 8 | `embedding` | `EMBED`（按 `output_kind` 选） | **3 个**：BGE-small-zh 稠密(512维) / 词法稀疏(20万维词表) / 图抽取（⚠️ `embed()` 抛 `NotImplementedError`） |
-| 9 | `indexing` | `IndexBackend` | `Elasticsearch` / `Milvus`（**仅在注入了客户端时注册**） |
-
-> **归一与清洗有严格的边界**：归一化是**等价变换**（只动控制字符与空白，从不删内容），
-> 清洗**会删行**。把两者混为一谈会让"内容莫名少了"无从定位。
-
-#### 配置是数据库行，不是代码 —— `DTD → Processor / Retrieval → Binding`
-
-| 层 | 表 | 关键字段 |
-|---|---|---|
-| 类型定义 | `document_type_definition` | `type_key`（唯一不可变）、`analysis_mode`、**融合策略**、**精排策略** |
-| 处理链 | `document_processor_definition` | `file_extension`、`loader_name`/`config`、`processor_name`/`config` |
-| 检索链 | `document_retrieval_definition` | `retrieval_type`、`chunker_name`/`config`、`retriever_name`/`config`、`storage_backend`/`config` |
-| 绑定 | `document_processor_retrieval_binding` | 配置层的 N:N |
-| 物理落点 | `document_index_binding` | 把**物理索引名**与配置解耦 |
-
-**一个文档类型如何落到具体组件链**：纯函数 `select_retrievals` ——
-绑定了具体 processor 就只走它绑定的检索；否则走该 DTD 下**全部活跃**检索；`reprocess` 可以取交集收窄。
-
-#### 「可拓展」：加一个组件是**放手即用**
-
-**关键：没有装饰器，没有中心注册清单。** 靠**反射发现**：
-
-- `import_package_modules(*CAPABILITY_PACKAGES)` 先 import 角色包下所有模块
-  （`__subclasses__()` 只看得到已 import 的类）
-- `leaf_subclasses(RoleBase, skip_abstract=True)` 深度优先收集**叶子子类**
-
-**加一个 chunker / parser / embedder / cleaner / normalizer / enricher 的完整步骤**：
-
-1. 新建一个类，继承对应角色基类
-2. 设 `name`（全局唯一、永不复用的 key）
-3. **可选**：声明 `config_model`（一个 pydantic 模型）—— `get_config_schema()` 会自动产出
-   `model_json_schema()`，**前端表单因此自动生成，不需要改前端**
-4. 放进该角色的目录。**完成。**
-
-注册表、能力目录接口（`GET /document-processor-capabilities`）、目录 API **全部自动收录**。
-
-> **唯一需要碰中心清单的情况**：新增一个**角色**（而不是角色下的实现）时，
-> 把新角色包的名字追加进 `CAPABILITY_PACKAGES`。
-
-**两道硬错误闸守着"静默二选一"**：
-
-| 冲突 | 结果 | 为什么必须炸 |
-|---|---|---|
-| 两个实现用了同一个 key | **`ValueError`** | 字典推导会让后者**静默覆盖**前者，症状是"某能力凭空消失" |
-| 两个 embedder 是同一个 `output_kind` | **`ValueError`** | 写入与查询**只按形态**选 embedder，"返回第一个"等于按模块名排序静默二选一 —— 而不同模型的向量空间不可比，混用**不报错**，只让召回率下降 |
-
-检索侧同理可拓展：加 `Fusioner` 子类（设 `fusioner_type`）或 `Reranker` 子类（设 `reranker_types`）。
-但 **Filter 与 Cutter 必须保持单一实现** —— 多于一个直接抛 `RetrieveStageNotFound`。
-
-#### 读取链路：`POST /documents/retrieve`
-
-四段式，优先级 **请求参数 > DTD 配置 > 类默认值**：
-
-| 段 | 配置来源 | 默认 |
-|---|---|---|
-| **融合** | DTD `fusion_strategy` | 开启，RRF，`top_k=50`，`rrf_k=60` |
-| **过滤** | 类默认（无 DTD 列） | 开启，无分数阈值 |
-| **精排** | DTD `rerank_strategy` | 开启；默认实现是**本地 cross-encoder** `BAAI/bge-reranker-v2-m3`（50 候选 × 512 字符，进程内） |
-| **裁剪** | 类默认（无 DTD 列） | `top_k=10` |
-
-**多路召回**：`retrieval_type` → 容器名（见下），查询向量按 `dense_vector`/`sparse_vector` 映射到 embedder
-—— **写查必须同一个模型**，这正是上面那道 `ValueError` 要防的。内容**从不存进索引**，召回后再从 PostgreSQL 回填。
-
-#### 容器名是契约，且只有一份
-
-`pipeline/containers.py` 是 `retrieval_type → 物理容器名` 的**唯一副本**，写入期与查询期共用。
-
-> **为什么硬编码而不让用户配**：查询期必须**一次查到全部文档**。允许每个类型/版本各配一个容器，
-> 查询就要跨 N 个容器做 federation 再融合 —— 而用户配错的表现是"**检索搜不到"，不是报错**。
-> 名字逐条写出来而不用 f-string 拼，也是为了让人一眼看出**这是个契约**（改了等于全量重建 + 数据迁移）。
-
-#### 失败语义：该炸的炸，该降级的降级，但**绝不静默**
-
-| 炸 | 降级（但必须记录） |
-|---|---|
-| 能力/后端查不到 → `CapabilityNotFound`（继承 `LookupError`，**不是 400**） | 后端故障 / 超时 / 未实现 → 该路进 **`degraded_routes`**，其余路照常 |
-| 能力 key 冲突、同形态多 embedder → `ValueError` | `llm`/`custom` 精排 → 直通 + WARNING |
-| DTD 缺失/未激活 → **404**（整请求，不是跳过） | 精排模型加载失败 → 退化为原序 + WARNING |
-| `retrieval_config` 键写错 → **422** | 调用方指名了但 DTD 没有的检索类型 → **静默筛除**（这是刻意的"筛选"语义，**不进** `degraded_routes`） |
-
-> `degraded_routes == []` 意味着**所有路都参与了**。这是一条很好用的断言。
-
-#### 缺口
-
-Graph 检索**端到端未实现**（`embed()` 抛 `NotImplementedError`，容器映射里 `graph` 被注释掉）；
-`retrieval_type=document` 的召回**未实现**（没有外部容器，本轮直接跳过）；
-`index/fiass.py` 是**0 字节**（文件名疑似 `faiss` 笔误，不存在该后端）；
-`ENRICH_METADATA` 无实现；`llm`/`custom` 精排是直通桩；层级分块未做（`parent_chunk_id` 恒 `None`）；
-**只支持 `.txt` / `.md`**（`format_detection` 节点是占位，不按 MIME 路由）；
-**逻辑删除不清外部索引**（删了文档，ES/Milvus 里的 chunk 仍可被召回）。
-
----
-
-### 五、规划与多代理：先把活拆成 DAG，再决定谁来干
-
-**主张：复杂请求先变成「可调度的任务图」，再按"能并行就并行"决定用主 agent 顺序跑、还是开子代理团队。**
-
-这两件事是**分开的两层**，混在一起就没法排查：
-
-| 层 | 做什么 | 谁负责 | 手册 |
-|---|---|---|---|
-| **规划** | 把请求拆成带依赖的 A2A 任务，写进 state | `planner` 子图（`agent_planner`） | [`README_PLAN.md`](README_PLAN.md) |
-| **执行** | claim 任务、跑任务、回写结果 | 主 `agent`（顺序）或 `subagent_worker` 子图（并行） | [`README_SUB_AGENT.md`](README_SUB_AGENT.md) |
-
-#### 计划就是一张 DAG
-
-模型只输出 `PlanDraft`：`id` + `message` + `metadata{skill_key, blocked_by, block_policy, capabilities}`。
-**执行态字段一个都不写**（`status` / `claim` / `blocked` / `messageId` 全由转换器补齐）——
-模型写它们只会制造第二份真相。
-
-```
-PlanDraft  ──validate_plan()──▶  Kahn 拓扑排序  ──to_a2a_tasks()──▶  A2A Task
-             DAG / 体积 / id 格式               id = <plan_id>:<local_id>
-             自依赖 / 悬空依赖 / 环              blocked_by ↔ blocked 正反边
+```bash
+.venv/Scripts/python.exe -m app.agent.spec_check     # 契约自检（当前覆盖 document 域）
+.venv/Scripts/python.exe -m app.agent.tool_smoke     # 工具发现 + 注册表一致
+.venv/Scripts/python.exe -m app.agent.prompt_smoke   # 提示词目录（含 1 条已知过期断言）
 ```
 
-校验是**拒绝制**，不是裁剪制：`message` 或 `metadata` 超过 **64 KiB**、有环、引用不存在的依赖 —— 整份计划作废（`PlanValidationError`）。
-只有"`skill_key` 不在目录里""未知 capability code"这类才降级成 `plan.notes` 里的 warning。
+### 4. 重置数据
 
-#### 规划失败不会污染执行
+```bash
+.venv/Scripts/python.exe reset_data.py
+```
 
-| 失败 | 处置 |
-|---|---|
-| ReAct 探索段抛异常 | 降级成一条"请基于当前对话直接生成计划"的 AIMessage，继续走 `task_generator` |
-| `task_generator` 抛异常 | `return {}` —— **保留旧计划**，不炸整轮 |
-| planner 调用了会跳父图的工具 | 拦下，转成一条模型可读的错误 ToolMessage，让它换个做法 |
-
-#### 什么时候开子代理
-
-**不是有任务就并行**。判据是"当前有 **≥2 个 ready task**"（依赖都已 `COMPLETED`），
-且本次运行**确实暴露了 `create_team`**；满足时 `task_listener` **不 claim**，写
-`team_decision="pending"` 回主 agent 做一次决策。
-
-这个询问是**一次性**的：主 agent 那一轮结束后若仍是 `pending`（没调 `create_team`），
-listener 写 `declined` 并继续顺序 claim —— 否则 `listener → agent → listener` 会无限空转。
-
-#### 三条并发正确性保证
-
-| 保证 | 做法 | 不这么做 |
-|---|---|---|
-| **谁跑哪个任务是确定的** | 父图 `subagent_dispatch` 先 CAS 预 claim，再按 `Send` 分发（`owner={run_id}:worker:{i}`） | 多个 worker 各自读板抢同一批 ready，重复执行 |
-| **任务板是执行态权威** | Redis（TTL 7 天，按 `plan_id` 索引）；graph state 只是投影 | `Send` payload 取代 state，worker 根本看不到父图 `tasks` |
-| **结果只走任务板** | worker 写 `artifacts` + `result_summary`；父图在全部终态后起一次**汇总回合** | worker transcript 串进主对话，多 worker 并发写 `messages` |
-
-**fail-closed 是默认姿态**：没有 Redis 任务板 → `subagent_dispatch` **不派发**，退回主 agent 顺序执行；
-读板失败 → 直接抛错让整轮 failed，不假装"没有 ready task"。
-
-#### 两条必须知道的边界
-
-1. **计划任务没有 HTTP 端点** —— 只活在 graph state / Redis 任务板 / 事件流里（`/api/v1/tasks` 是另一套异步作业）。
-2. **claim 的 lease 只写不续租** —— `lease_expires_at` 写进 claim，但没有回收逻辑；worker 崩溃后任务会停在 `WORKING`。
+> 所有 `/api/v1` 业务接口都要鉴权，无 token 一律 **401**
+> （`tests/api/test_auth_enforcement.py` 遍历 `protected_router` 守着这件事）。
+> `/docs` 与 `/openapi.json` 不挂在这棵树上，因此**对匿名访问者可见** —— 这是有意识的决定。
 
 ---
 
-## 其他值得注意的机制
+### 5. 架构总览
 
-除上面五项外，这些也是本仓库区别于"裸用 LangGraph"的地方：
+<img src="docs/images/agent-graph.svg" alt="Core Architecture：Agent ReAct 主图、planner 与 worker 两张编译子图、以及 L0–L3 记忆提取链" width="100%">
 
-| 机制 | 一句话 | 详见 |
-|---|---|---|
-| **模型选择拒绝兜底** | `(agent_type, model_role, attributes)` 等值匹配；匹配不到**报错**，平局**也报错** —— `bindings` 刻意无通配 `*` | [`README_MODEL.md`](README_MODEL.md) |
-| **上下文是固定 13 段流水线** | 顺序写死在 `PIPELINE_TEMPLATE`，**import 期断言**枚举与模板一致；14 个处理器（任务模式多出 `TASK_RESOLVER` / `SKILL_LOADER` 两段，跑不跑由 gate 决定） | [`README_CONTEXT.md`](README_CONTEXT.md) |
-| **处理器不能改对话** | 只能 `add_section` / `add_history` / 声明工具；回写 state 走白名单，**只有 `summary` 与 `memory` 两个键** | [`README_CONTEXT.md`](README_CONTEXT.md) |
-| **HITL 审批 + 持久化账本** | `interrupt()` 挂起图，"始终允许"落 LangGraph store，**重启不重复问**；代码里显式标注了「少调一次 `interrupt()` 会让后面的中断错位」 | [`README_TOOL.md`](README_TOOL.md) |
-| **模型私有标记的字符流闸** | deepseek 思考模式把工具调用写成 DSML 标记当正文吐出，**全程不报错**；用有状态闸跨分片拦截（含全角/半角竖线） | `app/agent/model/leaked_tool_call.py` |
-| **规划与执行分离** | planner 只产出 A2A 任务、**不发布任务板**；发布在 `create_team`（审批通过后才执行）—— 规划失败不会留下半张任务板 | [`README_PLAN.md`](README_PLAN.md) |
-| **任务板是执行态权威** | 一旦引入 worker，graph state 只是投影：`Send` payload 取代 state、多 worker 并发、跨 run 恢复都要求一个共享权威（Redis，TTL 7 天，幂等 upsert 不覆盖运行态） | [`README_SUB_AGENT.md`](README_SUB_AGENT.md) |
-| **预 claim，不是 worker 抢** | 父图 CAS 好再按 `Send` 分发，谁跑哪个任务是确定的；**没有任务板就退回顺序执行**（fail-closed），不假装并行 | [`README_SUB_AGENT.md`](README_SUB_AGENT.md) |
-| **子代理结果只走任务板** | worker transcript **永不**进主对话；全部终态后父图起一次汇总回合，把结果渲染成一条 HumanMessage 交主 agent | [`README_SUB_AGENT.md`](README_SUB_AGENT.md) |
-| **四层记忆，可重建性不同** | L0 是索引（可重建），**L1 是权威数据（不可重建）**；L2/L3 由 L1 抽象 | [`README_MEMORY.md`](README_MEMORY.md) |
-| **SSE 遇审批主动关流** | **跨仓库前端契约**：前端须自行 `resume` 后重开；"所有 interrupt 到齐"的权威信号是 **DB 状态**，不是事件批次 | [`README_STARTUP.md`](README_STARTUP.md) |
-| **契约先行** | 19 份 OpenAPI 规格**运行时不加载**；契约名与类名可不同，有专门的翻译函数（`AgentMessage`→`Message`） | [`README_STARTUP.md`](README_STARTUP.md) |
-| **历史运行按冻结拓扑渲染** | `topology_fingerprint`（sha256）供 CI 比对 golden；不写死节点列表 | [`README_DOCUMENT.md`](README_DOCUMENT.md) |
-| **启动期就炸** | Casdoor 自检、模型引用完整性、流水线模板一致性、提示词目录装配；配一个常驻 `LoopWatchdog` 抓事件循环卡顿 | [`README_STARTUP.md`](README_STARTUP.md) |
+一张图看全三件事：**主图**（`builder → agent → tools`，含 planner 分支与 `subagent_dispatch` 扇出）、
+**两张编译子图**（`planner` 做规划、`subagent_worker` 执行单个已 claim 的任务，都不是独立注册的图）、
+以及**不在任何图里**的**记忆提取链**（run 结束后异步 push，L0 → L1 → L2 → L3 逐层递进）。
 
----
-
-## 架构总览
+> 图里标了 `LLM` 的节点是**真正调模型**的地方 —— 主图里只有 `builder`（分类）与 `agent`（推理）两处；
+> 记忆链另有 **4 次**调用（L1 抽取 + 去重各 1 次、L2 整合 1 次、L3 画像 1 次），L0 只建索引不调模型。
+> 凡是没有标 `LLM` 的节点都是纯计算或纯 IO。
 
 ### 分层与依赖方向
 
@@ -433,7 +90,7 @@ listener 写 `declined` 并继续顺序 claim —— 否则 `listener → agent 
 app/common  ←  app/services  ←  app/infra  ←  app/bootstrap  ←  app/main.py
 ```
 
-箭头指向"被依赖"。**`app/common` 与 `app/infra` 都不允许 import 业务模块** ——
+箭头指向「被依赖」。**`app/common` 与 `app/infra` 都不允许 import 业务模块** ——
 这正是「任务 Handler 的注册点必须在 `app/bootstrap/task.py` 而不在 `app/infra`」的硬理由。
 
 ### 目录树
@@ -441,23 +98,22 @@ app/common  ←  app/services  ←  app/infra  ←  app/bootstrap  ←  app/main
 ```
 app/
 ├── main.py            # FastAPI app + lifespan（组合根，只负责排序）
-├── serve.py           # uvicorn 启动（显式 SelectorEventLoop，见 START_UP.md §8）
+├── serve.py           # uvicorn 启动（显式 SelectorEventLoop）
 ├── bootstrap/         # 装配层：auth / event_stream / graph_runtime / pipelines / task
 ├── api/v1/            # HTTP 路由（契约实现）+ router.py（public / protected 两棵树）
 ├── agent/             # LLM 运行时（图侧，不做业务持久化）
 │   ├── graph/react/   # 父图：builder / agent / tools / task_listener / subagent_dispatch
 │   ├── graph/planner/ # 规划子图：planner_llm / planner_tool / task_generator
 │   ├── graph/subagent/# worker 子图：task_listener / llm_node / tool_node
-│   ├── plan/          # 计划层：契约校验 / A2A 转换 / 任务板 / claim（**不 import LangGraph**）
-│   ├── state/         # AgentClassification 与枚举
+│   ├── plan/          # 计划层：契约校验 / A2A 转换 / 任务板 / claim（不 import LangGraph）
 │   ├── context/       # ContextBuilder 流水线（13 段 + 14 处理器）
 │   ├── model/         # ModelRegistry / resolver / adapters / runtime
-│   ├── prompt/        # 节点功能提示词（分类、记忆、摘要）
+│   ├── prompt/        # 节点功能提示词（分类、记忆、摘要、规划）
 │   ├── tools/         # 处理器链契约（interceptor / observer / transformer）+ @tool
 │   └── event/         # Redis Stream 事件实现（publisher / reader / sse / run_stream）
 ├── services/          # 业务模块，各自 domain / application / models / repository 分层
 │   ├── capability/    # 能力树（工具暴露的分类法）
-│   ├── document/      # 摄入流水线 + RAG 检索
+│   ├── document/      # 摄入流水线 + RAG 检索 + 检索评测
 │   ├── file/          # 文件与产物存储
 │   ├── memory/        # L0–L3 记忆
 │   ├── prompt/        # 职责提示词（业务数据）
@@ -467,11 +123,11 @@ app/
 │   └── user/          # Casdoor 鉴权 + 用户检索
 ├── infra/             # 共享运行时内核（不 import 业务）
 │   ├── graph/         # GraphRegistry / dispatcher / checkpointer / runner
-│   ├── datasource/    # DataSource 抽象 + postgres / redis / es / milvus / neo4j / checkpointer
+│   ├── datasource/    # DataSource 抽象 + postgres / redis / es / milvus / neo4j
 │   ├── task/          # 任务 worker / dispatcher / outbox / retry
 │   └── agent/         # 工具执行器 + 暴露 + 链折叠
-├── common/            # 共享内核：工厂、模型、鉴权、schema、任务协议、工具函数
-└── config/            # 运行时配置（casdoor / llm / model / event_stream / datasource/*）
+├── common/            # 共享内核：工厂、模型、鉴权、schema、任务协议
+└── config/            # 运行时配置（15 份 yaml）
 ```
 
 ### 四个图身份、两个注册图
@@ -480,25 +136,21 @@ app/
 `InProcessGraphDispatcher` 运行（一个 asyncio 队列 + 一个串行 worker；每个 run spawn 子任务，
 **因此取消针对的是 run，不是 worker**）。
 
-**注册的是两个图，但 agent 这张图里还编译进了两个子图** —— 两张子图各有自己的 catalog
-（节点目录 / 版本 / tool scope 命名空间）与**独立 state schema**，但**不单独进 registry**：
-
-> ⚠️ 它们的 `GRAPH_NAME`（`agent_planner` / `agent_subagent`）目前**只做声明与再导出**，
-> 没有任何运行期消费者 —— 只有 `agent_react` 与 `document_ingestion_pipeline` 的图名进了
-> `GraphDefinition(name=...)`。子图的运行期观测靠的是**节点 id**（`node_span`），不是图名。
-
 | 图 | `GRAPH_NAME` | 版本 | 形态 |
 |---|---|---|---|
-| 文档摄入管线 | `document_ingestion_pipeline` | `1.0.0` | **独立注册**（见"核心能力四"） |
+| 文档摄入管线 | `document_ingestion_pipeline` | `1.0.0` | **独立注册** |
 | Agent ReAct | `agent_react` | **`1.12.0`** | **独立注册**，父图 |
 | ↳ Planner | `agent_planner` | `0.1.0` | `build_planner_graph().compile()` 作为节点 `planner` |
 | ↳ Sub-Agent worker | `agent_subagent` | `0.1.0` | `build_subagent_graph().compile()` 作为节点 `subagent_worker` |
 
-> 子图 `compile()` **不带 checkpointer**，会继承父图的；`interrupt` 由父 Pregel 循环管理（冒泡 / resume），
-> 子图的 custom 事件也进父运行的事件流。代价是子图输出会按**同名 channel** 合并回父 state ——
-> 已用空 `output_schema` 隔掉（见下）。
+> ⚠️ 子图的 `GRAPH_NAME`（`agent_planner` / `agent_subagent`）目前**只做声明与再导出**，
+> 没有任何运行期消费者 —— 只有 `agent_react` 与 `document_ingestion_pipeline` 进了
+> `GraphDefinition(name=...)`。子图的运行期观测靠**节点 id**（`node_span`），不是图名。
+>
+> 子图 `compile()` **不带 checkpointer**（继承父图的），`interrupt` 由父 Pregel 循环管理。
+> 代价是子图输出会按**同名 channel** 合并回父 state —— 已用 `input_schema` / `output_schema` 隔掉。
 
-**图 B · Agent ReAct 图** — `agent_react` v1.12.0：
+### Agent ReAct 图（`agent_react` v1.12.0）
 
 ```
 START → builder
@@ -506,7 +158,7 @@ builder --(分类判要规划)--> tools            # 合成一条 enter_plan_mod
 builder --(plan 且没有任务 / 任务全完成)--> planner
 builder --(其余)--------> agent
 
-planner --> task_listener --> agent         # 默认；YTRADER_PLAN_STOP_AFTER_PLANNER=1 时 planner -> END
+planner --> task_listener --> agent         # YTRADER_PLAN_STOP_AFTER_PLANNER=1 时 planner -> END
 agent --(有 tool_calls)--> tools ×N         # 一个 tool_call 一个 Send 分支
 agent --(无 tool_calls，还有任务)--> task_listener
 agent --(无 tool_calls，没有任务)--> END
@@ -523,26 +175,12 @@ subagent_dispatch --(没有 ready task)----> task_listener      # 收尾
 | `agent` | 主循环 | 推理模型（`REASONING`） |
 | `planner` | **编译子图**：ReAct 探索 → 严格 JSON 的 `PlanDraft` → A2A 任务 | 推理（`agent_type=planner`） |
 | `tools` | 扇出：每个 tool_call 一个分支，各自过处理器链 | — |
-| `task_listener` | 完成上一个任务（落 `COMPLETED`）→ claim 下一个；全终态时触发**汇总回合** | — |
-| `subagent_dispatch` | 从任务板**预 claim** 最多 `subagent_workers` 个 ready task，动态 `Send` 扇出；没有就回 listener | — |
+| `task_listener` | 完成上一个任务 → claim 下一个；全终态时触发**汇总回合** | — |
+| `subagent_dispatch` | 从任务板**预 claim** 最多 `subagent_workers` 个 ready task，动态 `Send` 扇出 | — |
 | `subagent_worker` | **编译子图**：一个分支执行一个已 claim 的任务 | 推理（`agent_type=subagent`） |
 
-`ReactState` 是 `TypedDict`（**刻意不用 Pydantic**）：`messages` 用 `add_messages` reducer，其余是
-"最后写入者胜出"的通道。路由函数是**纯函数**。
-
-> **为什么要扇出成"一个 tool_call 一个分支"**：HITL 的 resume 语义依赖它 ——
+> **为什么扇出成「一个 tool_call 一个分支」**：HITL 的 resume 语义依赖它 ——
 > 一分支一个中断，审批账本跳过时才不会让后面的中断错位。
-
-**三条子图隔离规则**（都是踩过坑之后写死的）：
-
-| 规则 | 不这么做会怎样 |
-|---|---|
-| planner 用 `input_schema=PlannerInput` / `output_schema=PlannerOutput` | 父图 `context_policy` 漏进规划阶段，主 agent 的职责提示词与工具集污染规划；`messages` 漏回父图，工具循环被当成用户可见回复 |
-| worker 用**空** `output_schema=SubAgentOutput` | worker transcript 追加进主对话；多 worker 并发写 `tasks`/`plan` → 最后写者赢或 `InvalidUpdateError` |
-| 两张子图各自一个 tool scope uuid5 命名空间 | 与主图算出同一个 `branch_key`，观测行被合并成一行 |
-
-> 为什么 planner 必须是子图：它要做工具循环，中间推理一旦进主对话 `messages`，会污染用户可见回复、
-> 被 `message_recorder` 落库、被前端时间线渲染。详见 [`README_PLAN.md`](README_PLAN.md)。
 
 ### 一次对话的完整链路
 
@@ -552,8 +190,8 @@ POST /sessions/{id}/runs
   → InProcessGraphDispatcher.dispatch()（入队 → 子任务）
   → builder 节点：从 DB 现读能力候选 → 一次分类 LLM 调用 → capability_needs → tool_keys
        └─ 判要规划 → 合成一条 enter_plan_mode 调用 → tools 节点 → 图跳到 planner
-  → planner 子图（可选）：ReAct 探索（查技能/能力目录）→ task_generator 产出 A2A 任务
-       └─ 只发 plan.published 事件 + 写父图 state；**不发布任务板**
+  → planner 子图（可选）：ReAct 探索 → task_generator 产出 A2A 任务
+       └─ 只发 plan.published 事件 + 写父图 state；不发布任务板
   → task_listener：claim 第一个 ready task（或发现 ≥2 个 ready 时先问 main agent 要不要开团队）
   → agent 节点：ContextBuilder 跑 13 段流水线
        → 拼出一条 SystemMessage（各处理器 section 按序注入）
@@ -562,26 +200,183 @@ POST /sessions/{id}/runs
        → 流式产出 → leaked_tool_call 字符流闸 → 事件发布
   → 有 tool_calls？ → tools 扇出 → 处理器链（auth → approval[可能 interrupt] → cache → 真正调）
        └─ create_team 审批通过 → 发布任务板 → subagent_dispatch 预 claim → Send ×N
-            → subagent_worker 执行 → join 回 dispatch → 下一波 或 收尾
-  → 全部任务终态 → task_listener 起**汇总回合**（结果从任务板 artifact 取，不取 worker transcript）
-  → 事件经 Redis Stream → SSE 下发；遇审批**主动关流**（前端自行 resume 后重开）
+  → 全部任务终态 → task_listener 起汇总回合（结果从任务板 artifact 取，不取 worker transcript）
+  → 事件经 Redis Stream → SSE 下发；遇审批主动关流（前端自行 resume 后重开）
 ```
 
 ---
 
-## 配置速查
+## 🧩 五个核心能力
 
-完整说明见 **[`README_STARTUP.md`](README_STARTUP.md)**。要点先放这里：
+### 一、工具定义与拦截器链**运行时**可改
+
+**主张：改工具给模型看的说明、换它的前置/后置处理器、调它们的顺序 —— 都不发版、不重启。**
+
+| 维度 | 能不能运行时改 | 端点 |
+|---|---|---|
+| 说明文本（工具级 + 逐参数 `description_override`） | ✅ **下一次模型调用生效**（每次 build context 现读，无缓存） | `PUT /tools/{tool_id}/documentation` |
+| `input_schema` 的类型 / 必填 / 默认 | ❌ 归代码所有 | — |
+| 处理器链的增删改排 | ✅ 每次工具调用都从 DB 重读链（`ToolExecutor._load_chain`） | `/tools/{tool_id}/processors` |
+| 新建一个**处理器实现** | ❌ 处理器目录是只读的，需要发版 | — |
+
+**9 个内置处理器**（按反射从 `app.agent.tools.processor` 自动发现）：
+`approval_interceptor` · `auth_interceptor` · `cache_interceptor` · `execution_guard_interceptor` ·
+`timeout_interceptor` · `retry_interceptor` · `privacy_transformer` · `event_observer` · `metrics_observer`
+
+**洋葱折叠**：`compile_chain` 从链尾往头递归包，最内层是真正调 service 方法的 `_base_call`。
+`BEFORE` 在外层（可直接短路整条链）、`AFTER` 在内层（可改 `outcome`）、`AROUND` 占两行（进入 + 无操作退出）、
+`ASYNC` 观察者用 `create_task` 甩出去**不 await**（监控不阻塞工具调用）。
+
+**写入即校验**：未知 `processor_key` → 404；hook 不支持 / 执行模式不支持 / AROUND+ASYNC / 洋葱区间交叉 / 重排 id 不全 → 409；
+`config` 不过 `config_model` → 400。**三层防护**：应用层校验 → DB `CHECK` 约束 → 执行期 `build_chain._validate`。
+
+> 洋葱嵌套用**栈式校验**（`validate_onion`）保证区间正确嵌套而非交叉 ——
+> 交叉意味着 AROUND 的进入与退出挂到了不同层，折叠出的调用顺序不是你想的那个。
+
+📖 细节 → [`README_TOOL.md`](README_TOOL.md)
+
+### 二、工具级监控
+
+**主张：每一次工具调用都能回答「跑了没、成功没、花了多久、因为什么失败、是不是重复调用」。**
+
+| 层 | 载体 | 持久性 |
+|---|---|---|
+| 进程内实时 | `ToolEventBus`（`STARTED`/`SUCCEEDED`/`FAILED`/`DENIED`）+ `ToolMetricsRegistry`（按 tool_key 计数与时长） | 重启清零 |
+| 落库权威记录 | `tool_execution` 表（`param_hash` + 唯一约束 + `INSERT ... ON CONFLICT` 原子抢占） | 持久 |
+
+> ⚠️ `DENIED` 与 `FAILED` 是**两件事**：`DENIED` = 工具**根本没跑**（被 auth / approval 短路），
+> `FAILED` = 跑了但报错。指标里 `denied` **单独计数、不计入 `errors`** —— 否则「审批拒绝」会污染错误率。
+
+**这张表就是幂等的基础**：唯一约束 `(session_id, run_id, tool_key, param_hash)` +
+一条 `INSERT ... ON CONFLICT DO UPDATE WHERE status IN retryable` 原子抢占。
+重放与并发重复调用交给数据库，应用层不做「先查后写」那种有竞态的判断。
+
+> ⚠️ 当前边界：**实时诊断能力强，历史可查询能力弱** —— 指标没有查询接口、没有 Prometheus 导出、
+> `tool_execution` 没有 API 读、没有 reaper。详见 [`todolist`](todolist)。
+
+### 三、渐进式工具暴露：按树型业务分类现算
+
+**主张：不给模型看全部工具。每一轮运行开始时，按业务分类现算一遍它该看哪些。**
+
+```
+用户输入
+  └─ builder 节点（每个 run 只跑一次）
+       ├─ 从 DB 现读活跃能力候选集  CapabilityService.list_capabilities(is_active=True)
+       │    └─ 读不到 → 降级为空集 + 记录 note（不炸）
+       ├─ 一次 LLM 调用（agent_type="react" + ModelRole.CLASSIFICATION）
+       │    └─ 候选集渲染进提示词：每行 "code：name —— description"
+       ├─ 产出 capability_needs（限制在候选集内，未知落 other）
+       └─ tool_keys = 这些能力 code 映射到的工具
+  └─ 写入 context_policy.tool_keys（随 checkpoint 持久化）
+```
+
+两个必须分清的粒度：
+
+| | 何时算 | 运维改数据的生效点 |
+|---|---|---|
+| **key 集合** `context_policy.tool_keys` | **每 run 一次**（builder 只跑一次，图里没有回边） | **下一次 run** —— 当前 run 已快照 |
+| **可绑定工具对象** | **每次模型调用**重算（INITIAL 与每次 CONTINUATION 各一次） | 立即 |
+
+**「可见 == 可执行」是构造出来的，不是靠约定**：可见侧（`CapabilityProcessor` → `RegistryToolExposureSource.resolve`）
+与执行侧（tools 节点 `_wrap_tool_call`）调用**同一个纯函数 `select_specs`，传同一份 `tool_keys`**。
+
+> ⚠️ 两条边界：① 「在集合里」≠「一定会执行」（下游还有 fail-closed 的目录解析、幂等抢占、处理器链拒绝）；
+> ② `wire_name` 是多对一的（`a_b.c` 与 `a.b_c` 都换成 `a_b_c`），碰撞时有 **WARNING**，不是静默选择。
+>
+> ⚠️ 树形结构用于**组织**，门禁本身是**平**的：`is_active` 不递归到子树，工具查找按 `code IN (...)` 精确匹配。
+> **想停掉一整块，得逐个节点停用。**
+
+📖 细节 → [`README_TOOL.md`](README_TOOL.md) · [`README_CONTEXT.md`](README_CONTEXT.md)
+
+### 四、RAG 流水线：全链条可配置、可拓展
+
+**主张：从文件到可检索索引的每一个环节都是「注册表 + 配置选实现」，换实现不动调用方，加组件不碰中心清单。**
+
+| 链路 | 方向 | 载体 | 入口 |
+|---|---|---|---|
+| **写入（ingestion）** | 文件 → 清洗文本 → chunk → 向量 → 索引 | LangGraph 状态图（11 个 spec 节点，编译后 16 个） | `DocumentService.create/update/reprocess` |
+| **读取（retrieve）** | 查询 → 多路召回 → 融合 → 过滤 → 精排 → 裁剪 | 普通 async 服务方法 | `POST /documents/retrieve` |
+
+**配置是数据库行，不是代码** —— `DTD → Processor / Retrieval → Binding`：
+
+| 层 | 表 | 关键字段 |
+|---|---|---|
+| 类型定义 | `document_type_definition` | `type_key`（唯一不可变）、`analysis_mode`、融合策略、精排策略 |
+| 处理链 | `document_processor_definition` | `file_extension`、`loader_name`/`config`、`processor_name`/`config` |
+| 检索链 | `document_retrieval_definition` | `retrieval_type`、`chunker_name`/`config`、`retriever_name`/`config`、`storage_backend` |
+| 绑定 | `document_processor_retrieval_binding` | 配置层的 N:N |
+| 物理落点 | `document_index_binding` | 把物理索引名与配置解耦 |
+
+**「可拓展」：加一个组件是放手即用** —— 没有装饰器，没有中心注册清单，靠 `leaf_subclasses()` **反射发现**：
+
+1. 新建一个类，继承对应角色基类
+2. 设 `name`（全局唯一、永不复用的 key）
+3. **可选**：声明 `config_model`（pydantic）—— `get_config_schema()` 自动产出 JSON Schema，**前端表单因此自动生成**
+4. 放进该角色的目录。**完成。**
+
+**两道硬错误闸守着「静默二选一」**：
+
+| 冲突 | 结果 | 为什么必须炸 |
+|---|---|---|
+| 两个实现用了同一个 key | `ValueError` | 字典推导会让后者**静默覆盖**前者，症状是「某能力凭空消失」 |
+| 两个 embedder 是同一个 `output_kind` | `ValueError` | 写查只按形态选 embedder，「返回第一个」等于按模块名排序静默二选一 —— 而不同模型的向量空间不可比，混用**不报错**，只让召回率下降 |
+
+**失败语义：该炸的炸，该降级的降级，但绝不静默** —— 能力/后端查不到 → `CapabilityNotFound`；
+后端故障/超时 → 该路进 `degraded_routes`，其余照常；DTD 缺失/未激活 → **404（整请求）**。
+> `degraded_routes == []` 意味着**所有路都参与了**。这是一条很好用的断言。
+
+📖 细节 → [`README_DOCUMENT.md`](README_DOCUMENT.md) · 评测 → [`README_EVAL.md`](README_EVAL.md)
+
+### 五、规划与多代理：先把活拆成 DAG，再决定谁来干
+
+**主张：复杂请求先变成「可调度的任务图」，再按「能并行就并行」决定用主 agent 顺序跑、还是开子代理团队。**
+
+这两件事是**分开的两层**，混在一起就没法排查：
+
+| 层 | 做什么 | 谁负责 | 手册 |
+|---|---|---|---|
+| **规划** | 把请求拆成带依赖的 A2A 任务，写进 state | `planner` 子图（`agent_planner`） | [`README_PLAN.md`](README_PLAN.md) |
+| **执行** | claim 任务、跑任务、回写结果 | 主 `agent`（顺序）或 `subagent_worker` 子图（并行） | [`README_SUB_AGENT.md`](README_SUB_AGENT.md) |
+
+**计划就是一张 DAG**：模型只输出 `PlanDraft`（`id` + `message` + `metadata{skill_key, blocked_by, block_policy, capabilities}`），
+**执行态字段一个都不写** —— 模型写它们只会制造第二份真相。
+
+```
+PlanDraft  ──validate_plan()──▶  Kahn 拓扑排序  ──to_a2a_tasks()──▶  A2A Task
+             DAG / 体积 / id 格式               id = <plan_id>:<local_id>
+             自依赖 / 悬空依赖 / 环              blocked_by ↔ blocked 正反边
+```
+
+校验是**拒绝制**，不是裁剪制：`message` 或 `metadata` 超过 **64 KiB**、有环、引用不存在的依赖 → 整份计划作废
+（`PlanValidationError`）。只有「`skill_key` 不在目录里」这类才降级成 `plan.notes` 里的 warning。
+
+**三条并发正确性保证**：
+
+| 保证 | 做法 | 不这么做 |
+|---|---|---|
+| **谁跑哪个任务是确定的** | 父图 `subagent_dispatch` 先 CAS 预 claim，再按 `Send` 分发 | 多个 worker 各自读板抢同一批 ready，重复执行 |
+| **任务板是执行态权威** | Redis（TTL 7 天，按 `plan_id` 索引）；graph state 只是投影 | `Send` payload 取代 state，worker 根本看不到父图 `tasks` |
+| **结果只走任务板** | worker 写 `artifacts` + `result_summary`；父图在全部终态后起一次**汇总回合** | worker transcript 串进主对话，多 worker 并发写 `messages` |
+
+**fail-closed 是默认姿态**：没有 Redis 任务板 → `subagent_dispatch` **不派发**，退回主 agent 顺序执行；
+读板失败 → 直接抛错让整轮 failed，不假装「没有 ready task」。
+
+---
+
+## ⚙️ 配置速查
 
 ### 两类 yaml，性质完全不同
 
 | | 运行时配置 | 契约规格 |
 |---|---|---|
 | 位置 | `app/config/**` | `app/services/**/*.yaml` |
-| 数量 | 10 | 19 |
+| 数量 | **15**（顶层 9 + `datasource/` 6） | **21** |
 | 启动加载 | **会**（解析 + 校验） | **不会**，一个字节都不读 |
 | 改错后果 | 起不来 / 行为不对 | 不影响运行 |
 | 热加载 | **无** —— 改完必须重启 | — |
+
+> 真正做请求/响应校验的是 Python 里的 DTO。yaml 是「唯一事实来源」的**声明**，
+> 只有开发期的 `app/agent/spec_check.py` 会解析它。
 
 ### 运行时配置一览
 
@@ -591,106 +386,62 @@ POST /sessions/{id}/runs
 | [`event_stream.yaml`](./app/config/event_stream.yaml) | SSE 链路的全部节流参数 | `maxlen` 与 `ttl` 管**两件不同的事，两个都要** |
 | [`llm.yaml`](./app/config/llm.yaml) | **怎么建客户端**（provider / base_url / key） | 三家都 OpenAI 兼容，`base_url` 必须带 `/v1` |
 | [`model.yaml`](./app/config/model.yaml) | **选哪个模型**（六段目录 + 绑定） | `bindings` 刻意**没有通配兜底** |
-| [`datasource/*.yaml`](./app/config/datasource/) | 6 个数据源 | `postgre.yaml` 是**唯一强制**；加数据源不用改代码 |
+| [`datasource/*.yaml`](./app/config/datasource/) | 6 个数据源 | `postgre` 与 `checkpointer` 是 `required: true`；加数据源不用改代码 |
 
-**最容易踩的三条**：
+### 最容易踩的四条
 
-1. **`checkpointer.yaml` 的 `store` 段不是装饰** —— 它是 HITL 审批账本的持久化后端。**不传 `store`，账本退化成重启即丢的内存版**，症状是"已经批准过的工具重启后又问一遍"。
+1. **`checkpointer.yaml` 的 `store` 段不是装饰** —— 它是 HITL 审批账本的持久化后端。**不传 `store`，账本退化成重启即丢的内存版**，症状是「已经批准过的工具重启后又问一遍」。
 2. **单位陷阱**：`checkpointer.yaml` 的 `default_ttl_minutes` 是**分钟**，而审批拦截器那份配置的 TTL 是**秒**。
-3. **数据源 yaml 顶层 `type` 拼错会被静默跳过**（loader 已从 `raise` 放宽为 skip + warning）—— `tpye: postgresql` 之后只在取 `postgresql` 时报一句更差的错，**启动日志里的 warning 是唯一线索**。
+3. **数据源 yaml 顶层 `type` 拼错会被静默跳过**（loader 已从 `raise` 放宽为 skip + warning）—— 启动日志里的 warning 是**唯一线索**。
+4. **两个跨文件不变量**：`block_ms` 必须远小于 `socket_timeout`；`max_active_run_streams` 必须严格小于 `stream_max_connections`。
 
-> ⚠️ 仓库里有一批**注释失真**：`llm.yaml` / `event_stream.yaml` 的开头注释与 `README_MODEL.md` 第 1 节
-> 描述的是**配置收敛到 `app/config/` 之前**的布局，照它们找文件会找不到。细节见 [`README_STARTUP.md` §0](README_STARTUP.md)。
+> ⚠️ 仓库里有一批**注释失真**：`llm.yaml` / `event_stream.yaml` 的开头注释描述的是**配置收敛到
+> `app/config/` 之前**的布局，照它们找文件会找不到。**以实际文件位置为准。**
 
 ---
 
-## 快速开始
+## 🧪 验证与冒烟
+
+不连外部依赖也能跑的那部分，是改代码后最快的信心来源。
+
+| 命令 | 覆盖 |
+|---|---|
+| `-m app.agent.spec_check` | 契约一致性（document 域） |
+| `-m app.agent.tool_smoke` | 工具发现、`tool_key` 推导、处理器注册表 |
+| `-m app.agent.tool_processor_smoke` | 处理器链折叠与洋葱校验 |
+| `-m app.agent.prompt_smoke` | 提示词目录装配（**含 1 条已知过期断言**） |
+| `-m app.agent.retrieve_smoke` | 检索编排（不连 DB、不连 ES） |
+| `-m app.agent.pipeline_smoke` | 摄入流水线拓扑（`stub-run` 子命令**已失效**，见 [`todolist`](todolist)） |
+| `-m app.agent.agent_smoke` | Agent 图装配与路由纯函数 |
+| `-m app.services.memory.memory_smoke` | 记忆 L0–L3 链路 |
+| `-m app.services.document.retrieval_eval_smoke` | 检索评测 9 张表与 12 个端点 |
 
 ```bash
-# ⚠️ 用 .venv 里的 python，不要用裸 python
-#    （裸 python 是旧 anaconda，SQLAlchemy 太老，直接 ImportError）
-.venv/Scripts/python.exe run_server.py            # 默认 localhost:8080
-.venv/Scripts/python.exe run_server.py --port 8081
-
-# ⚠️ 不要用 `uvicorn app.main:app`
-#    psycopg 需要 SelectorEventLoop，而 uvicorn 0.36+ 会忽略 asyncio policy
+# 全部用 .venv 里的 python
+.venv/Scripts/python.exe -m app.agent.tool_smoke
+.venv/Scripts/python.exe -m pytest        # 单元测试（pytest.ini 已配好）
 ```
 
-**前置**：Postgres（**唯一必需**）+ Redis（SSE）。Milvus / ES / Neo4j 可选，缺失时对应能力降级。
-本机开发环境见 `app/config/datasource/`，重置数据用 `reset_data.py`。
-
-**契约自检**（开发期）：`.venv/Scripts/python.exe -m app.agent.spec_check`（目前只覆盖 document 那 6 份 spec）
-
-启动失败先查 [`README_STARTUP.md` §9 启动失败速查](README_STARTUP.md)。
-
 ---
 
-## 已知边界（诚实清单）
+## 🧭 推荐阅读顺序
 
-这份 README 只描述**代码里真实存在**的东西。以下能力目前**不工作或只有一半**，细节在各模块手册的
-「已知缺口」章节：
-
-| 缺口 | 症状 |
-|---|---|
-| **工具指标无出口** | 事件/指标只在进程内，**无查询接口、无 Prometheus、重启清零**；`tool_execution` 无 API 读、无 latency、无 token 记账、无 reaper |
-| **运行时改不了处理器实现** | 只能挂载已有处理器；新增处理器要发版 |
-| **能力树的 `is_active` 不级联** | 停用父节点**不会**停用子树；工具查找按 code 精确匹配、不向下递归 |
-| **加新工具要发版** | 能力树可改"选择"，但 tool_key 没有注册描述符就会被 `select_specs` 静默跳过 |
-| **发现同步拾取不了代码修改** | 只能发现"从未 import 的新模块"，改已加载模块仍需重启 |
-| `modules` 恒为空 / `capability_config` 无消费者 | 分类五维里只有 3 维真正起作用 |
-| Graph 检索 | 端到端未实现；`index/fiass.py` 是 **0 字节** |
-| `retrieval_type=document` | 召回未实现（无外部容器） |
-| 文档格式 | **只支持 `.txt` / `.md`**；`format_detection` 是占位 |
-| 逻辑删除 | **不清外部索引** —— 删了文档，chunk 仍可被召回 |
-| 成本估算 | `model.yaml` 的 `pricing:` 段全部被注释 → `estimated_cost` 恒为 `None` |
-| 结构化输出不能流式 | `_can_stream` 要求 `response_format is None` |
-| **计划任务没有 HTTP 端点** | A2A 计划任务只活在 graph state / Redis 任务板 / 事件流；`/api/v1/tasks` 是**异步作业**，另一套东西（名字撞车，别混） |
-| **4 个任务工具是占位** | `create_task` / `claim_task` / `update_task` / `complete_task` 全返回 `not_implemented=true`；只有 `create_team` 接了真实副作用 |
-| **claim lease 只写不续租** | `lease_expires_at` 写进 claim，但 `app/agent/plan/` 下**没有续租 / 过期回收**；`is_ready` 也不看 lease → worker 崩溃后任务永久停在 `WORKING` |
-| **worker 不是独立进程** | 是同一进程内的 `Send` 分支（Pregel super-step 并发），**不能跨机扩容** |
-| **`subagent_mode` 只写 `on`/`off`** | `pending` / `denied` 仅存在于 `ReactState` 注释；团队决策用的是另一个字段 `team_decision` |
-| **`block_policy` 只有一种** | `all_succeeded`；其他值直接拒绝（`contracts.py`） |
-| Context 的三个 Source 端口 | `ProfileSource` / `KnowledgeSource` / `MemorySource` **全仓零实现** |
-| L2 / L3 消费侧 | 场景与画像**只有写入方**，还没有检索/注入 |
-| L1 背景对话 | 只喂增量，从对话中间开始时指代没有先行词（漏抽或猜，**两类都不报错**） |
-| Neo4j | 已接为 DataSource 但**尚未被消费** |
-| `tool_span` | react 图的节点级 span **只打日志不落库**（文档管线才落表） |
-| 契约一致性 | 只有 document 域有 `spec_check` 自动闸，其余域靠人守 |
-
-更大的方向性未做项（sandbox、agent eval、trace、比 orchestrator-worker 更复杂的协作拓扑）见仓库根 `todolist`。
-多 agent 协作已落地到 **orchestrator-worker** 形态（`create_team` + worker 子图，见 [`README_SUB_AGENT.md`](README_SUB_AGENT.md)）。
-
----
-
-## 阅读建议
-
-### 子系统手册索引
-
-九份手册都按"事实 + 已知缺口"写，**没有一份是设计愿景**。
-
-| 手册 | 回答什么问题 |
-|---|---|
-| [`README_STARTUP.md`](README_STARTUP.md) | 怎么跑起来、配置在哪、启动失败怎么查、SSE 与前端契约 |
-| [`README_DOCUMENT.md`](README_DOCUMENT.md) | 文档摄入流水线 + RAG 检索：配置是 DB 行、加组件放手即用 |
-| [`README_EVAL.md`](README_EVAL.md) | 检索评测：金标怎么来、指标怎么算、"金标死在哪一段" |
-| [`README_CONTEXT.md`](README_CONTEXT.md) | 上下文怎么拼出来：固定段序、处理器能改什么、白名单回写 |
-| [`README_MODEL.md`](README_MODEL.md) | 模型怎么选：等值匹配、匹配不到就报错、为什么没有通配兜底 |
-| [`README_TOOL.md`](README_TOOL.md) | 工具定义、处理器链洋葱模型、HITL 审批账本 |
-| [`README_MEMORY.md`](README_MEMORY.md) | L0–L3 四层记忆，以及哪一层可重建、哪一层是权威 |
-| [`README_PLAN.md`](README_PLAN.md) | **计划模式**：请求怎么拆成 DAG、计划怎么变成 A2A 任务、谁发布任务板 |
-| [`README_SUB_AGENT.md`](README_SUB_AGENT.md) | **子代理**：worker 怎么被派发、任务板怎么保证不重复执行、结果怎么回流 |
-
-### 推荐顺序
-
-第一次读这个仓库，建议的顺序：
+九份手册都按「事实 + 可验证断言」写，**没有一份是设计愿景**。缺口不在这里 —— 在 [`todolist`](todolist)。
 
 1. **本文的「五个核心能力」** → 拿到它和别的 harness 的差异面
 2. **[`README_STARTUP.md`](README_STARTUP.md)** → 把它跑起来，知道配置在哪
-3. **挑一个你关心的子系统手册**，并且**先读它的「已知缺口」章节** —— 那节列的是当前**不能**工作的能力，比正面描述更能校准预期
+3. **挑一个你关心的子系统手册**，先读它的「阅读地图」—— 那节直接告诉你该看哪个文件
 4. 再回到代码，从 `app/main.py` 的 lifespan 往下走 —— 它是组合根，每一步的位置都有注释解释理由
 
-> 只想看**新增的规划 / 多代理能力**：直接读 [`README_PLAN.md`](README_PLAN.md) 与
-> [`README_SUB_AGENT.md`](README_SUB_AGENT.md)，两份都自带"端到端时序 + 失败矩阵"。
+> 只想看**规划 / 多代理**：直接读 [`README_PLAN.md`](README_PLAN.md) 与 [`README_SUB_AGENT.md`](README_SUB_AGENT.md)，
+> 两份都自带端到端时序与失败矩阵。
 
-> 本仓库的注释密度很高，而且**大量注释在解释"为什么"，包括"为什么不是另一种写法"**。
-> 这不是装饰 —— 它是这个项目最主要的交付物之一。
+---
+
+## 🤝 文档约定
+
+- **README 只写「怎么用、怎么读」**；「还差什么、什么时候会骗到你」统一写在 [`todolist`](todolist) 的 B 部分，按子系统分节，带 `❌ / ⚠️ / 📌 / 📝` 状态图例。
+- **每份手册开头都有「阅读地图」**：一张 `文件 → 职责` 的表。找东西先看它，别从头读。
+- **注释密集是刻意的**，而且大量注释在解释「为什么」，包括「为什么不是另一种写法」。
+  这不是装饰 —— 它是这个项目最主要的交付物之一。
+- **新增业务路由必须注册到 `protected_router`**，没有机制强制这一点，靠「照着邻居写」+ `tests/api/test_auth_enforcement.py`。
