@@ -67,12 +67,11 @@ class DataSourceConfigLoader:
             # 判定规则只有一条：**顶层有没有 `type` 键**。有 = 数据源，
             # 没有 = 别的配置（如 casdoor.yaml），跳过即可。
             #
-            # 以前这里是 `raise ValueError`，那等于宣布"这个目录只许
-            # 放数据源" —— 于是 llm.yaml / event_stream.yaml /
-            # model.yaml 为了躲开它，全被挪到了各自的模块目录下
-            # （见 app/common/llm.py 开头的说明）。而 app/config/ 恰恰
-            # 是"部署时要改的东西"最该待的地方，不该因为一个加载器的
-            # 假设把配置打散到三处。
+            # 历史：这里曾经 `raise ValueError`，等于宣布"这个目录只许
+            # 放数据源"，非数据源配置于是被挪到了各自的模块目录下。
+            # 现在那些配置统一住在 app/config/ 顶层（本加载器只扫
+            # datasource/ 子目录），这里的 skip 只用于兜住"目录里混进
+            # 了无 type 文件"这种情况。
             #
             # 跳过时**打 warning 列出文件名**，因为宽松化的代价是：
             # `tpye: postgresql` 这种键名拼错也会被跳过，之后就只在

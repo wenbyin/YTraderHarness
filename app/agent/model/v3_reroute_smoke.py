@@ -42,7 +42,8 @@ structured output 那一格红了 -> **停下来讨论**，不要换驱动。
 ⚠️ 需要真模型
 --------------
 本脚本用**真** registry + **真**模型（`model.yaml` 的 reasoning_default /
-classification_default），因此需要 `app/common/llm.yaml` 与凭据可解析。
+classification_default），因此需要 `app/config/providers.yaml` 的
+`llm` 段与凭据可解析。
 连不上就直接失败并打原始异常 —— 不跳过：这个验证的结论是"能不能换驱动"，
 跳过等于没有结论。
 

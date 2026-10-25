@@ -5,6 +5,9 @@
 __pycache__/
 *.pyc
 /.pytest_cache/
+# provider 连接配置（LLM / web / rerank 已合并）
+/app/config/providers.yaml
+# 旧版三份已废弃；保留忽略规则，防止本地残留文件（含明文密钥）被误提交
 /app/config/llm.yaml
 /app/config/rerank.yaml
 /app/config/web.yaml

@@ -7,7 +7,7 @@
 直接 `raise ValueError`，而那个 raise 在 try 之外，连一个空文件都能让
 整个应用起不来。
 
-于是 `llm.yaml` / `event_stream.yaml` / `model.yaml` 为了躲开它，
+于是当时的非数据源配置（`llm.yaml` / `event_stream.yaml` / `model.yaml`）为了躲开它，
 各自被挪到了模块目录下（见 app/common/llm.py 开头的说明）。
 
 现在判据改成"顶层有没有 `type`"：有 = 数据源，没有 = 别人的配置，

@@ -1,17 +1,18 @@
 # 模型目录：有哪些模型、它们什么能力、谁引用谁、按什么策略调用。
 #
-# ⚠️ 与 app/common/llm.yaml 的分工
-# --------------------------------
-#   llm.yaml      连接：base_url / api_key（${ENV}）/ provider 分派 / 客户端类
-#   model.yaml    声明：模型 / 能力 / 别名 / profile / 策略 / 绑定
+# ⚠️ 与 providers.yaml 的 llm 段的分工
+# ------------------------------------
+#   providers.yaml（llm 段）  连接：base_url / api_key（${ENV}）/ provider 分派 / 客户端类
+#   model.yaml                声明：模型 / 能力 / 别名 / profile / 策略 / 绑定
 #
 # 本文件**不含任何密钥**：`credential_ref` 只是一个名字，对应的环境变量名
 # 写在下面的 credentials: 里（那里也只有名字，没有值）。
 #
-# ⚠️ 为什么不放在 app/config/ 下
-# ------------------------------
-# 那个目录被数据源加载器整目录 glob("*.yaml") 扫，多一个不含 type 的文件
-# 会直接让启动失败（见 infra/datasource/loader.py）。理由与 llm.yaml 相同。
+# ⚠️ 为什么放在 app/config/ 顶层，而不是 datasource/ 子目录
+# --------------------------------------------------------
+# 数据源加载器只 glob(`app/config/datasource/*.yaml`)，本文件在上一层，
+# 不会被当成数据源扫描。放在 datasource/ 里则因为没有顶层 `type` 而被
+# 跳过并每次启动打一条 warning（见 infra/datasource/loader.py）。
 #
 # ⚠️ 装配顺序是有约束的
 # --------------------
@@ -23,11 +24,11 @@
 # provider：实现维度（规格 §4.1）
 # ============================================================
 #
-# 这里只声明"用哪个适配器"，连接信息与密钥一律在 llm.yaml 里 ——
-# 那份文件已经知道怎么按 provider 名分派客户端、怎么展开 ${ENV}。
-# 本模块不重复那套知识（规格 §20：不要造第二套配置系统）。
+# 这里只声明"用哪个适配器"，连接信息与密钥一律在 providers.yaml 的
+# llm 段里 —— 那边已经知道怎么按 provider 名分派客户端、怎么展开
+# ${ENV}。本模块不重复那套知识（规格 §20：不要造第二套配置系统）。
 #
-# provider 名必须与 llm.yaml 的 providers: 键一致。
+# provider 名必须与 providers.yaml 的 llm.providers 键一致。
 
 providers:
 
@@ -47,7 +48,7 @@ providers:
     label: qwen（阿里千问）
 
   #: 开发用的进程内 mock（openai run_server.py --mock）。
-  #: 与 qwen 同一条：llm.yaml 的 providers 里也要有 mock，且
+  #: 与 qwen 同一条：providers.yaml 的 llm.providers 里也要有 mock，且
   #: app/common/llm.py 的 `_INIT_PROVIDERS` 要映射到 openai 适配器。
   mock:
     adapter: langchain
@@ -61,10 +62,10 @@ providers:
 # 值由 Model 层在**建客户端时**从环境变量取（见 model/credentials.py）。
 #
 # 为什么还要这一层：一个 provider 可能有多把 key（生产 / 沙箱 / 多租户）。
-# 不写 credential_ref 的模型走 llm.yaml 里 provider 自己的那份凭据 ——
-# 默认路径上本模块不认识任何密钥。
+# 不写 credential_ref 的模型走 providers.yaml 的 llm 段里 provider
+# 自己的那份凭据 —— 默认路径上本模块不认识任何密钥。
 #
-# 解不到环境变量时**不算错**：回落到 llm.yaml 的那一份（见
+# 解不到环境变量时**不算错**：回落到 llm 段的那一份（见
 # EnvVarCredentialResolver 的说明）。要"声明的凭据必须存在"，在
 # build_model_registry(credentials=EnvVarCredentialResolver(..., required=True))
 # 里显式要求。
@@ -200,7 +201,8 @@ models:
       #:     16384 -> 200，`completion_tokens=16384`、可见正文 10164 字符
       #:     32768 -> 200（未验证是否真被采纳，本次没用到）
       #:
-      #: 原来那句"本仓库无法验证"是**当时**的事实（key 在 llm.yaml 里由
+      #: 原来那句"本仓库无法验证"是**当时**的事实（key 在 providers.yaml
+      #: 的 llm 段里由
       #: `${ENV}` 展开，静态看确实够不着）；现在用应用进程跑一次就验了，
       #: 所以把那句删掉 —— 留着它会挡住下一个人做同一件事。
       #:
@@ -285,7 +287,8 @@ models:
     #: 所以这里刻意取小。
     context_window: 32768
     credential_ref: qwen-production
-    #: 刻意**不写** credential_ref：llm.yaml 里 qwen 那一段自带 api_key，
+    #: 刻意**不写** credential_ref：providers.yaml 的 llm 段里 qwen
+    #: 那一段自带 api_key，
     #: 不写的话就走它（见本文件开头"credential_ref 只在要多把 key 时才需要"）。
     #: 将来要把千问的 key 单独放进环境变量，再加一行
     #: `credential_ref: qwen-production` 与对应的 credentials: 条目即可。

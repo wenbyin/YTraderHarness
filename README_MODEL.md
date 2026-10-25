@@ -157,7 +157,7 @@ app/agent/model/
 
 | 想深入看 | 去哪 |
 |---|---|
-| 模型建在哪个客户端上（`llm.yaml`） | [`README_STARTUP.md`](README_STARTUP.md) |
+| 模型建在哪个客户端上（`providers.yaml` 的 `llm` 段） | [`README_STARTUP.md`](README_STARTUP.md) |
 | 每次模型调用的上下文怎么拼 | [`README_CONTEXT.md`](README_CONTEXT.md) |
 | 记忆抽取用的是哪两个角色 | [`README_MEMORY.md`](README_MEMORY.md) |
 | 总览 | [`README.md`](README.md) |

@@ -15,9 +15,9 @@ rerank_score, authority}, ...]}`；无命中时 results 是空数组，
 Fetch 请求：`{"url": "https://..."}`（HTTP/HTTPS，最长 8192）。
 Fetch 响应：`{title, content}`，content 是 Markdown。
 
-⚠️ 不要把 llm.yaml 的 base_url 直接拿来拼
---------------------------------------
-llm.yaml 的 deepseek base_url 是 `https://api.deepseek.com/v1`（chat
+⚠️ 不要把 providers.yaml 里 llm 段的 base_url 直接拿来拼
+------------------------------------------------------
+llm 段 deepseek 的 base_url 是 `https://api.deepseek.com/v1`（chat
 端点），而 Search / Fetch 的路径挂在**站点根**上。`_origin()` 会还原
 origin，所以配置写站点根或带 `/v1` 都行。
 
@@ -49,11 +49,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import aiohttp
-import yaml
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from app.common.utils.env import expand_env
+from app.common.providers_config import (
+    get_providers_section,
+    load_providers_document,
+)
 
 __all__ = [
     "WebSettings",
@@ -67,11 +69,11 @@ logger = logging.getLogger(__name__)
 #: 显式来源；不写会按模块路径推导成 `agent`，tool_key 就不是 `web.*`。
 TOOL_SOURCE_REF = "web"
 
-#: 配置文件（真文件 gitignore；模板入库）。
+#: 配置文件（真文件 gitignore；模板入库）。web 配置在 `web` 段。
 _CONFIG_PATH = (
     Path(__file__).resolve().parents[2]
     / "config"
-    / "web.yaml"
+    / "providers.yaml"
 )
 
 #: DeepSeek 端点路径。
@@ -89,7 +91,7 @@ _API_MAX_COUNT = 50
 
 
 class WebSettings(BaseModel):
-    """`web.yaml` 的形状。"""
+    """`providers.yaml` 的 `web` 段的形状。"""
 
     base_url: str = "https://api.deepseek.com"
     api_key: str = ""
@@ -108,8 +110,8 @@ class WebSettings(BaseModel):
 @lru_cache(maxsize=1)
 def get_web_settings() -> WebSettings:
     """
-    读 `app/config/web.yaml`；缺的项从 llm.yaml 的 deepseek provider
-    兜底，最后回落 `DEEPSEEK_API_KEY`。
+    读 `app/config/providers.yaml` 的 `web` 段；缺的项从同一份文件的
+    `llm` 段里 deepseek provider 兜底，最后回落 `DEEPSEEK_API_KEY`。
 
     进程内缓存；测试改配置时调 `get_web_settings.cache_clear()`。
     """
@@ -121,14 +123,13 @@ def get_web_settings() -> WebSettings:
         merged = {**defaults.model_dump(), **fallback}
         return WebSettings.model_validate(merged)
 
-    raw = yaml.safe_load(
-        _CONFIG_PATH.read_text(encoding="utf-8")
-    ) or {}
-
-    section = expand_env(raw.get("web") or {})
+    section = get_providers_section(
+        load_providers_document(_CONFIG_PATH),
+        "web",
+    )
 
     # 逐项兜底：只配了 api_key 的人不该因此丢掉端点；空的 section
-    # 值也不该把 llm.yaml 的 key 覆盖成空串。
+    # 值也不该把 llm 段里的 key 覆盖成空串。
     merged = defaults.model_dump()
 
     for key, value in fallback.items():
@@ -151,7 +152,7 @@ def get_web_settings() -> WebSettings:
 
 def _from_llm_config() -> dict[str, str]:
     """
-    从 llm.yaml 的 deepseek provider 取 key 与站点根。
+    从 providers.yaml 的 `llm` 段 deepseek provider 取 key 与站点根。
 
     读不到就返回空 dict —— 真正的"没凭据"错误推迟到工具调用时，
     不在 import / 装配期炸（与 rerank_api.py 同一立场）。
@@ -165,7 +166,7 @@ def _from_llm_config() -> dict[str, str]:
     except Exception as exc:  # noqa: BLE001 - 兜底而已
 
         logger.debug(
-            "读 llm.yaml 的 deepseek provider 失败（%s: %s），"
+            "读 providers.yaml 的 deepseek provider 失败（%s: %s），"
             "web 工具将没有默认端点/凭据。",
             type(exc).__name__,
             exc,
@@ -354,7 +355,7 @@ async def _post_json(
     if not api_key:
         raise RuntimeError(
             "DeepSeek web API 没有凭据：请设置 DEEPSEEK_API_KEY，"
-            "或在 app/config/web.yaml 里配置 api_key。"
+            "或在 app/config/providers.yaml 的 web 段里配置 api_key。"
         )
 
     url = (

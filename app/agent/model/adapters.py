@@ -8,7 +8,7 @@
 
     provider 名 -> 客户端类    （init_chat_model 的别名表 + 不走它的
                                 那几家直接构造，见 _DIRECT_PROVIDERS）
-    连接信息与密钥              （app/common/llm.yaml + ${ENV} 展开）
+    连接信息与密钥              （providers.yaml 的 llm 段 + ${ENV} 展开）
     provider 特有参数            （temperature 的"不传就不传"这类取舍）
 
 因此本模块的 Factory **不自己 import openai / langchain 包**，而是把
@@ -811,7 +811,7 @@ def _client_creation_error(
     return ModelConfigurationError(
         f"无法为模型 {definition.id!r} 创建 provider 客户端：\n"
         f"    {type(exc).__name__}: {exc}\n"
-        "常见原因：provider 没在 app/common/llm.yaml 里配置、API Key "
+        "常见原因：provider 没在 providers.yaml 的 llm 段里配置、API Key "
         "环境变量为空、或对应的 langchain provider 包没有安装。",
         provider=definition.provider,
         model=definition.model,

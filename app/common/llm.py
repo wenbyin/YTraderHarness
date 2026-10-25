@@ -24,8 +24,8 @@
 
 配置住在 app/config/，但不在被扫描的那个子目录里
 ------------------------------------------------
-`llm.yaml` 与 casdoor、模型目录、事件流并排放在 `app/config/` 下，
-与读它的本模块**不同目录**。
+`providers.yaml`（`llm` 段）与 casdoor、模型目录、事件流并排放在
+`app/config/` 下，与读它的本模块**不同目录**。
 
 它不会被数据源加载器扫到，因为加载器只 glob 交给它的那**一个**目录，
 而 `app/main.py` 给它的是 `app/config/datasource/`（见
@@ -49,17 +49,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib import import_module
-from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.common.utils import expand_env
+from app.common.providers_config import (
+    DEFAULT_CONFIG_PATH,
+    get_providers_section,
+    load_providers_document,
+)
 
 __all__ = [
     "ChatModelWarmup",
+    "DEFAULT_CONFIG_PATH",
     "LLMConfig",
     "LLMProviderConfig",
     "get_chat_model",
@@ -73,7 +76,8 @@ __all__ = [
 #: 大多数家都在 `init_chat_model` 的支持列表里，这里列出**本项目实际用到**
 #: 的那几个，而不是把 27 个全抄一遍：多抄一个就多一处会过期的信息。
 #:
-#: ⚠️ 值可以是**别名**：本项目自己的 provider 名（llm.yaml 的键）与
+#: ⚠️ 值可以是**别名**：本项目自己的 provider 名（providers.yaml 的
+#: llm.providers 键）与
 #: `init_chat_model` 认的名字不必相同。qwen 就是这一种 —— 它的端点是
 #: OpenAI 兼容的（`/compatible-mode/v1`），`init_chat_model` 也不认得
 #: "qwen" 这个名字，因此映射到它认得的 "openai"，由 base_url 指向
@@ -106,15 +110,12 @@ _DIRECT_PROVIDERS: dict[str, tuple[str, str]] = {
     "deepseek": ("app.common.deepseek_chat", "ReasoningChatDeepSeek"),
 }
 
-#: 默认配置文件位置 —— app/config/llm.yaml。
+#: 默认配置文件位置 —— app/config/providers.yaml 的 `llm` 段。
 #:
-#: 不再用 `Path(__file__).with_name(...)`：配置已经不住在本模块旁边了。
 #: 从 __file__ 往上推而不是写相对路径，理由和 tests 里那条一样 ——
 #: 相对路径只在 CWD 恰好是仓库根时成立，而"读配置"这件事在 IDE 里点运行、
-#: 从别处跑脚本时都会发生。
-DEFAULT_CONFIG_PATH = (
-    Path(__file__).resolve().parents[1] / "config" / "llm.yaml"
-)
+#: 从别处跑脚本时都会发生。路径本身由 providers_config 统一定义，
+#: 这里 import 进来是为了兼容既有调用方。
 
 
 class LLMProviderConfig(BaseModel):
@@ -157,7 +158,7 @@ class LLMProviderConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    """整份 llm.yaml。"""
+    """`providers.yaml` 的 `llm` 段。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -188,7 +189,7 @@ class LLMConfig(BaseModel):
             raise ValueError(
                 f"未知的 LLM provider: {name!r}。"
                 f"已配置的有：{known}。"
-                "请检查 app/config/llm.yaml。"
+                "请检查 app/config/providers.yaml 的 llm 段。"
             )
 
         return name, config
@@ -199,23 +200,26 @@ def load_llm_config(
         path: str | None = None,
 ) -> LLMConfig:
     """
-    读配置并展开环境变量占位符。
+    读 `providers.yaml` 的 `llm` 段，并展开环境变量占位符。
 
     按路径缓存 —— 同一份配置在一次进程里只解析一次。改了 yaml 要重启
     才生效，与项目里其它配置（数据源、模型路径）的立场一致。
+
+    `path` 指向整份 providers.yaml，不是某一行的片段。
     """
 
-    file_path = Path(path) if path else DEFAULT_CONFIG_PATH
+    section = get_providers_section(
+        load_providers_document(path),
+        "llm",
+    )
 
-    if not file_path.exists():
+    if not section:
         raise ValueError(
-            f"LLM 配置文件不存在：{file_path}。"
-            "该文件随代码一起提供，缺失说明部署不完整。"
+            "providers.yaml 缺少 `llm` 段 —— 至少要写 "
+            "`default_provider` 与 `providers`。"
         )
 
-    raw = yaml.safe_load(file_path.read_text(encoding="utf-8")) or {}
-
-    return LLMConfig.model_validate(expand_env(raw))
+    return LLMConfig.model_validate(section)
 
 
 def get_chat_model(
@@ -241,7 +245,7 @@ def get_chat_model(
 
         get_chat_model(temperature=X)     本次调用显式指定
           ↓ 没有则
-        llm.yaml 里该 provider 的 temperature
+        providers.yaml 的 llm 段里该 provider 的 temperature
           ↓ 没有则
         **不传这个参数**，用服务端的默认值
 
@@ -257,9 +261,9 @@ def get_chat_model(
     `deepseek-reasoner`），也可能有多把 key（生产 / 沙箱 / 多租户），
     所以这两个值必须能被调用方覆盖：
 
-        model      覆盖 llm.yaml 里该 provider 的 model
+        model      覆盖 providers.yaml 的 llm 段里该 provider 的 model
                    （缺省 None = 不覆盖，保持既有行为）
-        api_key    覆盖 llm.yaml 里该 provider 的 api_key
+        api_key    覆盖 providers.yaml 的 llm 段里该 provider 的 api_key
                    （缺省 None = 用配置里那份；给了就不再校验配置里
                    那份是否为空 —— 覆盖的意义就是不用它）
 
@@ -303,7 +307,8 @@ def get_chat_model(
         raise ValueError(
             f"LLM provider {name!r} 没有配置 API Key。"
             f"请设置环境变量后重启服务"
-            f"（见 app/config/llm.yaml 里 {name} 那段的 api_key）。"
+            f"（见 app/config/providers.yaml 的 llm 段里 "
+            f"{name} 那一段的 api_key）。"
         )
 
     # 三级优先：调用方显式指定 > provider 配置 > **不传**。

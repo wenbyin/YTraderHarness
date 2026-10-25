@@ -84,7 +84,7 @@ def _patch_post(monkeypatch, handler) -> None:
 )
 def test_origin_strips_the_compatible_mode_suffix(base, expected) -> None:
     """
-    原生精排路径挂在**站点根**上，而 llm.yaml 给的 base_url 带
+    原生精排路径挂在**站点根**上，而 llm 段给的 base_url 带
     `/compatible-mode/v1`（那是 chat 的端点）。
 
     不还原就会拼成 `.../compatible-mode/v1/api/v1/services/...` —— 实测

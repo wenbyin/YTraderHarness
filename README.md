@@ -16,7 +16,7 @@
 
 | 入口 | 关键数字 | 什么时候看 |
 |---|---|---|
-| 🚀 [`README_STARTUP.md`](README_STARTUP.md) **启动与配置** | 15 份运行时配置 / 21 份契约 | 第一次跑起来、启动失败排障 |
+| 🚀 [`README_STARTUP.md`](README_STARTUP.md) **启动与配置** | 14 份运行时配置 / 21 份契约 | 第一次跑起来、启动失败排障 |
 | 📄 [`README_DOCUMENT.md`](README_DOCUMENT.md) **文档与 RAG** | 11→16 个节点 / 4 段读取 | 摄入流水线、多路召回、加组件 |
 | 📊 [`README_EVAL.md`](README_EVAL.md) **检索评测** | 9 张表 / 12 个端点 | 评召回、看金标死在哪一段 |
 | 🧠 [`README_CONTEXT.md`](README_CONTEXT.md) **上下文装配** | 13 段 / 14 个处理器 | 流水线段序、处理器的边界 |
@@ -127,7 +127,7 @@ app/
 │   ├── task/          # 任务 worker / dispatcher / outbox / retry
 │   └── agent/         # 工具执行器 + 暴露 + 链折叠
 ├── common/            # 共享内核：工厂、模型、鉴权、schema、任务协议
-└── config/            # 运行时配置（15 份 yaml）
+└── config/            # 运行时配置（14 份 yaml）
 ```
 
 ### 四个图身份、两个注册图
@@ -370,7 +370,7 @@ PlanDraft  ──validate_plan()──▶  Kahn 拓扑排序  ──to_a2a_tasks
 | | 运行时配置 | 契约规格 |
 |---|---|---|
 | 位置 | `app/config/**` | `app/services/**/*.yaml` |
-| 数量 | **15**（顶层 9 + `datasource/` 6） | **21** |
+| 数量 | **14**（顶层 8 + `datasource/` 6） | **21** |
 | 启动加载 | **会**（解析 + 校验） | **不会**，一个字节都不读 |
 | 改错后果 | 起不来 / 行为不对 | 不影响运行 |
 | 热加载 | **无** —— 改完必须重启 | — |
@@ -384,7 +384,7 @@ PlanDraft  ──validate_plan()──▶  Kahn 拓扑排序  ──to_a2a_tasks
 |---|---|---|
 | [`casdoor.yaml`](./app/config/casdoor.yaml) | JWT 校验、OAuth 登录、管理员门禁 | `APP_ENV=prod` + `enabled: false` = **硬拒绝启动** |
 | [`event_stream.yaml`](./app/config/event_stream.yaml) | SSE 链路的全部节流参数 | `maxlen` 与 `ttl` 管**两件不同的事，两个都要** |
-| [`llm.yaml`](./app/config/llm.yaml) | **怎么建客户端**（provider / base_url / key） | 三家都 OpenAI 兼容，`base_url` 必须带 `/v1` |
+| [`providers.yaml`](./app/config/providers.yaml.template)（模板） | **怎么连外部 provider**（`llm` / `web` / `rerank` 三段） | 真文件含密钥、gitignore；三家 LLM 都 OpenAI 兼容，`base_url` 必须带 `/v1` |
 | [`model.yaml`](./app/config/model.yaml) | **选哪个模型**（六段目录 + 绑定） | `bindings` 刻意**没有通配兜底** |
 | [`datasource/*.yaml`](./app/config/datasource/) | 6 个数据源 | `postgre` 与 `checkpointer` 是 `required: true`；加数据源不用改代码 |
 
@@ -395,8 +395,9 @@ PlanDraft  ──validate_plan()──▶  Kahn 拓扑排序  ──to_a2a_tasks
 3. **数据源 yaml 顶层 `type` 拼错会被静默跳过**（loader 已从 `raise` 放宽为 skip + warning）—— 启动日志里的 warning 是**唯一线索**。
 4. **两个跨文件不变量**：`block_ms` 必须远小于 `socket_timeout`；`max_active_run_streams` 必须严格小于 `stream_max_connections`。
 
-> ⚠️ 仓库里有一批**注释失真**：`llm.yaml` / `event_stream.yaml` 的开头注释描述的是**配置收敛到
-> `app/config/` 之前**的布局，照它们找文件会找不到。**以实际文件位置为准。**
+> ⚠️ 配置已经收敛到 `app/config/` 顶层，只有 `datasource/` 子目录会被数据源加载器扫描。
+> 若在旧代码或旧文档里看到 `llm.yaml` / `web.yaml` / `rerank.yaml`，它们已合并为
+> `providers.yaml`。
 
 ---
 

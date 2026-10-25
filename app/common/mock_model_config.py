@@ -182,7 +182,7 @@ class MockModelConfig(BaseModel):
         default=18080,
         ge=1,
         le=65535,
-        description="监听端口；llm.yaml 的 mock.base_url 默认指向 18080。",
+        description="监听端口；providers.yaml 的 llm.mock.base_url 默认指向 18080。",
     )
 
     seed: int | None = Field(

@@ -9,26 +9,26 @@
 它**不是**第二套配置系统
 ----------------------
 本项目的配置约定一直是一份 YAML + `yaml.safe_load` + 启动期校验
-（`app/config/datasource/*.yaml` 由数据源加载器读，`app/config/llm.yaml` 由
-`app/common/llm.py` 读）。这里照同一套来，没有引入新的配置框架、
+（`app/config/datasource/*.yaml` 由数据源加载器读，`app/config/providers.yaml`
+的 `llm` 段由 `app/common/llm.py` 读）。这里照同一套来，没有引入新的配置框架、
 没有新的环境变量语法、没有第二份 DI 容器。
 
-⚠️ 与 `app/config/llm.yaml` 的分工（重要）
------------------------------------------
-    llm.yaml        **连接**：base_url / api_key / provider 分派 / 客户端类
-    model.yaml      **声明**：有哪些模型、它们什么能力、谁引用谁、什么策略
+⚠️ 与 `app/config/providers.yaml` 的 llm 段的分工（重要）
+--------------------------------------------------------
+    providers.yaml（llm 段）  **连接**：base_url / api_key / provider 分派 / 客户端类
+    model.yaml                **声明**：有哪些模型、它们什么能力、谁引用谁、什么策略
 
 因此新增一个 provider 的完整步骤是两处各一行：
 
-    llm.yaml    加一段连接信息（含 `${ENV}`）
+    providers.yaml 的 llm.providers 加一段连接信息（含 `${ENV}`）
     model.yaml  providers: 里加一条（`adapter: langchain`）+ 模型/绑定
 
-两者都不含明文密钥：llm.yaml 用环境变量占位，model.yaml 只写
+两者都不含明文密钥：providers.yaml 用环境变量占位，model.yaml 只写
 `credential_ref` 的**名字**。
 
 配置在 `app/config/` 下的摆放
 ---------------------------
-    app/config/llm.yaml          连接：base_url / api_key / 客户端类
+    app/config/providers.yaml    连接：LLM / web / rerank 三类 provider
     app/config/model.yaml        声明：本文件读的那份
     app/config/event_stream.yaml 事件流参数
     app/config/casdoor.yaml      鉴权
@@ -105,7 +105,8 @@ _TOP_LEVEL_KEYS = frozenset({
 
 @dataclass(frozen=True, slots=True)
 class ProviderDeclaration:
-    """`providers:` 里的一条 —— 只声明"用哪个适配器"，连接信息在 llm.yaml。"""
+    """`providers:` 里的一条 —— 只声明"用哪个适配器"，连接信息在
+    providers.yaml 的 llm 段。"""
 
     name: str
 
@@ -284,7 +285,7 @@ def build_model_registry(
         接入自研网关时在这里加一项，**不用改**目录格式。
     credentials
         凭据解析器。默认按目录里的 `credentials:` 建一个环境变量解析器
-        （缺变量时回落到 llm.yaml 里 provider 自己的凭据）。
+        （缺变量时回落到 providers.yaml 的 llm 段里 provider 自己的凭据）。
     """
 
     resolved = catalog or load_model_catalog(path)

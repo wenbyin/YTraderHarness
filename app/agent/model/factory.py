@@ -482,7 +482,7 @@ class ModelClientFactory:
         解析凭据引用。
 
         没有 ref（绝大多数模型）时**什么都不做**：让 provider 用它自己
-        配置里的凭据（app/common/llm.yaml）。这就是"不重复造配置系统"
+        配置里的凭据（providers.yaml 的 llm 段）。这就是"不重复造配置系统"
         的实际含义 —— 默认路径上本模块不认识任何密钥。
         """
 
