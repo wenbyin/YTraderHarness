@@ -277,6 +277,28 @@ class FakeDefinitionRepository:
         return count
 
 
+class FakeDefinitionStateRepository:
+    """内存版运行期开关：集合里有 key = 显式禁用。"""
+
+    def __init__(self):
+        self.disabled: set[str] = set()
+
+    async def list_disabled_keys(self):
+        return set(self.disabled)
+
+    async def disabled_keys_for(self, tool_keys):
+        return self.disabled & set(tool_keys)
+
+    async def disable(self, tool_key, *, disabled_by, now):
+        self.disabled.add(tool_key)
+        return None
+
+    async def enable(self, tool_key):
+        existed = tool_key in self.disabled
+        self.disabled.discard(tool_key)
+        return existed
+
+
 class FakeDocumentationRepository:
     def __init__(self):
         self.docs: dict[UUID, dict] = {}
@@ -599,6 +621,7 @@ async def main() -> int:
     # 全局扫描本身另有用例覆盖（见本文件末尾的"全局扫描"一节）。
     discoverer = ToolDiscoverer([_OwnToolsScanner(registry)])
     definitions = FakeDefinitionRepository()
+    definition_states = FakeDefinitionStateRepository()
     documentations = FakeDocumentationRepository()
 
     # 一份假数据同时喂给两个契约：能力树本体（capability 模块）与
@@ -612,6 +635,7 @@ async def main() -> int:
     )
     query = ToolQueryServiceImpl(
         tool_definition_repository=definitions,
+        tool_definition_state_repository=definition_states,
         tool_documentation_repository=documentations,
         tool_classification_repository=store,
     )

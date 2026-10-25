@@ -24,6 +24,8 @@ from .enum import SourceState, SourceType
 __all__ = [
     "PagedToolSummaryResponse",
     "ToolDefinitionDetail",
+    "ToolEnabledState",
+    "ToolEnabledUpdate",
     "ToolManifest",
     "ToolSummary",
 ]
@@ -120,6 +122,13 @@ class ToolSummary(APIModel):
 
     source_state: SourceState = Field(description="代码侧状态。")
 
+    enabled: bool = Field(
+        description=(
+            "运行期开关。false = 被人工显式禁用（"
+            "tool_definition_state 里有行），下一轮工具解析会跳过它。"
+        ),
+    )
+
     description: str | None = Field(
         default=None,
         description=(
@@ -139,6 +148,13 @@ class ToolSummary(APIModel):
 class ToolDefinitionDetail(APIModel):
     """详情页：事实 + 人工说明 + 能力，一次给全。"""
 
+    enabled: bool = Field(
+        description=(
+            "运行期开关。与 manifest 分开：manifest 只装代码侧事实，"
+            "这个字段来自 tool_definition_state（有行 = 禁用）。"
+        ),
+    )
+
     manifest: ToolManifest = Field(
         description="代码侧事实。",
     )
@@ -151,6 +167,25 @@ class ToolDefinitionDetail(APIModel):
         default_factory=list,
         description="已关联的能力。",
     )
+
+
+class ToolEnabledUpdate(APIModel):
+    """PATCH /tools/{tool_id}/enabled 的请求体。"""
+
+    enabled: bool = Field(
+        description=(
+            "true = 恢复启用（删除禁用行）；"
+            "false = 显式禁用（写入/刷新禁用行）。"
+        ),
+    )
+
+
+class ToolEnabledState(APIModel):
+    """写入后的开关状态。"""
+
+    tool_key: str = Field(description="稳定业务标识。")
+
+    enabled: bool = Field(description="true = 启用；false = 显式禁用。")
 
 
 class PagedToolSummaryResponse(APIModel):

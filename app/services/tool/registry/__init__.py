@@ -9,6 +9,7 @@ Tool 自注册与发现。
     docstring.py    docstring 切段（纯函数，两条来源共用）
     spec.py         两个数据结构
     selection.py    按 key 选工具（纯函数）—— "哪些工具能用"的唯一判定
+    state.py        显式禁用的进程内快照（只装 DB 状态，不碰代码注册表）
 
     processor_registry.py
                     处理器实现的注册表（反射发现，与上面几个无关 ——
@@ -52,10 +53,12 @@ from .schema import (
 )
 from .selection import select_specs, tool_key_of, wire_name
 from .spec import ToolManifestData, ToolSpec
+from .state import DisabledToolCache, get_disabled_tool_cache
 
 __all__ = [
     "PROCESSOR_PACKAGES",
     "TOOL_SOURCE_PACKAGES",
+    "DisabledToolCache",
     "InjectedArg",
     "LangchainToolScanner",
     "MCPToolScanner",
@@ -68,6 +71,7 @@ __all__ = [
     "ToolScanner",
     "ToolSpec",
     "extract_parameter_descriptions",
+    "get_disabled_tool_cache",
     "get_processor_registry",
     "get_tool_registry",
     "inject_tool_args",

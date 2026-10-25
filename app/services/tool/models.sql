@@ -43,6 +43,25 @@ CREATE INDEX idx_tool_definition_source_state
     ON tool_definition(source_state);
 
 
+-- ============================================================
+-- 运行时开关：有行 = 显式禁用，无行 = 启用
+--
+-- ⚠️ **没有** enabled 列：插入即禁用，删除即恢复。"只过滤显式
+--    声明禁用"因此是表结构本身保证的。
+--
+-- ⚠️ **没有**外键：remove_missing=true 会物理删除 tool_definition
+--    的行；ON DELETE CASCADE 会让一次同步悄悄清掉人工设的禁用。
+--    键是稳定的 tool_key，同名工具回来时仍保持禁用（fail-closed）。
+--    代价是可能留下指向 MISSING / 已删工具的孤儿行。
+-- ============================================================
+
+CREATE TABLE tool_definition_state (
+    tool_key       VARCHAR(255) PRIMARY KEY,
+    disabled_by    VARCHAR(255),
+    disabled_at    TIMESTAMPTZ NOT NULL
+);
+
+
 CREATE TABLE tool_documentation (
     tool_id                     UUID PRIMARY KEY
                                 REFERENCES tool_definition(id)

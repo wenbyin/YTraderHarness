@@ -73,8 +73,12 @@ class ToolDocumentation(BaseModel):
     """
     一个 Tool 的人工说明覆盖。
 
-    这张表是**唯一**允许人写的地方 —— definition 归代码
+    说明文字这一侧**唯一**允许人写的地方 —— definition 归代码
     （见 tool_definition.py 的说明），同步不会碰这里。
+
+    运行期开关（禁用 / 启用）是另一件事，住在
+    tool_definition_state；那边同样是人工写、同步不碰，但语义不同：
+    它不属于"说明"。
     """
 
     model_config = ConfigDict(

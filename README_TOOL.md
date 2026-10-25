@@ -194,6 +194,7 @@ app/infra/agent/
 | 资源 | 端点 |
 |---|---|
 | 工具查询 / 文档覆盖 | `GET /tools`、`GET /tools/{id}`、`PUT /tools/{id}/documentation` |
+| 运行期开关 | `PATCH /tools/{id}/enabled`（`{enabled: false}` = 显式禁用） |
 | 处理器链 | `GET /tools/{id}/processors`、`POST`、`PATCH …/{processor_id}`、`DELETE`、`PUT …/processors`、`PUT …/processors/order` |
 | 工具 ↔ 能力 | `PUT /tools/{id}/classifications`（**整体替换**） |
 | 发现同步 | `POST /tools/discovery/sync` → create / update / unchanged / missing |
@@ -205,6 +206,17 @@ app/infra/agent/
 
 - ✅ **能**发现**新加的**工具（模块从未被 import，扫描器会 import 它）
 - ❌ **不能**拾取对**已 import 模块**的代码修改 —— Python 不会重新执行已加载的模块。**改代码仍然要重启。**
+
+### 运行期禁用
+
+- 持久层是 `tool_definition_state`：**有行 = 禁用，无行 = 启用**（没有 `enabled` 列）。
+- 只影响**下一轮**工具解析：主 agent、planner、skill/subagent 共用
+  `ToolQueryService.tool_keys_for_capabilities`，过滤只发生在这一处；
+  正在跑的这一轮不受影响。
+- 同步按 `tool_key` **原地更新**同一行，不会重置开关；工具暂时
+  `MISSING` 再回来也仍然处于禁用状态（`remove_missing` 也不会级联删它）。
+- 进程内快照在写事务**提交后**失效，下一次解析才重新查库。
+  `--instances N` 是 N 个独立进程，其他进程要等到重启才有新值。
 
 > ⚠️ 新增业务路由必须注册到 `protected_router`，且**注册顺序有约束**，不满足会静默匹配错。
 > 详见 `app/api/v1/router.py` 的模块注释。
