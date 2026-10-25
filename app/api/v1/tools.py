@@ -32,6 +32,9 @@ from app.services.dependencies import Service
 from app.services.tool.application.tool_classification_service import (
     ToolClassificationService,
 )
+from app.services.tool.application.tool_definition_state_service import (
+    ToolDefinitionStateService,
+)
 from app.services.tool.application.tool_discovery_service import (
     ToolDiscoveryService,
 )
@@ -49,6 +52,8 @@ from app.services.tool.domain.schemas import (
     ToolDefinitionDetail,
     ToolDocumentation,
     ToolDocumentationUpdate,
+    ToolEnabledState,
+    ToolEnabledUpdate,
     ToolSyncRequest,
     ToolSyncResult,
 )
@@ -161,6 +166,41 @@ async def get_tool(
 
     try:
         return await service.get_tool(tool_id)
+
+    except ValueError as exc:
+        raise to_http_error(exc) from exc
+
+
+# ============================================================
+# Tool Runtime State
+# ============================================================
+
+
+@router.patch(
+    "/tools/{tool_id}/enabled",
+    response_model=ToolEnabledState,
+    tags=["Tools"],
+)
+async def set_tool_enabled(
+        tool_id: UUID,
+        request: ToolEnabledUpdate,
+        service: ToolDefinitionStateService = Service[
+            ToolDefinitionStateService
+        ],
+):
+    """
+    显式禁用 / 恢复启用一个工具。
+
+    **禁用是对下一轮生效**：该工具不再进入下一次工具解析（主 agent /
+    planner / skill 共用同一条路）；正在跑的这一轮不受影响。
+
+    持久层语义是"有行 = 禁用"：enabled=false 写入（或刷新）一行，
+    enabled=true 删除那一行。同步不会碰这张表，所以代码变更不会
+    把开关冲掉 —— 只有这个接口能改。
+    """
+
+    try:
+        return await service.set_enabled(tool_id, request.enabled)
 
     except ValueError as exc:
         raise to_http_error(exc) from exc

@@ -6,7 +6,8 @@ Tool 模块的持久化契约与实现。
 （契约的子类，或同包同名的 X_impl.py）。
 
 ⚠️ 能力树（taxonomy）的仓储不在这里 —— 它是
-app/services/capability/repository/。本模块只有工具自己的四张表
+app/services/capability/repository/。本模块只有工具自己的表
+（definition / state / documentation / execution / processor）
 加上 tool ↔ capability 的关联表。
 """
 
@@ -16,6 +17,10 @@ from .tool_classification_impl import (
 )
 from .tool_definition import ToolDefinitionRepository
 from .tool_definition_impl import ToolDefinitionRepositoryImpl
+from .tool_definition_state import ToolDefinitionStateRepository
+from .tool_definition_state_impl import (
+    ToolDefinitionStateRepositoryImpl,
+)
 from .tool_documentation import ToolDocumentationRepository
 from .tool_documentation_impl import (
     ToolDocumentationRepositoryImpl,
@@ -30,6 +35,8 @@ __all__ = [
     "ToolClassificationRepositoryImpl",
     "ToolDefinitionRepository",
     "ToolDefinitionRepositoryImpl",
+    "ToolDefinitionStateRepository",
+    "ToolDefinitionStateRepositoryImpl",
     "ToolDocumentationRepository",
     "ToolDocumentationRepositoryImpl",
     "ToolExecutionRepository",

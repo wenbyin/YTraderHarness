@@ -25,6 +25,12 @@ from .tool_classification_service import ToolClassificationService
 from .tool_classification_service_impl import (
     ToolClassificationServiceImpl,
 )
+from .tool_definition_state_service import (
+    ToolDefinitionStateService,
+)
+from .tool_definition_state_service_impl import (
+    ToolDefinitionStateServiceImpl,
+)
 from .tool_discovery_service import ToolDiscoveryService
 from .tool_discovery_service_impl import ToolDiscoveryServiceImpl
 from .tool_documentation_service import ToolDocumentationService
@@ -45,6 +51,8 @@ __all__ = [
     "ProcessorDefinitionServiceImpl",
     "ToolClassificationService",
     "ToolClassificationServiceImpl",
+    "ToolDefinitionStateService",
+    "ToolDefinitionStateServiceImpl",
     "ToolDiscoveryService",
     "ToolDiscoveryServiceImpl",
     "ToolDocumentationService",

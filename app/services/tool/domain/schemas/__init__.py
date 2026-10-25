@@ -8,6 +8,7 @@ domain/schemas/
 │
 ├── tool.py
 │   └── ToolManifest / ToolSummary / ToolDefinitionDetail /
+│       ToolEnabledUpdate / ToolEnabledState /
 │       PagedToolSummaryResponse
 │
 ├── documentation.py
@@ -77,6 +78,8 @@ from .processor import (
 from .tool import (
     PagedToolSummaryResponse,
     ToolDefinitionDetail,
+    ToolEnabledState,
+    ToolEnabledUpdate,
     ToolManifest,
     ToolSummary,
 )
@@ -108,6 +111,8 @@ __all__ = [
     "ToolClassificationUpdate",
     "ToolDefinitionDetail",
     "ToolDocumentation",
+    "ToolEnabledState",
+    "ToolEnabledUpdate",
     "ToolDocumentationUpdate",
     "ToolManifest",
     "ToolProcessor",

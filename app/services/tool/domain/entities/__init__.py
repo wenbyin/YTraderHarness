@@ -7,6 +7,7 @@ app/services/capability/domain/entities/。本模块只在需要嵌一份
 """
 
 from .tool_definition import ToolDefinition
+from .tool_definition_state import ToolDefinitionState
 from .tool_documentation import (
     ParameterDocumentation,
     ToolDocumentation,
@@ -17,6 +18,7 @@ from .tool_processor import ToolProcessor
 __all__ = [
     "ParameterDocumentation",
     "ToolDefinition",
+    "ToolDefinitionState",
     "ToolDocumentation",
     "ToolExecution",
     "ToolProcessor",

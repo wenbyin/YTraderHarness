@@ -7,6 +7,7 @@ ToolQueryService 的默认实现。
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from uuid import UUID
 
@@ -19,15 +20,21 @@ from ..domain.schemas import (
     SourceType,
     ToolDefinitionDetail,
 )
+from ..registry.state import get_disabled_tool_cache
 from ..repository.tool_classification import (
     ToolClassificationRepository,
 )
 from ..repository.tool_definition import ToolDefinitionRepository
+from ..repository.tool_definition_state import (
+    ToolDefinitionStateRepository,
+)
 from ..repository.tool_documentation import (
     ToolDocumentationRepository,
 )
 from ._assembly import build_definition_detail, build_summary
 from .tool_query_service import ToolQueryService
+
+logger = logging.getLogger(__name__)
 
 
 class ToolQueryServiceImpl(ToolQueryService):
@@ -36,6 +43,9 @@ class ToolQueryServiceImpl(ToolQueryService):
             self,
             *,
             tool_definition_repository: ToolDefinitionRepository,
+            tool_definition_state_repository: (
+                ToolDefinitionStateRepository
+            ),
             tool_documentation_repository: (
                 ToolDocumentationRepository
             ),
@@ -47,6 +57,7 @@ class ToolQueryServiceImpl(ToolQueryService):
         super().__init__(ctx)
 
         self._definitions = tool_definition_repository
+        self._states = tool_definition_state_repository
         self._documentations = tool_documentation_repository
         self._classifications = tool_classification_repository
 
@@ -80,6 +91,13 @@ class ToolQueryServiceImpl(ToolQueryService):
 
         tool_ids = [d.tool_id for d in definitions]
 
+        # 管理页读**库里的当前值**，不读进程内快照：列表页是给人看
+        # 开关状态的，多实例下别的进程刚改过，读快照会显示旧值。
+        # 只查这一页的 key，不多一次全表扫描。
+        disabled = await self._states.disabled_keys_for(
+            [d.tool_key for d in definitions]
+        )
+
         # 两个批量查询，而不是在循环里逐个取 ——
         # 一页 20 条时那是 40 次多余的往返（经典的 N+1）。
         overrides = (
@@ -101,6 +119,7 @@ class ToolQueryServiceImpl(ToolQueryService):
                 classifications=classification_map.get(
                     definition.tool_id, []
                 ),
+                enabled=definition.tool_key not in disabled,
             )
             for definition in definitions
         ]
@@ -132,10 +151,15 @@ class ToolQueryServiceImpl(ToolQueryService):
             await self._classifications.list_for_tool(tool_id)
         )
 
+        disabled = await self._states.disabled_keys_for(
+            [definition.tool_key]
+        )
+
         return build_definition_detail(
             definition,
             stored,
             classifications,
+            enabled=definition.tool_key not in disabled,
         )
 
     # ========================================================
@@ -156,7 +180,55 @@ class ToolQueryServiceImpl(ToolQueryService):
         # 仓储已经按 tool_key 排序，但**组装层不该依赖别人的排序**
         # （与 _assembly.build_chain 同一条规矩）：这里少去重一次，
         # 将来任何一条换掉的查询都会静默把重复的 key 交给模型。
-        return list(dict.fromkeys(d.tool_key for d in definitions))
+        keys = list(dict.fromkeys(d.tool_key for d in definitions))
+
+        # 运行期开关。这是"哪些工具能给模型看 / 允许执行"这条路的
+        # **唯一** DB -> key 解析点；filter 在这里，主 agent、planner、
+        # skill/subagent 三条路同时生效，而 select_specs 不必知道 DB。
+        disabled = await self._ensure_disabled_keys()
+
+        hidden = [key for key in keys if key in disabled]
+
+        if hidden:
+            # 跳过要留痕：与 select_specs 的"注册表里找不到"同一条立场。
+            logger.warning(
+                "以下工具被显式禁用，本次不暴露：%s",
+                "、".join(hidden),
+            )
+
+        return [key for key in keys if key not in disabled]
+
+    async def _ensure_disabled_keys(self) -> frozenset[str]:
+        """
+        取禁用快照；进程内第一次（或失效后第一次）才查库。
+
+        并发下两个请求可能同时看到"未加载"并各查一次 —— 结果相同，
+        不值得为此加锁。
+
+        ⚠️ 加载期间写路径可能提交并 invalidate。用代际号挡住写回：
+        读到的是旧值就不落盘，重读一次。连续被打断极少，上限 3 次后
+        直接使用最后一次读到的最新值。
+        """
+
+        cache = get_disabled_tool_cache()
+
+        if cache.loaded:
+            return cache.disabled_keys()
+
+        latest: frozenset[str] = frozenset()
+
+        for _ in range(3):
+
+            generation = cache.generation
+
+            latest = frozenset(
+                await self._states.list_disabled_keys()
+            )
+
+            if cache.replace(latest, generation=generation):
+                return latest
+
+        return latest
 
     async def tool_ids_for_keys(
             self,

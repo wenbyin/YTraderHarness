@@ -124,6 +124,35 @@ paths:
           $ref: '#/components/responses/NotFound'
 
 
+  /tools/{tool_id}/enabled:
+    patch:
+      tags:
+        - Tools
+      summary: Enable or disable a tool at runtime
+      operationId: setToolEnabled
+
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolEnabledUpdate'
+
+      responses:
+        '200':
+          description: Updated runtime state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolEnabledState'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
   /tools/discovery/sync:
     post:
       tags:
@@ -514,6 +543,33 @@ components:
             format: uuid
 
 
+    ToolEnabledUpdate:
+      type: object
+      required:
+        - enabled
+      properties:
+        enabled:
+          type: boolean
+          description: >
+            true = restore (delete the disabled row);
+            false = explicitly disable (write/refresh the disabled row).
+
+
+    ToolEnabledState:
+      type: object
+      required:
+        - tool_key
+        - enabled
+      properties:
+        tool_key:
+          type: string
+          readOnly: true
+
+        enabled:
+          type: boolean
+          readOnly: true
+
+
     ToolSummary:
       type: object
       required:
@@ -522,6 +578,7 @@ components:
         - name
         - source_type
         - source_state
+        - enabled
       properties:
         id:
           type: string
@@ -542,6 +599,14 @@ components:
             - ACTIVE
             - MISSING
 
+        enabled:
+          type: boolean
+          readOnly: true
+          description: >
+            Runtime switch. false = explicitly disabled via
+            PATCH /tools/{tool_id}/enabled; such a tool is skipped by
+            the next tool resolution. Not part of the code-side manifest.
+
         description:
           type: string
           nullable: true
@@ -557,10 +622,18 @@ components:
     ToolDefinitionDetail:
       type: object
       required:
+        - enabled
         - manifest
         - documentation
         - classifications
       properties:
+        enabled:
+          type: boolean
+          readOnly: true
+          description: >
+            Runtime switch. Kept outside `manifest` because the manifest
+            is code-side fact; this flag comes from tool_definition_state.
+
         manifest:
           $ref: '#/components/schemas/ToolManifest'
 

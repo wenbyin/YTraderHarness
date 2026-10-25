@@ -174,12 +174,16 @@ def build_summary(
         *,
         description_override: str | None,
         classifications: list[Capability],
+        enabled: bool,
 ) -> ToolSummary:
     """
     列表项。
 
     description 用**生效值**而不是原始 docstring —— 人在列表页
     看到的应该与他配置的一致，否则会以为改动没保存。
+
+    enabled 来自 `tool_definition_state`（由服务层批量查出来），
+    不来自 definition —— 它是运行期开关，不是代码侧事实。
     """
 
     source_raw = (definition.source_docstring or {}).get("raw")
@@ -190,6 +194,7 @@ def build_summary(
         name=definition.name,
         source_type=definition.source_type,
         source_state=definition.source_state,
+        enabled=enabled,
         description=description_override or source_raw,
         classifications=[
             build_capability(item) for item in classifications
@@ -201,10 +206,18 @@ def build_definition_detail(
         definition: ToolDefinition,
         stored: ToolDocumentationEntity | None,
         classifications: list[Capability],
+        *,
+        enabled: bool,
 ) -> ToolDefinitionDetail:
-    """详情：事实 + 说明 + 能力，一次组装完。"""
+    """
+    详情：事实 + 说明 + 能力，一次组装完。
+
+    enabled 放在顶层而不是塞进 manifest：manifest 的契约是"代码侧
+    事实"，把人工开关放进去会让"这一份能否由同步覆盖"变得含糊。
+    """
 
     return ToolDefinitionDetail(
+        enabled=enabled,
         manifest=build_manifest(definition),
         documentation=build_documentation(definition, stored),
         classifications=[

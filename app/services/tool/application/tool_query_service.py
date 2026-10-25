@@ -89,7 +89,13 @@ class ToolQueryService(BaseService):
             codes: list[str],
     ) -> list[str]:
         """
-        能力 code 列表 -> 挂在它们下面的 ACTIVE 工具的 tool_key。
+        能力 code 列表 -> 挂在它们下面的 ACTIVE、且**未被显式禁用**的
+        工具的 tool_key。
+
+        "禁用"指 `tool_definition_state` 里有行。这是运行期开关：
+        有行就跳过，无行才是启用。过滤发生在**这一处**，因此主 agent、
+        planner、skill/subagent 三条解析路径同时生效；下游的
+        `select_specs` 仍然只读代码注册表，不需要知道数据库。
 
         去重且保序（按 tool_key 排序，与仓储的 order_by 一致）——
         同一个工具挂多个能力时只出现一次；调用方直接把它当

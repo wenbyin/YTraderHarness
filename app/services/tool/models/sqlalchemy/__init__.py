@@ -18,6 +18,7 @@ Capability，因此 app/infra/datasource/initializer.py 必须把两个
 
 from .tool_classification import ToolDefinitionClassification
 from .tool_definition import ToolDefinition
+from .tool_definition_state import ToolDefinitionState
 from .tool_documentation import ToolDocumentation
 from .tool_execution import ToolExecution
 from .tool_parameter_documentation import (
@@ -28,6 +29,7 @@ from .tool_processor import ToolProcessor
 __all__ = [
     "ToolDefinition",
     "ToolDefinitionClassification",
+    "ToolDefinitionState",
     "ToolDocumentation",
     "ToolExecution",
     "ToolParameterDocumentation",
