@@ -10,6 +10,7 @@ __pycache__/
 /app/config/web.yaml
 /app/config/mcp.yaml
 /app/config/casdoor.yaml
+/app/config/providers.yaml
 /app/config/cert.pem
 /milvus_flush_probe.py
 /todolist

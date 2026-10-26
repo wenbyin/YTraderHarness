@@ -1,0 +1,159 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 1020" width="1240" height="1020" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Microsoft YaHei', sans-serif">
+  <rect width="1240" height="1020" fill="#ffffff" rx="12" stroke="#e2e8f0" stroke-width="1"/>
+  <defs>
+    <marker id="ah" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#94a3b8"/>
+    </marker>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#e2e8f0" stroke-width="0.5"/>
+    </pattern>
+  </defs>
+  <rect width="100%" height="100%" fill="url(#grid)" rx="12"/>
+  <text x="28" y="38" fill="#0f172a" font-size="16" font-weight="700">Document Ingesting · 入库流水线</text>
+  <text x="28" y="58" fill="#64748b" font-size="10" text-anchor="start">YTrader Harness · document_ingestion_pipeline v1.0.0 — 6 段线性（每版本一次） → 4 段扇出（每 retrieval 一路） → 1 次扇入汇总</text>
+  <line x1="346" y1="145" x2="376" y2="145" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="626" y1="145" x2="656" y2="145" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="906" y1="145" x2="936" y2="145" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <path d="M 1061 178 V 206 H 176 V 256" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <text x="620" y="200" fill="#64748b" font-size="9" text-anchor="middle">事务提交后由后台任务跑图（已脱离请求事务）</text>
+  <line x1="256" y1="296" x2="282" y2="296" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="442" y1="296" x2="468" y2="296" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="628" y1="296" x2="654" y2="296" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="814" y1="296" x2="840" y2="296" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="1000" y1="296" x2="1026" y2="296" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <path d="M 1106 332 V 372 H 115 V 430" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <text x="700" y="364" fill="#64748b" font-size="9" text-anchor="middle">Send × N — 按 retrieval 逐个发，每路一份 payload</text>
+  <line x1="356" y1="486" x2="378" y2="486" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="398" y1="486" x2="420" y2="486" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="630" y1="486" x2="652" y2="486" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="672" y1="486" x2="694" y2="486" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="904" y1="486" x2="926" y2="486" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="946" y1="486" x2="968" y2="486" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <path d="M 640 668 V 690 H 221 V 712" fill="none" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <text x="450" y="683" fill="#64748b" font-size="9" text-anchor="middle">扇入：等所有分支汇合后只跑一次</text>
+  <line x1="346" y1="754" x2="376" y2="754" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="626" y1="754" x2="656" y2="754" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <line x1="906" y1="754" x2="936" y2="754" stroke="#94a3b8" stroke-width="1.5" marker-end="url(#ah)"/>
+  <rect x="20" y="96" width="44" height="118" rx="10" fill="#f1ebff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="42" y="155" fill="#0f172a" font-size="12.5" font-weight="700" text-anchor="middle" style="writing-mode:vertical-rl;text-orientation:upright;letter-spacing:3px">① 触发</text>
+  <rect x="20" y="244" width="44" height="118" rx="10" fill="#dcf7fb" stroke="#0e7490" stroke-width="1.5"/>
+  <text x="42" y="303" fill="#0f172a" font-size="12.5" font-weight="700" text-anchor="middle" style="writing-mode:vertical-rl;text-orientation:upright;letter-spacing:3px">② 线性</text>
+  <rect x="20" y="392" width="44" height="276" rx="10" fill="#ddf8ed" stroke="#047857" stroke-width="1.5"/>
+  <text x="42" y="530" fill="#0f172a" font-size="12.5" font-weight="700" text-anchor="middle" style="writing-mode:vertical-rl;text-orientation:upright;letter-spacing:3px">③ 扇出</text>
+  <rect x="20" y="700" width="44" height="120" rx="10" fill="#fdf3dd" stroke="#b45309" stroke-width="1.5"/>
+  <text x="42" y="760" fill="#0f172a" font-size="12.5" font-weight="700" text-anchor="middle" style="writing-mode:vertical-rl;text-orientation:upright;letter-spacing:3px">④ 扇入</text>
+  <rect x="96" y="112" width="250" height="66" rx="8" fill="#f1ebff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="221" y="139" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">创建文档</text>
+  <text x="221" y="157" fill="#64748b" font-size="10.5" text-anchor="middle">校验类型 · 文件 · 唯一键</text>
+  <text x="337" y="170" fill="#7c3aed" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">API</text>
+  <rect x="376" y="112" width="250" height="66" rx="8" fill="#f1ebff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="501" y="139" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">冻结配置快照</text>
+  <text x="501" y="157" fill="#64748b" font-size="10.5" text-anchor="middle">pipeline_config → meta_data</text>
+  <text x="617" y="170" fill="#7c3aed" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">SNAPSHOT</text>
+  <rect x="656" y="112" width="250" height="66" rx="8" fill="#f1ebff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="781" y="139" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">post_commit 派发</text>
+  <text x="781" y="157" fill="#64748b" font-size="10.5" text-anchor="middle">事务提交后才投递</text>
+  <text x="897" y="170" fill="#7c3aed" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">DISPATCH</text>
+  <rect x="936" y="112" width="250" height="66" rx="8" fill="#f1ebff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="1061" y="139" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">GraphRunner 起跑</text>
+  <text x="1061" y="157" fill="#64748b" font-size="10.5" text-anchor="middle">读 state，建 RunSnapshot</text>
+  <text x="1177" y="170" fill="#7c3aed" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">RUNNER</text>
+  <rect x="96" y="260" width="160" height="72" rx="8" fill="#dcf7fb" stroke="#0e7490" stroke-width="1.5"/>
+  <text x="176" y="287" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">① 接入文件</text>
+  <text x="176" y="305" fill="#64748b" font-size="10.5" text-anchor="middle">引用源 File，不复制</text>
+  <text x="247" y="324" fill="#0e7490" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">INGESTION</text>
+  <rect x="282" y="260" width="160" height="72" rx="8" fill="#dcf7fb" stroke="#0e7490" stroke-width="1.5"/>
+  <text x="362" y="287" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">② 格式识别</text>
+  <text x="362" y="305" fill="#64748b" font-size="10.5" text-anchor="middle">后缀 / MIME 选解析器</text>
+  <text x="433" y="324" fill="#0e7490" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">FORMAT</text>
+  <rect x="468" y="260" width="160" height="72" rx="8" fill="#dcf7fb" stroke="#0e7490" stroke-width="1.5"/>
+  <text x="548" y="287" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">③ 解析</text>
+  <text x="548" y="305" fill="#64748b" font-size="10.5" text-anchor="middle">bytes → 纯文本</text>
+  <text x="619" y="324" fill="#0e7490" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">PARSING</text>
+  <rect x="654" y="260" width="160" height="72" rx="8" fill="#dcf7fb" stroke="#0e7490" stroke-width="1.5"/>
+  <text x="734" y="287" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">④ 归一化</text>
+  <text x="734" y="305" fill="#64748b" font-size="10.5" text-anchor="middle">编码 · 换行 · 空白</text>
+  <text x="805" y="324" fill="#0e7490" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">NORMALIZE</text>
+  <rect x="840" y="260" width="160" height="72" rx="8" fill="#dcf7fb" stroke="#0e7490" stroke-width="1.5"/>
+  <text x="920" y="287" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">⑤ 清洗</text>
+  <text x="920" y="305" fill="#64748b" font-size="10.5" text-anchor="middle">去页眉页脚 · 水印</text>
+  <text x="991" y="324" fill="#0e7490" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">CLEAN</text>
+  <rect x="1026" y="260" width="160" height="72" rx="8" fill="#dcf7fb" stroke="#0e7490" stroke-width="1.5"/>
+  <text x="1106" y="287" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">⑥ 元数据抽取</text>
+  <text x="1106" y="305" fill="#64748b" font-size="10.5" text-anchor="middle">定扇出计划 branches</text>
+  <text x="1177" y="324" fill="#0e7490" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">METADATA</text>
+  <rect x="92" y="392" width="1100" height="276" rx="12" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="7 5"/>
+  <text x="146" y="420" fill="#334155" font-size="11" text-anchor="start" font-weight="600">扇出区 · 每路一份 BranchInput（只含 branch 配置 + 上游 ref，看不到父状态）</text>
+  <rect x="104" y="434" width="24" height="96" rx="10" fill="#ddf8ed" stroke="#047857" stroke-width="1.5"/>
+  <text x="116" y="482" fill="#0f172a" font-size="12.5" font-weight="700" text-anchor="middle" style="writing-mode:vertical-rl;text-orientation:upright;letter-spacing:3px">N 路</text>
+  <rect x="146" y="446" width="210" height="80" rx="8" fill="#ddf8ed" stroke="#047857" stroke-width="1.5"/>
+  <text x="251" y="473" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">⑦ 切分</text>
+  <text x="251" y="491" fill="#64748b" font-size="10.5" text-anchor="middle">同 chunker 只切一次</text>
+  <text x="347" y="518" fill="#047857" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">CHUNKING</text>
+  <rect x="420" y="446" width="210" height="80" rx="8" fill="#ddf8ed" stroke="#047857" stroke-width="1.5"/>
+  <text x="525" y="473" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">⑧ 切分增强</text>
+  <text x="525" y="491" fill="#64748b" font-size="10.5" text-anchor="middle">补 locator · 继承元数据</text>
+  <text x="621" y="518" fill="#047857" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">ENRICH</text>
+  <rect x="694" y="446" width="210" height="80" rx="8" fill="#ddf8ed" stroke="#047857" stroke-width="1.5"/>
+  <text x="799" y="473" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">⑨ 向量化</text>
+  <text x="799" y="491" fill="#64748b" font-size="10.5" text-anchor="middle">dense / sparse / graph</text>
+  <text x="895" y="518" fill="#047857" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">EMBEDDING</text>
+  <rect x="968" y="446" width="210" height="80" rx="8" fill="#ddf8ed" stroke="#047857" stroke-width="1.5"/>
+  <text x="1073" y="473" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">⑩ 写入索引</text>
+  <text x="1073" y="491" fill="#64748b" font-size="10.5" text-anchor="middle">按类型写 ES / Milvus / PG</text>
+  <text x="1169" y="518" fill="#047857" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">INDEXING</text>
+  <circle cx="388" cy="486" r="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="3 2"/>
+  <text x="388" y="489.6" fill="#64748b" font-size="9.5" text-anchor="middle">N</text>
+  <circle cx="662" cy="486" r="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="3 2"/>
+  <text x="662" y="489.6" fill="#64748b" font-size="9.5" text-anchor="middle">N</text>
+  <circle cx="936" cy="486" r="10" fill="#ffffff" stroke="#94a3b8" stroke-width="1.4" stroke-dasharray="3 2"/>
+  <text x="936" y="489.6" fill="#64748b" font-size="9.5" text-anchor="middle">N</text>
+  <text x="118" y="556" fill="#334155" font-size="10.3" text-anchor="start">· 扇出计划在 ⑥ 一次定下：版本绑定 processor → 只跑它关联的 retrieval；未绑定 → 该类型全部 active retrieval</text>
+  <text x="118" y="578" fill="#334155" font-size="10.3" text-anchor="start">· 分支产物不留在本地：写回父状态 chunk_refs / enrich_refs / vector_refs（键 = chunker_digest 或 retrieval_id），下一道屏障再取回注入 upstream_ref</text>
+  <text x="118" y="600" fill="#334155" font-size="10.3" text-anchor="start">· 屏障 _after_chunking / _after_chunk_enrichment / _after_embedding 不在 NODE_SPECS、不埋点，只在 super-step 边界等齐再发下一批 Send</text>
+  <text x="118" y="622" fill="#334155" font-size="10.3" text-anchor="start">· ⑩ 按 retrieval_type 定容器：document 已在 ⑦ 落库（不重写）· keyword / sparse → ES · dense → Milvus</text>
+  <rect x="91" y="711" width="260" height="86" rx="10" fill="#ddf8ed" stroke="#047857" stroke-width="1" opacity="0.55"/>
+  <rect x="96" y="716" width="250" height="76" rx="9" fill="#ddf8ed" stroke="#047857" stroke-width="2"/>
+  <text x="221" y="743" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">⤓ 汇总落盘</text>
+  <text x="221" y="761" fill="#64748b" font-size="10.5" text-anchor="middle">扇入后只跑一次</text>
+  <text x="337" y="784" fill="#047857" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">FINALIZE</text>
+  <rect x="376" y="716" width="250" height="76" rx="8" fill="#fdf3dd" stroke="#b45309" stroke-width="1.5"/>
+  <text x="501" y="743" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">版本 × Retrieval 绑定</text>
+  <text x="501" y="761" fill="#64748b" font-size="10.5" text-anchor="middle">每对一行，upsert</text>
+  <text x="617" y="784" fill="#b45309" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">BINDING</text>
+  <rect x="656" y="716" width="250" height="76" rx="8" fill="#ffe4e8" stroke="#be123c" stroke-width="1.5"/>
+  <text x="781" y="743" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">processing_status</text>
+  <text x="781" y="761" fill="#64748b" font-size="10.5" text-anchor="middle">partial → 业务 failed</text>
+  <text x="897" y="784" fill="#be123c" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">STATUS</text>
+  <rect x="936" y="716" width="250" height="76" rx="8" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="1061" y="743" fill="#0f172a" font-size="13" font-weight="600" text-anchor="middle">进入查询期</text>
+  <text x="1061" y="761" fill="#64748b" font-size="10.5" text-anchor="middle">retrieve · 评测消费</text>
+  <text x="1177" y="784" fill="#94a3b8" font-size="7" text-anchor="end" letter-spacing="0.8" opacity="0.92">OUT OF GRAPH</text>
+  <text x="96" y="824" fill="#334155" font-size="10" text-anchor="start" font-weight="600">三条实现约束（决定这条链能跑多大、错在哪）</text>
+  <rect x="96" y="852" width="330" height="86" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="112" y="878" fill="#0f172a" font-size="12" font-weight="600">正文不进 state</text>
+  <text x="112" y="900" fill="#475569" font-size="9.8" text-anchor="start">只放 ArtifactRef：file_id + 截断 preview</text>
+  <text x="112" y="919" fill="#475569" font-size="9.8" text-anchor="start">432 KB 文档 → state ≈ 8 KB（塞正文则 4.8 MB）</text>
+  <rect x="468" y="852" width="330" height="86" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="484" y="878" fill="#0f172a" font-size="12" font-weight="600">只重试瞬时错误</text>
+  <text x="484" y="900" fill="#475569" font-size="9.8" text-anchor="start">ConnectionError / TimeoutError / Milvus</text>
+  <text x="484" y="919" fill="#475569" font-size="9.8" text-anchor="start">判据 is_retryable，最多 3 次；配置错不重试</text>
+  <rect x="840" y="852" width="330" height="86" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="856" y="878" fill="#0f172a" font-size="12" font-weight="600">空分支也要收敛</text>
+  <text x="856" y="900" fill="#475569" font-size="9.8" text-anchor="start">没有 retrieval 时显式 Send 到 finalize</text>
+  <text x="856" y="919" fill="#475569" font-size="9.8" text-anchor="start">否则运行静默结束，版本永远停在 processing</text>
+  <text x="96" y="972" fill="#334155" font-size="10.5" text-anchor="start">一句话：引用源文件 → 解析成文本 → 归一 / 清洗 → 元数据 + 扇出计划 → N 路各自切分 · 增强 · 向量化 · 写索引 → 一次扇入写回版本状态</text>
+  <text x="96" y="1002" fill="#64748b" font-size="9" text-anchor="start">图例</text>
+  <rect x="136" y="992" width="11" height="11" rx="3" fill="#f1ebff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="153" y="1002" fill="#334155" font-size="9.5" text-anchor="start">入口与装配（图外）</text>
+  <rect x="314" y="992" width="11" height="11" rx="3" fill="#dcf7fb" stroke="#0e7490" stroke-width="1.5"/>
+  <text x="331" y="1002" fill="#334155" font-size="9.5" text-anchor="start">线性阶段 · 每版一次</text>
+  <rect x="492" y="992" width="11" height="11" rx="3" fill="#ddf8ed" stroke="#047857" stroke-width="1.5"/>
+  <text x="509" y="1002" fill="#334155" font-size="9.5" text-anchor="start">扇出阶段 · 每路一次</text>
+  <rect x="670" y="992" width="11" height="11" rx="3" fill="#fdf3dd" stroke="#b45309" stroke-width="1.5"/>
+  <text x="687" y="1002" fill="#334155" font-size="9.5" text-anchor="start">库表写入</text>
+  <rect x="848" y="992" width="11" height="11" rx="3" fill="#ffe4e8" stroke="#be123c" stroke-width="1.5"/>
+  <text x="865" y="1002" fill="#334155" font-size="9.5" text-anchor="start">状态与失败语义</text>
+  <rect x="1026" y="992" width="11" height="11" rx="3" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="3 2"/>
+  <text x="1043" y="1002" fill="#334155" font-size="9.5" text-anchor="start">路由屏障 · 不埋点</text>
+</svg>
