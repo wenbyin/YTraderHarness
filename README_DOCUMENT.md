@@ -90,6 +90,8 @@ flowchart TB
 | 一次运行留下了哪些记录 | `document_pipeline_run.py`、`document_pipeline_node_run.py` |
 
 ---
+## 📝 Code Architecture
+![document-ingest-flow.svg](docs/images/document-ingest-flow.svg)
 
 ## 📝 写入链路
 
