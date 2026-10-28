@@ -69,3 +69,15 @@ class PermissionDeniedError(ApplicationError, ValueError):
 
     Controller 映射为 403。
     """
+
+
+class ServiceUnavailableError(ApplicationError, ValueError):
+    """
+    依赖的外部服务没有启用或不可达，接口此刻无法完成请求。
+
+    与 500 的分界：这是**可解释的、部署/配置层面的**不可用
+    （比如本地开发关掉了 Casdoor，而登录接口必须去问它），
+    不是代码 bug。客户端重试不会好，换凭据也不会。
+
+    Controller 映射为 503。
+    """

@@ -6,6 +6,7 @@ from app.common.exceptions import (
     ConflictError,
     NotFoundError,
     PermissionDeniedError,
+    ServiceUnavailableError,
 )
 
 __all__ = [
@@ -23,6 +24,7 @@ def to_http_error(
         ConflictError          -> 409
         AuthenticationError    -> 401（带 WWW-Authenticate: Bearer）
         PermissionDeniedError  -> 403
+        ServiceUnavailableError -> 503
         其他 ValueError        -> 400
 
     ⚠️ 这里**接不到**路由级依赖里抛的异常
@@ -59,6 +61,12 @@ def to_http_error(
     if isinstance(exc, ConflictError):
         return HTTPException(
             status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )
+
+    if isinstance(exc, ServiceUnavailableError):
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
         )
 

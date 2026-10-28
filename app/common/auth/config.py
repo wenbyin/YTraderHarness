@@ -21,12 +21,17 @@ llm.py 刻意**不**在加载时校验密钥是否为空（"只跑检索、不�
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.common.environment import (
+    AppEnvironment,
+    current_environment,
+)
 from app.common.utils import expand_env
 
 __all__ = [
@@ -35,6 +40,8 @@ __all__ = [
     "load_casdoor_config",
     "reset_casdoor_config",
 ]
+
+logger = logging.getLogger(__name__)
 
 #: 默认配置文件位置。
 #:
@@ -63,6 +70,8 @@ class CasdoorConfig(BaseModel):
         default=True,
         description=(
             "总开关。false = 跳过全部校验（仅本地开发）。\n\n"
+            "yaml 里写 `${CASDOOR_ENABLED:-true}`，本地用环境变量\n"
+            "`CASDOOR_ENABLED=false` 即可关闭，不必改文件。\n\n"
             "APP_ENV=prod 且这里是 false 时，app/main.py 会拒绝启动。"
         ),
     )
@@ -180,6 +189,19 @@ class CasdoorConfig(BaseModel):
             "（宽松的「取 / 之后那段」会让任何组织的同名角色都通过）。\n\n"
             "配错的表现是那几个端点 403；服务端日志会打出 token 里"
             "实际持有的角色名，照着抄进本项即可。"
+        ),
+    )
+
+    dev_roles: list[str] = Field(
+        default_factory=list,
+        description=(
+            "只在 enabled: false 时生效：合成用户携带的角色。\n\n"
+            "本地要调管理端端点（/users/search、/memory/extraction/*）"
+            "或要求角色的工具时，填 ['Y-Trader-Admin'] 之类。\n"
+            "默认空 = 与生产保持同样的「无角色」形态，避免本地能跑、"
+            "生产被拒。\n\n"
+            "⚠️ 它不会进生产：APP_ENV=prod + enabled:false 会在启动期"
+            "被 app/bootstrap/auth.py 直接拒绝。"
         ),
     )
 
@@ -351,17 +373,37 @@ def load_casdoor_config(
     读配置并展开环境变量占位符。
 
     **不做 require_ready 校验** —— 那是组件的构造步骤。这样测试可以
-    直接构造一份"故意的坏配置"来验校验逻辑本身，不必先绕过它。
+    直接构造一份「故意的坏配置」来验校验逻辑本身，不必先绕过它。
 
     按路径缓存：同一份配置在一次进程里只解析一次。
+
+    开发环境允许**完全没有这个文件**
+    --------------------------------
+    文件本身被 .gitignore 排除（含明文凭据），新机器克隆下来就是没有。
+    以前这里一律抛错，于是「本地不接 Casdoor」还得先复制一份模板 ——
+    那与「关掉鉴权」的意图正好相反。现在 DEV 下缺失 = 返回一份
+    `enabled: false` 的默认配置；STAGING / PROD 仍然视为部署不完整，
+    照旧响亮地失败。
     """
 
     file_path = Path(path) if path else DEFAULT_CONFIG_PATH
 
     if not file_path.exists():
+
+        if current_environment() is AppEnvironment.DEV:
+
+            logger.warning(
+                "Casdoor 配置文件不存在（%s），按 APP_ENV=dev 处理为"
+                "「鉴权已关闭」。所有 /api/v1 接口将不校验令牌。",
+                file_path,
+            )
+
+            return CasdoorConfig(enabled=False)
+
         raise ValueError(
             f"Casdoor 配置文件不存在：{file_path}。"
-            "该文件随代码一起提供，缺失说明部署不完整。"
+            "该文件随部署一起提供，缺失说明部署不完整。"
+            "（只有 APP_ENV=dev 允许缺省并自动关闭鉴权。）"
         )
 
     raw = yaml.safe_load(

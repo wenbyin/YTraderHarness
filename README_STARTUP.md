@@ -78,7 +78,7 @@ app/common  ←  app/services  ←  app/infra  ←  app/bootstrap  ←  app/main
 | 文件 | 管什么 | 一句话记住 |
 |---|---|---|
 | [`app.yaml`](./app/config/app.yaml) | 应用级开关 | — |
-| [`casdoor.yaml`](./app/config/casdoor.yaml) | JWT 校验、OAuth 登录、管理员门禁 | `APP_ENV=prod` + `enabled: false` = **硬拒绝启动** |
+| [`casdoor.yaml`](./app/config/casdoor.yaml) | JWT 校验、OAuth 登录、管理员门禁 | `APP_ENV=prod` + `enabled: false` = **硬拒绝启动**；本地 `CASDOOR_ENABLED=false` |
 | [`event_stream.yaml`](./app/config/event_stream.yaml) | SSE 链路的全部节流参数 | `maxlen` 与 `ttl` 管**两件不同的事，两个都要** |
 | [`providers.yaml.template`](./app/config/providers.yaml.template) | 外部 provider 连接：`llm` / `web` / `rerank` 三段 | 复制成 `providers.yaml` 再填 key；真文件 gitignore |
 | [`mcp.yaml`](./app/config/mcp.yaml) | MCP 外部工具来源 | 配了才连，连不上不影响启动 |
@@ -136,11 +136,43 @@ app/common  ←  app/services  ←  app/infra  ←  app/bootstrap  ←  app/main
 | `QWEN_API_KEY` | Qwen 凭证 | 落到 yaml 里的开发 key |
 | `AGENT_EVENT_STREAM_PREFIX` | 事件流键前缀 | `agent_run` |
 | `APP_ENV` | 运行环境；`prod` 会开启额外保护 | 非 prod |
+| `CASDOOR_ENABLED` | 是否校验 Casdoor 令牌 | `true` |
 
 其它 `${VAR:-default}` 占位符在各 datasource yaml 里（dsn / 密码 / uri / token 等）。
 
 > ⚠️ 有**两份 `expand_env` 实现**：`app/common/utils/env.py` 与 `app/infra/datasource/loader.py::_expand_env`（后者是复制的一份）。
 > 改展开语义要**同时改两处**。
+
+### 本地开发不接 Casdoor
+
+`casdoor.yaml` 被 `.gitignore` 排除，**DEV 下可以完全不存在**：缺失即视为鉴权关闭。
+文件存在时也可以显式关掉，不必改它：
+
+```bash
+APP_ENV=dev CASDOOR_ENABLED=false python run_server.py
+```
+
+效果：
+
+| 接口 / 能力 | 关闭后 |
+|---|---|
+| 所有普通 `/api/v1` 接口 | 不再要求 `Authorization` |
+| `GET /auth/me` | 可用，返回合成用户 `dev-bypass` |
+| `/auth/login`、`/auth/callback`、`/auth/refresh` | **503** —— 必须去问 Casdoor |
+| `GET /users/search` | **503** —— 用户目录只在 Casdoor 里 |
+| `/memory/extraction/*`、`/memory/query/*` | 默认 **403**；要放行需配 `dev_roles: [Y-Trader-Admin]` |
+| 要求角色的工具（checkauth） | 默认拒绝；同上，需配 `dev_roles` |
+
+缺配置文件时合成用户没有任何角色（group 也取不到）。要在这种状态下放行管理端或
+要求角色的工具，建一份最小 `app/config/casdoor.yaml`：
+
+```yaml
+name: casdoor
+enabled: false
+dev_roles: [Y-Trader-Admin]
+```
+
+`APP_ENV=prod` 时 `enabled: false` 会被拒绝启动，见 `app/bootstrap/auth.py`。
 
 ---
 

@@ -71,15 +71,18 @@
 
 name: casdoor
 
-# 总开关。
+# 总开关。由环境变量控制，默认开：
 #
-# false = 完全跳过校验，current_user 返回一个合成用户
-#         （groups 即 required_groups），供本地开发/跑测试用。
+#     CASDOOR_ENABLED=false    本地开发：完全跳过令牌校验
+#
+# false = current_user 返回一个合成用户
+#         （groups 即 required_groups，角色见下面的 dev_roles），
+#         供本地开发/跑测试用。
 #
 # ⚠️ 生产**打不开**这个口子：APP_ENV=prod 且 enabled: false 时
 #    app/main.py 会直接拒绝启动。理由是这个开关一旦在生产被误开，
 #    所有接口就是裸奔，而且没有任何运行期迹象 —— 它必须响亮地失败。
-enabled: true
+enabled: "${CASDOOR_ENABLED:-true}"
 
 # Casdoor 服务地址。后端**拿 token 换用户信息**走这里。
 endpoint: "${CASDOOR_ENDPOINT:-http://localhost:8088}"
@@ -204,6 +207,22 @@ required_roles:
 # 空值会在启动期报错：空 admin_role 等于对所有人关门，而调用方只会
 # 看到 403 —— 那种"静默关门"必须响亮地失败。
 admin_role: "${CASDOOR_ADMIN_ROLE:-Y-Trader-Admin}"
+
+# enabled: false 时合成用户携带的角色（**只在本地开发生效**）。
+#
+# 默认空 —— 与生产保持同样的「无角色」形态：全局没有 required_roles，
+# 工具级 checkauth 要什么角色挂在工具上，凭空给几个会让本地能跑、
+# 生产拒绝同一个工具。
+#
+# 确实要在本地调管理端端点（/users/search、/memory/extraction/*）或
+# 受角色限制的工具时，显式写：
+#
+#     dev_roles:
+#       - Y-Trader-Admin
+#
+# ⚠️ APP_ENV=prod + enabled: false 会在启动期被拒绝，因此这一项
+#    不可能把角色带进生产。
+dev_roles: []
 
 # ------------------------------------------------------------
 # 从 query string 取 token —— 唯一的例外，且限路径

@@ -725,11 +725,12 @@ class CasdoorAuthComponent:
             name="dev-bypass",
             display_name="本地开发（Casdoor 鉴权已关闭）",
             groups=list(self._config.required_groups),
-            #: 角色**刻意留空**：全局没有 `required_roles` 这种东西，
-            #: 而工具级的 checkauth 要什么角色是挂载在工具上的 ——
-            #: 这里凭空给几个，等于让本地开发"能跑"，生产却拒绝同一
-            #: 个工具。那种差异只会在上线时才发现。
-            roles=[],
+            #: 角色来自 casdoor.yaml 的 `dev_roles`，**默认空**。
+            #: 空 = 与生产保持同样的「无角色」形态：全局没有
+            #: `required_roles`，工具级 checkauth 要什么角色挂在工具上，
+            #: 凭空给几个会让本地能跑、生产拒绝同一个工具。
+            #: 确实要在本地调管理端/受角色限制的工具时，显式配置。
+            roles=list(self._config.dev_roles),
             #: 组织同样留空，但理由不同：没有 token 就没有组织可言。
             #: 不拿配置里的 `org_name` 顶上 —— 那是**服务端**在哪个
             #: Casdoor 组织下（用于限定群组名前缀），不是调用者属于哪个

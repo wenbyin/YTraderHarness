@@ -382,7 +382,7 @@ PlanDraft  ──validate_plan()──▶  Kahn 拓扑排序  ──to_a2a_tasks
 
 | 文件 | 管什么 | 一句话记住 |
 |---|---|---|
-| [`casdoor.yaml`](./app/config/casdoor.yaml) | JWT 校验、OAuth 登录、管理员门禁 | `APP_ENV=prod` + `enabled: false` = **硬拒绝启动** |
+| [`casdoor.yaml`](./app/config/casdoor.yaml) | JWT 校验、OAuth 登录、管理员门禁 | `APP_ENV=prod` + `enabled: false` = **硬拒绝启动**；本地 `CASDOOR_ENABLED=false` |
 | [`event_stream.yaml`](./app/config/event_stream.yaml) | SSE 链路的全部节流参数 | `maxlen` 与 `ttl` 管**两件不同的事，两个都要** |
 | [`providers.yaml`](./app/config/providers.yaml.template)（模板） | **怎么连外部 provider**（`llm` / `web` / `rerank` 三段） | 真文件含密钥、gitignore；三家 LLM 都 OpenAI 兼容，`base_url` 必须带 `/v1` |
 | [`model.yaml`](./app/config/model.yaml) | **选哪个模型**（六段目录 + 绑定） | `bindings` 刻意**没有通配兜底** |

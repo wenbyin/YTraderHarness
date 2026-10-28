@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from app.common.auth.component import get_casdoor_component
 from app.common.auth.models import AuthenticatedUser
+from app.common.exceptions import ServiceUnavailableError
 from app.common.service.base import ServiceContext
 
 from ..domain.schemas.auth import (
@@ -149,7 +150,8 @@ class UserServiceImpl(UserService):
 
         这时候 `current_user` 会给所有人一个合成用户（本地开发的便利），
         但"发起登录/换取令牌/查目录"都是要真去问 Casdoor 的，没有配置
-        就是没有。报 500 而不是 401：这不是调用方的凭据问题。
+        就是没有。报 503 而不是 401：这不是调用方的凭据问题，也不是
+        服务端代码出错 —— 是这个部署根本没启用这个依赖。
 
         `what` 只是把话说清楚（"登录相关接口" / "用户检索"），不影响
         行为。
@@ -158,7 +160,7 @@ class UserServiceImpl(UserService):
         if self._auth.enabled:
             return
 
-        raise RuntimeError(
+        raise ServiceUnavailableError(
             "Casdoor 鉴权已关闭（casdoor.yaml 的 enabled: false），"
             f"{what}不可用。要联调请填好凭据并把它打开。"
         )
