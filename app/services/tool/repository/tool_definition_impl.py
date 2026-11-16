@@ -234,6 +234,17 @@ class ToolDefinitionRepositoryImpl(ToolDefinitionRepository):
 
         return [self._to_entity(m) for m in result.scalars()]
 
+    async def list_missing(self) -> list[ToolDefinition]:
+
+        result = await self._session.execute(
+            select(ToolDefinitionModel).where(
+                ToolDefinitionModel.source_state
+                == SourceState.MISSING.value
+            )
+        )
+
+        return [self._to_entity(m) for m in result.scalars()]
+
     async def list_all(
             self,
             *,

@@ -8,6 +8,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Index,
+    Integer,
     String,
     Text,
     func,
@@ -116,6 +117,57 @@ class Skill(Base):
         server_default=func.now(),
         onupdate=func.now(),
         comment="最后更新时间。",
+    )
+
+    # ========================================================
+    # 容量度量（派生列，只读）
+    # ========================================================
+    #
+    # 这些列**不接受写请求**：SkillCreate / SkillUpdate 是
+    # additionalProperties: false，多带一个字段就 422。它们只由服务层
+    # 在 create / update / 换绑定时测量并落库。
+    #
+    # 字符数刻意不存：`instructions.length` 前端实时算即可，落库就会
+    # 和原文产生第二份可漂移的事实。token 必须后端算 —— 前端没有编码器，
+    # 而且要把口径（编码名）连同数字一起存下来，否则数字无法解释。
+    #
+    # 存量行的默认态是「未测量」：0 / 0 / 'unmeasured' / NULL。
+    # 前端据此显示「未测量」，不会把 0 当成真实结果。任何一次保存或
+    # 改绑定都会把它们刷成实测值。
+
+    instructions_tokens: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment="仅 instructions 原文的 token 数；0 + unmeasured 表示未测量。",
+    )
+
+    prompt_tokens: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment=(
+            "SkillSnapshot.render_prompt() 渲染出的完整 prompt 的 token 数。"
+        ),
+    )
+
+    token_encoding: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="unmeasured",
+        server_default="unmeasured",
+        comment=(
+            "实测口径：o200k_base / heuristic:3.0 / unmeasured。"
+        ),
+    )
+
+    token_computed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+        comment="最近一次测量时间（UTC）；NULL 表示从未测量。",
     )
 
     __table_args__ = (

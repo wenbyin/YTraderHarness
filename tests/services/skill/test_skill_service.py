@@ -212,6 +212,12 @@ async def test_create_defaults_to_draft_with_no_bindings() -> None:
     assert detail.tags == []
     assert detail.examples == []
 
+    # 容量在 create 时就测好：数字 + 口径 + 测量时间三者成对存在。
+    assert detail.instructions_tokens > 0
+    assert detail.prompt_tokens > detail.instructions_tokens
+    assert detail.token_encoding in {"o200k_base", "heuristic:3.0"}
+    assert detail.token_computed_at is not None
+
 
 async def test_update_keeps_key_and_rejects_empty_or_null() -> None:
     service, *_ = _build()
@@ -230,6 +236,9 @@ async def test_update_keeps_key_and_rejects_empty_or_null() -> None:
     assert updated.name == "公告检索 v2"
     assert updated.instructions == created.instructions
     assert updated.status is created.status
+    # 只改 name 也会重算：name 是 render_prompt() 标题的一部分。
+    assert updated.instructions_tokens == created.instructions_tokens
+    assert updated.token_computed_at is not None
 
     with pytest.raises(ValueError):
         await service.update_skill(created.id, SkillUpdate())
@@ -333,6 +342,46 @@ async def test_replace_bindings_validates_before_writing() -> None:
     assert links.links[created.id] == []
 
 
+async def test_token_metrics_recomputed_on_save_and_binding_change() -> None:
+    """
+    token 是派生值，不是输入。三个写路径都要重算，且口径跟着数字存。
+
+    特别验换绑定：能力清单会进 render_prompt()，所以 prompt_tokens 必须
+    变；但换绑定不是改 skill 定义，updated_at 不能被顺手刷新。
+    """
+
+    service, _, _, capabilities = _build()
+
+    created = await service.create_skill(
+        _create_request("announcement_search")
+    )
+
+    longer = await service.update_skill(
+        created.id,
+        SkillUpdate(instructions="按公司名与时间范围逐条检索公告，" * 20),
+    )
+
+    assert longer.instructions_tokens > created.instructions_tokens
+    assert longer.prompt_tokens > created.prompt_tokens
+    assert longer.token_encoding in {"o200k_base", "heuristic:3.0"}
+
+    before_binding = longer.prompt_tokens
+    first = capabilities[0]
+
+    await service.replace_skill_capabilities(
+        created.id,
+        SkillCapabilityUpdate(capability_ids=[first.capability_id]),
+    )
+
+    rebound = await service.get_skill(created.id)
+
+    assert rebound.prompt_tokens > before_binding
+    # instructions 没动，它自己的 token 不该跟着变。
+    assert rebound.instructions_tokens == longer.instructions_tokens
+    assert rebound.token_computed_at is not None
+    assert rebound.updated_at == longer.updated_at
+
+
 async def test_list_filters_status_and_pages() -> None:
     service, *_ = _build()
 
@@ -358,6 +407,11 @@ async def test_list_filters_status_and_pages() -> None:
     assert [s.skill_key for s in page.items] == ["alpha"]
     # 摘要带 tags（发现用），但不带 instructions / capabilities。
     assert page.items[0].tags == []
+    # 但容量字段要在：卡片页脚靠它显示，不能只在详情里给。
+    assert page.items[0].prompt_tokens > 0
+    assert page.items[0].token_encoding in {
+        "o200k_base", "heuristic:3.0"
+    }
     assert "instructions" not in page.items[0].model_dump()
     assert "capabilities" not in page.items[0].model_dump()
     assert "examples" not in page.items[0].model_dump()

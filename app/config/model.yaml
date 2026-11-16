@@ -99,7 +99,7 @@ models:
     #: 上下文窗口（token）。**预算**的依据（规格 §二十一）：Context Builder
     #: 用它算 history_budget。填的是保守值 —— 请按该模型的真实文档调整；
     #: 不填时预算回落到策略里的兜底窗口，并在快照里注明来源。
-    context_window: 65536
+    context_window: 307200
     credential_ref: deepseek-production
     #: 便宜、快。工具调用与结构化输出都支持（OpenAI 兼容端点）。
     #:

@@ -109,9 +109,15 @@ class MCPProviderSettings(BaseModel):
 
     enabled: bool = True
 
-    #: 目前只实现 stdio。将来加 SSE / streamable HTTP 时，
-    #: 这里加一个取值，管理器按它分支 —— 契约不提前编。
-    transport: Literal["stdio"] = "stdio"
+    #: 连接方式。
+    #:
+    #:   stdio            拉起本地子进程，走标准输入输出（tdx-link-mcp）
+    #:   streamable_http  MCP 规范的 Streamable HTTP：单个 POST 端点收
+    #:                    JSON-RPC（ytrader-market）
+    #:
+    #: 两种方式**共用**后面的会话逻辑（initialize / list_tools /
+    #: call_tool）与工具过滤，差别只在"怎么拿到一对 read/write 流"。
+    transport: Literal["stdio", "streamable_http"] = "stdio"
 
     #: stdio 的启动命令（可执行文件或命令名）。支持 ${ENV} 展开。
     command: str = ""
@@ -123,6 +129,13 @@ class MCPProviderSettings(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
 
     cwd: str | None = None
+
+    #: streamable_http 的端点，必须带 http(s):// 前缀，例如
+    #: http://127.0.0.1:8105/mcp
+    url: str = ""
+
+    #: streamable_http 的附加请求头（鉴权等）。支持 ${ENV} 展开。
+    headers: dict[str, str] = Field(default_factory=dict)
 
     #: 启动 + initialize + 首次 list_tools 的总预算。
     startup_timeout_ms: int = Field(
@@ -140,19 +153,42 @@ class MCPProviderSettings(BaseModel):
 
     tools: MCPToolFilter = Field(default_factory=MCPToolFilter)
 
+    def unusable_reason(self) -> str | None:
+        """
+        这个 provider 缺什么才能连接；可以连接时返回 None。
+
+        分开返回原因而不是只给 bool：一份模板拷过来还没填 url 时，
+        日志要能直接说"缺 url"，而不是让排查从"为什么没有工具"开始。
+        """
+
+        if not self.enabled:
+            return "enabled=false"
+
+        if self.transport == "stdio":
+
+            if not self.command.strip():
+                return "stdio 缺 command"
+
+            return None
+
+        if self.transport == "streamable_http":
+
+            if not self.url.strip():
+                return "streamable_http 缺 url"
+
+            if not self.url.strip().startswith(("http://", "https://")):
+                return "url 必须以 http:// 或 https:// 开头"
+
+            return None
+
+        # Literal 已经挡掉了未知取值；留一条兜底，避免将来加枚举时
+        # 忘了在这里补分支而静默连不上。
+        return f"不支持的 transport: {self.transport}"
+
     def usable(self) -> bool:
-        """
-        这个 provider 有没有足够的信息去连接。
+        """这个 provider 有没有足够的信息去连接。"""
 
-        缺 command 的 stdio provider 只打 warning、不抛 —— 一份模板
-        拷过来还没填路径时，不该让整个应用起不来。
-        """
-
-        return (
-            self.enabled
-            and self.transport == "stdio"
-            and bool(self.command.strip())
-        )
+        return self.unusable_reason() is None
 
     @property
     def startup_timeout_seconds(self) -> float:
@@ -178,7 +214,7 @@ class MCPSettings(BaseModel):
         """
         可以尝试连接的 provider。
 
-        缺 command 的会被排除并留一条 warning —— 「配了但没填完」
+        缺 command / 缺 url 的会被排除并留一条**带原因**的 warning ——
         与「没配」是两件事，静默跳过会让排查从「为什么没有工具」
         变成「配置到底读没读」。
         """
@@ -193,11 +229,13 @@ class MCPSettings(BaseModel):
             if not provider.enabled:
                 continue
 
-            if not provider.usable():
+            reason = provider.unusable_reason()
+
+            if reason is not None:
 
                 logger.warning(
-                    "MCP provider %s 已启用但不可用（command 为空或"
-                    " transport 不支持），本次跳过。", name,
+                    "MCP provider %s 已启用但不可用（%s），本次跳过。",
+                    name, reason,
                 )
                 continue
 

@@ -38,6 +38,11 @@ def build_skill_summary(
         status=entity.status,
         created_at=entity.created_at,
         updated_at=entity.updated_at,
+        # 只读容量度量。不来自请求，直接取实体上服务层算好的值。
+        instructions_tokens=entity.instructions_tokens,
+        prompt_tokens=entity.prompt_tokens,
+        token_encoding=entity.token_encoding,
+        token_computed_at=entity.token_computed_at,
     )
 
 
@@ -46,15 +51,10 @@ def build_skill_detail(
         capabilities: list[CapabilityEntity],
 ) -> SkillDetail:
 
+    # 从摘要展开，而不是再抄一遍 12 个字段 —— 容量字段以后再加时，
+    # 列表页与详情页不会一个有一个没有。
     return SkillDetail(
-        id=entity.skill_id,
-        skill_key=entity.skill_key,
-        name=entity.name,
-        description=entity.description,
-        tags=list(entity.tags),
-        status=entity.status,
-        created_at=entity.created_at,
-        updated_at=entity.updated_at,
+        **build_skill_summary(entity).model_dump(),
         examples=list(entity.examples),
         instructions=entity.instructions,
         capabilities=[

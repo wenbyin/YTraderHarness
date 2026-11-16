@@ -117,6 +117,12 @@ class DocumentRepositoryImpl(DocumentRepository):
                 == document_type_definition_id,
                 DocumentModel.document_key
                 == document_key,
+                # 软删（deleted_at 非空）的 Document 不参与「业务标识已存在」判定。
+                # 少了这一条，删掉的 key 会永久占位：重建必然 409
+                # 「Document has been deleted」，且没有任何接口能救回来。
+                # 注意 document 表上 document_key 没有 DB 唯一约束（只有普通索引），
+                # 409 完全来自本函数的应用层判重，所以这里加条件即可根治。
+                DocumentModel.deleted_at.is_(None),
             )
         )
 

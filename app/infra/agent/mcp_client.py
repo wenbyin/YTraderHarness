@@ -24,6 +24,14 @@ registry —— 合在一起就是环。现在 scanner → 本模块 → 配置�
     **另一个线程**里跑事件循环 —— 在 FastAPI 的请求循环里直接
     `asyncio.run` 会报「loop is already running」。
 
+两类 provider
+-------------
+stdio             本地子进程（tdx-link-mcp）
+streamable_http   远端 HTTP 端点（ytrader-market，POST /mcp）
+
+差别只在 `_open_transport()`：拿到 (read, write) 之后，
+initialize / list_tools / call_tool 与工具过滤完全共用一套。
+
 结果转换
 --------
 MCP 的 `CallToolResult` 是内容块列表，不是 JSON。这里把
@@ -37,7 +45,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, nullcontext
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -70,9 +79,23 @@ except ImportError as exc:  # pragma: no cover - 依赖缺失时走这条
     ClientSession = None  # type: ignore[assignment]
     StdioServerParameters = None  # type: ignore[assignment]
     stdio_client = None  # type: ignore[assignment]
+    streamablehttp_client = None  # type: ignore[assignment]
     _MCP_IMPORT_ERROR: Exception | None = exc
+    _HTTP_IMPORT_ERROR: Exception | None = exc
 else:
     _MCP_IMPORT_ERROR = None
+
+    try:
+        from mcp.client.streamable_http import streamablehttp_client
+
+    except ImportError as exc:  # pragma: no cover - 只影响 http provider
+        # 单独兜一层：这条 import 链在 Windows 上会牵到 pywin32
+        # （mcp/os/win32/utilities.py），缺 pywintypes 时炸的是这里。
+        # 把它和 stdio 分开，缺 pywin32 的环境至少还能用 tdx。
+        streamablehttp_client = None  # type: ignore[assignment]
+        _HTTP_IMPORT_ERROR = exc
+    else:
+        _HTTP_IMPORT_ERROR = None
 
 
 class MCPToolCallError(RuntimeError):
@@ -102,16 +125,71 @@ def tool_description(tool: Any) -> str | None:
     return str(description) if description else None
 
 
+def _drop_nulls(value: Any) -> Any:
+    """递归去掉 None 值。
+
+    只删 None，不删空 dict / 空 list / False / 0 —— 那几种是**有意义
+    的 JSON 值**，删掉会改变 schema 语义。
+    """
+
+    if isinstance(value, dict):
+        return {
+            key: _drop_nulls(item)
+            for key, item in value.items()
+            if item is not None
+        }
+
+    if isinstance(value, list):
+        return [_drop_nulls(item) for item in value]
+
+    return value
+
+
 def tool_input_schema(tool: Any) -> dict[str, Any]:
-    schema = (
+    """
+    `inputSchema` -> 可交给模型 API 的 parameters。
+
+    为什么客户端也要修一遍
+    ----------------------
+    MCP 只要求 inputSchema 是 JSON Schema，并没有要求它不含 null 子字段。
+    但 OpenAI 兼容接口对 `function.parameters` 极其严格：
+
+        Invalid schema for function 'x': null is not of type "object"
+
+    而且这个 400 发生在**请求体校验**阶段 —— 不是"这个工具不可用"，
+    是整轮对话直接失败，看上去还像模型的问题。我们控制不了所有
+    MCP server（ytrader-market 的 `list_periods` 就踩过：
+    `"properties": null`），所以在这一层兜住，同时留 warning
+    让 server 的 bug 仍然可见，而不是被悄悄抹平。
+    """
+
+    raw = (
         getattr(tool, "input_schema", None)
         or getattr(tool, "inputSchema", None)
     )
 
-    return dict(schema) if isinstance(schema, dict) else {
-        "type": "object",
-        "properties": {},
-    }
+    if not isinstance(raw, dict):
+        return {"type": "object", "properties": {}}
+
+    schema = _drop_nulls(raw)
+    changed = schema != raw
+
+    if not isinstance(schema.get("properties"), dict):
+        schema["properties"] = {}
+        changed = True
+
+    if schema.get("type") != "object":
+        # 顶层只能是对象：parameters 不接受数组/字符串当根。
+        schema["type"] = "object"
+        changed = True
+
+    if changed:
+        logger.warning(
+            "MCP 工具 %s 的 inputSchema 含非法空值（properties/type），"
+            "已规范化后使用；建议修 server。", tool_name(tool),
+        )
+
+    return schema
 
 
 # ============================================================
@@ -189,6 +267,10 @@ class _ProviderRuntime:
     session: Any
     tools: list[Any]
     stack: AsyncExitStack
+    #: 只对 stdio 生效：一条子进程会话上的并发调用未必安全
+    #: （tdx 侧会改订阅/专家状态）。streamable_http 是无状态的单个
+    #: POST，并行调用是正常的用法，串行反而会把并发的行情查询排队。
+    serialized: bool = True
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -198,6 +280,60 @@ def _require_sdk() -> None:
             "未安装 mcp SDK，MCP provider 不可用："
             f"{_MCP_IMPORT_ERROR}"
         )
+
+
+async def _open_transport(
+        stack: AsyncExitStack,
+        settings: MCPProviderSettings,
+) -> tuple[Any, Any]:
+    """
+    按 `transport` 打开连接，返回一对 (read, write) 流。
+
+    两种 transport 的差别到此为止 —— 上面的 initialize / list_tools /
+    call_tool 全部共用：MCP 协议是同一套，只是底下管道不同
+    （子进程 stdin/stdout vs. HTTP POST + SSE）。
+
+    流的生命周期挂在 `stack` 上，由调用方在失败时 `aclose()`
+    —— 半开的连接会漏子进程或漏 HTTP 会话。
+    """
+
+    if settings.transport == "stdio":
+
+        params = StdioServerParameters(
+            command=settings.command,
+            args=list(settings.args),
+            env=dict(settings.env) or None,
+            cwd=settings.cwd,
+        )
+
+        return await stack.enter_async_context(stdio_client(params))
+
+    if settings.transport == "streamable_http":
+
+        if streamablehttp_client is None:
+            raise RuntimeError(
+                "streamable_http 客户端不可用（缺 pywin32 或 SDK 版本过旧）："
+                f"{_HTTP_IMPORT_ERROR}"
+            )
+
+        # httpx 的读超时必须跟着 call_timeout 走：SDK 默认 30s 会把一次
+        # 正常但慢的回源查询掐断（行情源限频时可达分钟级），症状是
+        # 「MCP 工具无故超时」而不是 server 报错，很难查。
+        timeout = settings.call_timeout_seconds
+
+        read, write, _session_id = await stack.enter_async_context(
+            streamablehttp_client(
+                settings.url,
+                headers=dict(settings.headers) or None,
+                timeout=timeout,
+                sse_read_timeout=max(timeout, 60.0),
+            )
+        )
+
+        return read, write
+
+    # Literal 已经挡掉了未知取值；留一条兜底，避免加了枚举却忘了分支。
+    raise RuntimeError(f"不支持的 MCP transport: {settings.transport}")
 
 
 class MCPProviderManager:
@@ -250,19 +386,10 @@ class MCPProviderManager:
 
         _require_sdk()
 
-        params = StdioServerParameters(
-            command=settings.command,
-            args=list(settings.args),
-            env=dict(settings.env) or None,
-            cwd=settings.cwd,
-        )
-
         stack = AsyncExitStack()
 
         try:
-            read, write = await stack.enter_async_context(
-                stdio_client(params)
-            )
+            read, write = await _open_transport(stack, settings)
 
             session = await stack.enter_async_context(
                 ClientSession(read, write)
@@ -291,6 +418,7 @@ class MCPProviderManager:
             session=session,
             tools=tools,
             stack=stack,
+            serialized=settings.transport == "stdio",
         )
 
         logger.info(
@@ -354,9 +482,12 @@ class MCPProviderManager:
                 "无法执行。检查启动日志与 mcp.yaml。"
             )
 
-        # 串行化同一 provider 的调用：stdio server 只有一条会话，
-        # 而 tdx 侧的操作未必并发安全。不同 provider 之间互不阻塞。
-        async with runtime.lock:
+        # stdio 只有一条子进程会话，且 tdx 侧的操作未必并发安全 —— 串行化。
+        # streamable_http 是无状态 POST，并发调用本来就是正常用法；用同一
+        # 把锁会把「同时查 5 只票」排队成 5 倍延迟。
+        guard = runtime.lock if runtime.serialized else nullcontext()
+
+        async with guard:
             result = await asyncio.wait_for(
                 runtime.session.call_tool(
                     tool, arguments or {},
@@ -403,18 +534,9 @@ async def _list_tools_once(
 
     _require_sdk()
 
-    params = StdioServerParameters(
-        command=settings.command,
-        args=list(settings.args),
-        env=dict(settings.env) or None,
-        cwd=settings.cwd,
-    )
-
     async with AsyncExitStack() as stack:
 
-        read, write = await stack.enter_async_context(
-            stdio_client(params)
-        )
+        read, write = await _open_transport(stack, settings)
 
         session = await stack.enter_async_context(
             ClientSession(read, write)
@@ -474,6 +596,59 @@ def list_provider_tools(
 # langchain 适配
 # ============================================================
 
+#: `config` 是 LangChain 的保留参数名。`BaseTool.arun` 会执行
+#: `tool_kwargs[config_param] = config`（见 langchain_core/tools/base.py
+#: 的 `_get_runnable_config_param`），把模型传的同名值覆盖成
+#: RunnableConfig；`StructuredTool._arun` 又把它当具名参数吸收，
+#: 底层 `coroutine(**kwargs)` 里就再也看不到这个参数了。
+#:
+#: MCP 里恰好把业务参数命名为 `config` 的工具（strategy_apply /
+#: strategy_validate(kind=strategy|template)）因此永远到不了 server，
+#: 报错却是「必须给 config」，看上去像模型传错，实际是适配层冲突。
+#:
+#: 解法：不动 LangChain、不动 MCP server —— 注册时把顶层参数换个名字，
+#: 调用前再映射回来。选 `config_payload` 而不是 `draft`，因为它对
+#: `kind=template` 的模板配置同样成立，也不与任何已知 MCP 字段重名。
+_CONFIG_PARAM = "config"
+_CONFIG_ALIAS = "config_payload"
+
+
+def rewrite_config_param(
+        schema: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """
+    把 inputSchema 里**顶层**名为 `config` 的参数改成 `config_payload`。
+
+    只动顶层 properties 与 required。嵌套对象里的 `config` 是值的一部分
+    （例如 `kind=template` 的 `{template_type, config}`），LangChain 不看，
+    原样保留。
+
+    返回 `(schema, changed)`；`changed=False` 时返回的就是传入的对象，
+    调用方据此决定要不要追加描述提示。
+    """
+
+    properties = schema.get("properties")
+
+    if (
+            not isinstance(properties, dict)
+            or _CONFIG_PARAM not in properties
+            or _CONFIG_ALIAS in properties  # 别覆盖 server 已有的同名字段
+    ):
+        return schema, False
+
+    result = deepcopy(schema)
+    props = result["properties"]
+    props[_CONFIG_ALIAS] = props.pop(_CONFIG_PARAM)
+
+    required = result.get("required")
+    if isinstance(required, list):
+        result["required"] = [
+            _CONFIG_ALIAS if item == _CONFIG_PARAM else item
+            for item in required
+        ]
+
+    return result, True
+
 
 def build_structured_tool(
         provider: str,
@@ -483,11 +658,21 @@ def build_structured_tool(
     """
     把一个 MCP tool 包成 langchain `StructuredTool`。
 
-    `args_schema` 直接给 MCP 的 JSON Schema —— 模型看到的参数与实际
-    传给 server 的是同一份，不需要在中间再翻译一层。
+    `args_schema` 用 MCP 的 JSON Schema（先做一次 `config` 改名），
+    模型看到的参数与最终发给 server 的参数只差这一个别名，由
+    `invoke` 映射回来。其余工具零改动。
 
-    底层函数用 `**kwargs`：模型的参数由 StructuredTool 按 schema
-    校验后原样传进来，这里不做二次解释。
+    ⚠️ 为什么还要给 `ainvoke` 套一层
+    --------------------------------
+    平台侧的 skill / 工具描述写的都是 `config`，模型偶尔会照旧传
+    `config`。这个键在 LangChain 内部就被覆盖，**下游无法恢复**
+    （值在 `BaseTool.arun` 里已经被换成 RunnableConfig），所以必须在
+    进入 LangChain 之前改名。这样两种写法都接得住：按新 schema 传
+    `config_payload`，或按旧文档传 `config`。
+
+    只覆盖 `ainvoke`：执行器（`tool_executor.py`）走的就是这条异步路径。
+    `StructuredTool` 是 pydantic 模型，实例属性赋值会被 `__setattr__`
+    拦掉，而这里只是覆盖一个非数据描述符方法，直接落 `__dict__` 即可。
     """
 
     from langchain_core.tools import StructuredTool
@@ -495,14 +680,49 @@ def build_structured_tool(
     name = tool_name(tool)
 
     async def invoke(**kwargs: Any) -> Any:
+        if _CONFIG_ALIAS in kwargs:
+            kwargs[_CONFIG_PARAM] = kwargs.pop(_CONFIG_ALIAS)
         return await manager.call_tool(provider, name, kwargs)
 
-    return StructuredTool.from_function(
+    schema, renamed = rewrite_config_param(tool_input_schema(tool))
+
+    description = tool_description(tool) or f"{provider} MCP 工具 {name}"
+
+    if renamed:
+        description += (
+            "\n\n⚠️ 接入层字段名：原参数 `config` 在这里注册为 "
+            f"`{_CONFIG_ALIAS}`（内容与类型不变，客户端会自动还原）。"
+            f"请按工具 schema 填 `{_CONFIG_ALIAS}`；填 `config` 也能识别。"
+        )
+
+    built = StructuredTool.from_function(
         coroutine=invoke,
         name=name,
-        description=(
-            tool_description(tool)
-            or f"{provider} MCP 工具 {name}"
-        ),
-        args_schema=tool_input_schema(tool),
+        description=description,
+        args_schema=schema,
     )
+
+    if renamed:
+        original_ainvoke = built.ainvoke
+
+        async def ainvoke_compat(
+                input: Any,
+                config: Any = None,
+                **kwargs: Any,
+        ) -> Any:
+            if isinstance(input, dict):
+                # 执行器在注入 tool_call_id 时会给完整 ToolCall 形状。
+                if input.get("type") == "tool_call":
+                    args = dict(input.get("args") or {})
+                    if _CONFIG_PARAM in args:
+                        args[_CONFIG_ALIAS] = args.pop(_CONFIG_PARAM)
+                    input = {**input, "args": args}
+                elif _CONFIG_PARAM in input:
+                    input = dict(input)
+                    input[_CONFIG_ALIAS] = input.pop(_CONFIG_PARAM)
+
+            return await original_ainvoke(input, config, **kwargs)
+
+        object.__setattr__(built, "ainvoke", ainvoke_compat)
+
+    return built

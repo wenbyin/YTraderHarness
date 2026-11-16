@@ -12,6 +12,7 @@ ToolDiscoveryService 的默认实现。
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -76,7 +77,21 @@ class ToolDiscoveryServiceImpl(ToolDiscoveryService):
 
         request = request or ToolSyncRequest()
 
-        manifests = self._discoverer.discover(
+        # ⚠️ 扫描是**同步**的，必须挪出事件循环
+        # ------------------------------------
+        # 本地扫描器要 import 包，MCP 扫描器要等 `tools/list` ——
+        # `mcp_client.list_provider_tools` 虽然自己起线程跑一次性
+        # 会话，但**等它结果**的这一侧仍然阻塞（`future.result`）。
+        # 直接调用会把循环按住整段扫描时间（哨兵日志里那条
+        # "事件循环被卡住 N 秒" 就是这个），同一时刻所有请求、SSE
+        # 心跳、Redis 读超时定时器一起停摆。
+        #
+        # 线程里是安全的：扫描只读进程内注册表 + 发网络请求，
+        # 不碰任何 async 资源（DB 从下面的 `_reconcile` 才开始用，
+        # 仍留在循环上）；返回的是纯数据快照，跨线程传递没有
+        # 循环亲和性。
+        manifests = await asyncio.to_thread(
+            self._discoverer.discover,
             source_types=self._parse_source_types(
                 request.source_types
             ),
@@ -193,13 +208,19 @@ class ToolDiscoveryServiceImpl(ToolDiscoveryService):
         """
         处理"库里有、代码里已经没有了"的行。
 
-        返回 (标记为缺失的行数, 被级联删掉的说明行数)。
+        返回 (本次判定为缺失的行数, 被级联删掉的说明行数)。
 
-        只看 ACTIVE 的行：已经是 MISSING 的不重复处理，
-        否则每次同步都会把它们再报一遍，missing 计数就没有意义了。
+        两种模式下"缺失"的取法**不一样**，这不是笔误：
+
+            remove_missing=false   只看 ACTIVE 的行（已经 MISSING 的
+                                   不再重复标、也不再重复计数，否则
+                                   每次同步都会把它们再报一遍）
+            remove_missing=true    还要把**已经 MISSING 的**行一起捞
+                                   出来删 —— 它们是上一轮标出来的，
+                                   不在 ACTIVE 里，漏了这一步就出现
+                                   "点了删除、missing 却恒为 0、
+                                   刷新后缺失的工具还在"
         """
-
-        active = await self._definitions.list_active()
 
         # ⚠️ 按**本次同步的范围**对账，而不是全表
         # ------------------------------------
@@ -208,46 +229,76 @@ class ToolDiscoveryServiceImpl(ToolDiscoveryService):
         # 本地工具判成「没扫到」并全部转 MISSING —— 它们只是这次
         # 没被扫，不是消失了。MCP 接入后这条路径会变得常见（前端
         # 刷新单个 provider），所以必须在这里收窄。
+        #
+        # 收窄对删除同样生效：删是**不可逆**的，范围写错一次就少一批行。
         wanted_types = set(
             self._parse_source_types(request.source_types) or []
         )
         wanted_refs = set(request.source_refs or [])
 
-        stale = [
+        def in_scope(definition: ToolDefinition) -> bool:
+            return (
+                (
+                    not wanted_types
+                    or definition.source_type in wanted_types
+                )
+                and (
+                    not wanted_refs
+                    or definition.source_ref in wanted_refs
+                )
+            )
+
+        active = [
             d
-            for d in active
-            if d.tool_key not in scanned_keys
-            and (
-                not wanted_types
-                or d.source_type in wanted_types
-            )
-            and (
-                not wanted_refs
-                or d.source_ref in wanted_refs
-            )
+            for d in await self._definitions.list_active()
+            if in_scope(d)
         ]
 
-        if not stale:
-            return 0, 0
-
-        stale_ids = [d.tool_id for d in stale]
+        stale = [d for d in active if d.tool_key not in scanned_keys]
 
         if not request.remove_missing:
             # 默认路径：只标记，不删除。
+            if not stale:
+                return 0, 0
+
             await self._definitions.mark_missing(
-                stale_ids, now=now
+                [d.tool_id for d in stale], now=now
             )
+
             return len(stale), 0
+
+        # ---- remove_missing=true：物理删除 ----
+        #
+        # 除了"这一轮才缺失的"（stale），还要删**已经 MISSING** 的行。
+        # 它们是上一次（remove_missing=false，默认值）同步标出来的：
+        # source_state 已经不是 ACTIVE，`list_active()` 根本取不到，
+        # 于是上一版实现里这一批行永远删不掉，missing 也永远报 0。
+        #
+        # `tool_key not in scanned_keys` 这一条是防御性的：理论上
+        # _reconcile 已经把"重新出现"的行改回 ACTIVE 了，但漏掉它的
+        # 代价是删掉一个**代码里还在**的工具 —— 这里宁可多判断一次。
+        already_missing = [
+            d
+            for d in await self._definitions.list_missing()
+            if in_scope(d) and d.tool_key not in scanned_keys
+        ]
+
+        doomed = stale + already_missing
+
+        if not doomed:
+            return 0, 0
+
+        doomed_ids = [d.tool_id for d in doomed]
 
         # 物理删除前先数一下会连带丢掉多少人工写的说明 ——
         # CASCADE 是静默的，不报这个数字，用户事后才发现。
         orphaned = await self._documentations.count_for_tools(
-            stale_ids
+            doomed_ids
         )
 
-        await self._definitions.delete_many(stale_ids)
+        await self._definitions.delete_many(doomed_ids)
 
-        return len(stale), orphaned
+        return len(doomed), orphaned
 
     @staticmethod
     def _parse_source_types(

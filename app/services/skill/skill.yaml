@@ -15,10 +15,19 @@ info:
 
     That resolution is an internal service call, not a management endpoint.
 
+    Capacity metrics are **read-only derived columns** on the response:
+    instructions_tokens / prompt_tokens / token_encoding / token_computed_at.
+    The backend measures them with tiktoken (o200k_base) on every write and
+    falls back to a heuristic with an explicit "heuristic:3.0" marker when
+    the encoder is unavailable. Character count is deliberately NOT stored:
+    the frontend computes instructions.length live. None of these four
+    fields are accepted in SkillCreate / SkillUpdate
+    (additionalProperties: false).
+
     Non-responsibilities:
       - Skill versioning (updates are in place; the runtime snapshots the
         definition when spawning a sub-agent).
-      - Tokens, A2A Agent Cards, A2A protocol metadata.
+      - Character counts, A2A Agent Cards, A2A protocol metadata.
       - Skill-level, capability-level, or tool-level authorization.
         Platform authentication is inherited from the protected route tree
         and is not modeled here.
@@ -387,6 +396,14 @@ components:
         - status
         - created_at
         - updated_at
+        - instructions_tokens
+        - prompt_tokens
+        - token_encoding
+        - token_computed_at
+      description: |
+        The four capacity fields are read-only derived values. They are
+        never accepted in SkillCreate / SkillUpdate. A row that predates
+        the migration reports 0 / 0 / 'unmeasured' / null = not measured.
       properties:
         id:
           type: string
@@ -420,6 +437,34 @@ components:
         updated_at:
           type: string
           format: date-time
+
+        instructions_tokens:
+          type: integer
+          minimum: 0
+          description: Token count of the instructions text alone.
+
+        prompt_tokens:
+          type: integer
+          minimum: 0
+          description: |
+            Token count of the fully rendered system prompt: title +
+            description + instructions + capability list. Same shape as
+            SkillSnapshot.render_prompt().
+
+        token_encoding:
+          type: string
+          description: |
+            Measurement basis: 'o200k_base' (exact tiktoken),
+            'heuristic:3.0' (fallback when the encoder is unavailable),
+            or 'unmeasured' (never measured). Always read together with
+            the numbers.
+
+        token_computed_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Last measurement time (UTC); null = never measured.
 
     SkillDetail:
       allOf:

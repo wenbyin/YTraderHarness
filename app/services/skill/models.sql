@@ -11,7 +11,9 @@
 --       -> tool_definition_classification
 --       -> tool_definition.tool_key（ACTIVE）
 --
--- 明确不含：版本表、分类绑定、token、A2A Agent Card、鉴权。
+-- 明确不含：版本表、分类绑定、字符数（char）、A2A Agent Card、鉴权。
+-- token 是**派生度量列**，由服务层在写路径测量，不出现在写请求里；
+-- 字符数刻意不落库，前端用 instructions.length 实时算。
 
 CREATE TABLE skill (
     id              UUID PRIMARY KEY,
@@ -40,6 +42,15 @@ CREATE TABLE skill (
 
     created_at      TIMESTAMPTZ NOT NULL,
     updated_at      TIMESTAMPTZ NOT NULL,
+
+    -- 容量度量：派生列，只读（写请求 additionalProperties: false，不接受）。
+    -- 服务层在 create / update / 换绑定时用 tiktoken 测量，失败降级启发式，
+    -- 并把实际口径写进 token_encoding —— 数字与口径必须成对存在。
+    -- 存量行默认 0 / 0 / 'unmeasured' / NULL = 尚未测量，前端显示「未测量」。
+    instructions_tokens  INTEGER      NOT NULL DEFAULT 0,
+    prompt_tokens        INTEGER      NOT NULL DEFAULT 0,
+    token_encoding       VARCHAR(32)  NOT NULL DEFAULT 'unmeasured',
+    token_computed_at    TIMESTAMPTZ  NULL,
 
     CONSTRAINT ck_skill_key_format
         CHECK (skill_key ~ '^[a-z][a-z0-9_]{1,119}$'),
