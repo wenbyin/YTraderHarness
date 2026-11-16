@@ -154,6 +154,19 @@ class ToolDefinitionRepository(BaseRepository):
         raise NotImplementedError
 
     @abstractmethod
+    async def list_missing(self) -> list[ToolDefinition]:
+        """
+        取全部 MISSING 的行。
+
+        只有 `remove_missing=true` 这一条路会读它：那些行是**上一轮**
+        同步标出来的缺失，它们不在 `list_active()` 里，所以不会被
+        反向比对扫到 —— 不单独取出来，`remove_missing=true` 就永远
+        删不掉它们（现象：missing 恒为 0，刷新后缺失的工具还在）。
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
     async def list_paged(
             self,
             *,

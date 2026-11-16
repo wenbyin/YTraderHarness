@@ -39,6 +39,8 @@ class ToolSyncRequest(APIModel):
             "默认 false —— 建议保持：Tool 可能已被编排进某个 "
             "Agent / 工作流，行删了引用就断了，报错也指不到原因。"
             "默认只转成 MISSING，让调用方自己决定怎么处理。"
+            "true 时连**上一轮已经是 MISSING** 的行一起删，"
+            "否则那些行没有任何别的删除路径。"
         ),
     )
 
@@ -68,7 +70,12 @@ class ToolSyncResult(APIModel):
 
     missing: int = Field(
         default=0,
-        description="库里 ACTIVE 但本次没扫到、已标记为 MISSING 的行数。",
+        description=(
+            "本次判定为「代码里已不存在」的行数。"
+            "remove_missing=false 时是刚被标成 MISSING 的行数；"
+            "remove_missing=true 时是被物理删除的行数"
+            "（含上一轮就已 MISSING 的行）。"
+        ),
     )
 
     orphaned_documentations: int = Field(

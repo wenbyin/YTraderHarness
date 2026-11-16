@@ -207,6 +207,16 @@ app/infra/agent/
 - ✅ **能**发现**新加的**工具（模块从未被 import，扫描器会 import 它）
 - ❌ **不能**拾取对**已 import 模块**的代码修改 —— Python 不会重新执行已加载的模块。**改代码仍然要重启。**
 
+### `remove_missing=true` 删的是谁
+
+默认 `false`：代码里没了 → 行标成 `MISSING`，`missing` 记"本轮刚标出来的"。
+
+`true`：物理删除，**包括上一轮就已经是 `MISSING` 的行**。
+后者是它们唯一的删除路径 —— `MISSING` 的行不在 `list_active()` 里，
+不单独捞一遍就会出现"点了删除、`missing` 恒为 0、刷新后缺失的工具
+还在"（2026-11-03 修的就是这个）。此时 `missing` 的语义是"被删掉的行数"。
+删除按 `source_types` / `source_refs` 收窄，和标记是同一套范围。
+
 ### 运行期禁用
 
 - 持久层是 `tool_definition_state`：**有行 = 禁用，无行 = 启用**（没有 `enabled` 列）。
@@ -223,11 +233,93 @@ app/infra/agent/
 
 ---
 
+## 🔌 MCP provider
+
+MCP 工具**不在代码里**：它们是 server `tools/list` 返回的运行时事实。
+所以这一层走配置（`app/config/mcp.yaml`）+ 协议发现，代码里没有可挂
+注解的对象。
+
+| transport | 怎么连 | 用在哪 |
+|---|---|---|
+| `stdio` | 拉起本地子进程，读写 stdin/stdout | `tdx`（tdx-link-mcp.exe）、`ytrader_core`（`python -m app.mcp`） |
+| `streamable_http` | 单个 POST 端点收 JSON-RPC | `ytrader_market`（`http://127.0.0.1:8105/mcp`） |
+
+两种 transport 的差别只在 `mcp_client._open_transport()`：拿到一对
+`(read, write)` 之后，`initialize` / `list_tools` / `call_tool`、
+结果转换、工具过滤完全共用。
+
+### 已接入的 provider
+
+```yaml
+mcp:
+  providers:
+    tdx:            # stdio，通达信
+      transport: stdio
+      command: .venv/Scripts/tdx-link-mcp.exe
+    ytrader_market: # HTTP，行情数据平台
+      transport: streamable_http
+      url: http://127.0.0.1:8105/mcp
+    ytrader_core:   # stdio，策略平台（另一个 Python 进程）
+      transport: stdio
+      command: D:/workspace/YTraderCore/.venv/Scripts/python.exe
+      args: ["-m", "app.mcp"]
+      cwd: D:/workspace/YTraderCore
+```
+
+`ytrader_market` 只放行 8 个**只读**工具（`list_datasets` /
+`get_dataset_schema` / `list_periods` / `search_instruments` /
+`query_market_data` / `get_coverage` / `list_boards` /
+`get_board_members`），`sync_data` / `sync_schema` 同时进了 `deny`。
+
+> 双保险的理由：对端（Go 服务）自己也有 `mcp.mode`，默认 `query`
+> 就只注册查询工具；但**两边各管一段**才靠谱 —— 对端哪天为了运维
+> 打开 `mode: all`，这边的 allowlist 仍然拦住模型。
+>
+> 另外对端有 `mcp.read_only`：`true` 时查询只读本地库与缓存，不回源、
+> 不落库、不建表。代价是没同步过的区间查不到，返回 `complete=false` +
+> `diagnostics.missingRanges` 指明缺哪一段，而不是报错 —— 别让模型
+> 对着空结果反复重试。
+
+`ytrader_core`（`D:\workspace\YTraderCore`）是策略平台，10 个工具分两类：
+
+| 只读 | 会写 core 库 |
+|---|---|
+| `catalog_get` `symbol_resolve` `bars_get` `indicator_preview` `strategy_get` `strategy_validate` `run_report` | `strategy_apply` `strategy_publish` `run_backtest` |
+
+> 后三条放行是因为"改策略 / 跑回测"本身就是这套接入的目的；只要读
+> 就把它们从 `allow` 里删掉 —— 删掉后模型**看不见**，与"不存在"同一
+> 待遇（过滤在扫描阶段做）。
+>
+> 两个配套设置别改错：`cwd` 必须指向 core 仓库根（`-m app.mcp` 靠它
+> 找包与 `app/config`）；`call_timeout_ms` 必须**大于** `run_backtest`
+> 自己的 `wait_seconds`（默认 120s）—— 否则传输层先掐断，模型只看到
+> 一句 timeout，而域层本来会回一条"超时了、请缩短区间"的结构化错误。
+
+### 排错顺序
+
+1. **启动日志**有没有 `MCP provider ytrader_market 已连接：N 个工具`；
+   失败是 `logger.exception`，带完整堆栈。
+2. 没连上是 `transport`/`url` 配错，还是服务没起？`curl
+   http://127.0.0.1:8105/healthz` 先看对端活没活。
+3. `已启用但不可用（streamable_http 缺 url）` —— 配置没填完，
+   这类 provider 会被跳过而不是让应用起不来。
+4. `streamable_http 客户端不可用（缺 pywin32…）` —— `mcp` SDK 的
+   HTTP 客户端在 Windows 上依赖 pywin32，`pip install pywin32`。
+5. `ytrader_core` 连不上，按这个顺序看：`command` 里的 python 存不存在
+   → `cwd` 是不是 core 仓库根 → 手动跑一次
+   `cd D:\workspace\YTraderCore && .venv\Scripts\python.exe -m app.mcp --print-tools`。
+   最后这条能把"我们的配置错了"和"core 自己起不来"分开：手动也跑不出来
+   就是 core 侧的问题（多半是它的数据源配置或依赖）。
+
+---
+
 ## 🚀 验证
 
 ```bash
 .venv/Scripts/python.exe -m app.agent.tool_smoke              # 发现 + 注册表 + tool_key 推导
 .venv/Scripts/python.exe -m app.agent.tool_processor_smoke    # 链折叠 + 洋葱校验
+.venv/Scripts/python.exe -m app.agent.mcp_market_smoke        # 真连 ytrader-market：连接 → tools/list → 取一条行情
+.venv/Scripts/python.exe -m app.agent.mcp_core_smoke          # 真连 ytrader-core：连接 → tools/list → 目录/代码规范化 → isError
 ```
 
 ---

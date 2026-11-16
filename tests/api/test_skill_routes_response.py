@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
+from pydantic import ValidationError
 
 import app.services.dependencies as dependencies_module
 from app.api.v1.skills import router as skills_router
@@ -25,9 +26,11 @@ from app.common.exceptions import NotFoundError
 from app.services.skill.domain.schemas import (
     CapabilityRef,
     PagedSkillResponse,
+    SkillCreate,
     SkillDetail,
     SkillStatus,
     SkillSummary,
+    SkillUpdate,
 )
 
 _SKILL_ID = uuid4()
@@ -58,6 +61,11 @@ def _summary() -> SkillSummary:
         status=SkillStatus.ACTIVE,
         created_at=now,
         updated_at=now,
+        # 只读容量度量：响应里必须有，写请求里绝不能有。
+        instructions_tokens=128,
+        prompt_tokens=196,
+        token_encoding="o200k_base",
+        token_computed_at=now,
     )
 
 
@@ -205,11 +213,21 @@ async def test_list_shape_and_filters(
         "status",
         "created_at",
         "updated_at",
+        "instructions_tokens",
+        "prompt_tokens",
+        "token_encoding",
+        "token_computed_at",
     }
     assert item["id"] == str(_SKILL_ID)
     assert item["tags"] == ["金融", "公告检索"]
     assert item["status"] == "ACTIVE"
     assert isinstance(item["created_at"], str)
+
+    # 容量是只读派生值：列表页也要带，且数字与口径成对出现。
+    assert item["instructions_tokens"] == 128
+    assert item["prompt_tokens"] == 196
+    assert item["token_encoding"] == "o200k_base"
+    assert isinstance(item["token_computed_at"], str)
 
     assert service.list_kwargs is not None
     assert service.list_kwargs["status"] is SkillStatus.ACTIVE
@@ -238,6 +256,12 @@ async def test_detail_and_capability_shape(
         "检索最近一个月的股权质押公告"
     ]
     assert isinstance(body["capabilities"], list)
+
+    # SkillDetail 继承 SkillSummary，容量字段不能被 allOf 吞掉。
+    assert body["instructions_tokens"] == 128
+    assert body["prompt_tokens"] == 196
+    assert body["prompt_tokens"] > body["instructions_tokens"]
+    assert body["token_encoding"] == "o200k_base"
 
     capability = body["capabilities"][0]
 
@@ -291,6 +315,33 @@ async def test_create_parses_a2a_metadata(
     assert request.examples == [
         "检索最近一个月的股权质押公告"
     ]
+
+
+def test_write_contracts_reject_capacity_fields() -> None:
+    """
+    容量字段是**只读**的：SkillCreate / SkillUpdate 是
+    additionalProperties: false。前端如果把 GET 到的值回填进 PATCH，
+    后端必须 422，而不是静默忽略或当真写库。
+    """
+
+    base = {
+        "skill_key": "announcement_search",
+        "name": "上市公司公告检索",
+        "description": "检索公告",
+        "instructions": "按公司名检索公告。",
+    }
+
+    for field in (
+        "instructions_tokens",
+        "prompt_tokens",
+        "token_encoding",
+        "token_computed_at",
+    ):
+        with pytest.raises(ValidationError):
+            SkillCreate(**base, **{field: 1})
+
+        with pytest.raises(ValidationError):
+            SkillUpdate(**{field: 1})
 
 
 async def test_replace_bindings_parses_uuids(
@@ -372,3 +423,12 @@ def test_openapi_contains_operations_and_schemas(
     assert set(
         schemas["PagedSkillResponse"]["required"]
     ) == {"items", "page", "page_size", "total"}
+
+    # 运行态 OpenAPI 也必须把容量字段列为 required —— 若 Pydantic
+    # 给了 default，这里会静默少四项，与 skill.yaml 和前端 TS 漂移。
+    assert {
+        "instructions_tokens",
+        "prompt_tokens",
+        "token_encoding",
+        "token_computed_at",
+    } <= set(schemas["SkillSummary"]["required"])

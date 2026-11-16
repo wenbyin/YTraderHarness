@@ -694,6 +694,9 @@ components:
             Whether physically remove definitions missing from
             the latest discovery result.
             Recommended to keep false.
+            When true, rows already in MISSING state (flagged by a
+            previous sync) are removed as well — that is their only
+            deletion path.
 
 
     ToolSyncResult:
@@ -719,6 +722,11 @@ components:
 
         missing:
           type: integer
+          description: |
+            Rows judged absent from code. With remove_missing=false
+            they were just flagged MISSING; with remove_missing=true
+            they were physically deleted (including rows that had
+            already been MISSING before this sync).
 
         orphaned_documentations:
           type: integer

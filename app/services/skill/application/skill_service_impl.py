@@ -39,6 +39,7 @@ from ._assembly import (
     build_skill_detail,
     build_skill_summary,
 )
+from ._token_metrics import measure_skill_tokens
 from .skill_service import SkillService
 from ...tool.registry import tool
 
@@ -111,6 +112,14 @@ class SkillServiceImpl(SkillService):
 
         now = datetime.now(timezone.utc)
 
+        # 新建时还没有能力绑定，能力清单那段是空的；第一次换绑定会重算。
+        metrics = measure_skill_tokens(
+            skill_key=request.skill_key,
+            name=request.name,
+            description=request.description,
+            instructions=request.instructions,
+        )
+
         entity = await self._skills.add(
             SkillEntity(
                 skill_id=uuid4(),
@@ -123,6 +132,7 @@ class SkillServiceImpl(SkillService):
                 status=request.status,
                 created_at=now,
                 updated_at=now,
+                **metrics.as_entity_fields(),
             )
         )
 
@@ -155,36 +165,49 @@ class SkillServiceImpl(SkillService):
         if not provided:
             raise ValueError("至少提供一个要更新的字段。")
 
+        name = self._pick(request, "name", current.name)
+        description = self._pick(
+            request, "description", current.description
+        )
+        tags = self._pick(request, "tags", list(current.tags))
+        examples = self._pick(
+            request, "examples", list(current.examples)
+        )
+        instructions = self._pick(
+            request, "instructions", current.instructions
+        )
+        status = self._pick(request, "status", current.status)
+
+        # 能力清单是完整 prompt 的一部分，测 prompt_tokens 要带着当前绑定。
+        capabilities = await self._links.list_for_skill(
+            skill_id
+        )
+
+        metrics = measure_skill_tokens(
+            skill_key=current.skill_key,
+            name=name,
+            description=description,
+            instructions=instructions,
+            capabilities=self._capability_pairs(capabilities),
+        )
+
         entity = SkillEntity(
             skill_id=current.skill_id,
             # skill_key 不在契约里；这里显式沿用原值，防止将来有人
             # 给 SkillUpdate 加上该字段后意外改掉稳定标识。
             skill_key=current.skill_key,
-            name=self._pick(request, "name", current.name),
-            description=self._pick(
-                request, "description", current.description
-            ),
-            tags=self._pick(
-                request, "tags", list(current.tags)
-            ),
-            examples=self._pick(
-                request, "examples", list(current.examples)
-            ),
-            instructions=self._pick(
-                request, "instructions", current.instructions
-            ),
-            status=self._pick(
-                request, "status", current.status
-            ),
+            name=name,
+            description=description,
+            tags=tags,
+            examples=examples,
+            instructions=instructions,
+            status=status,
             created_at=current.created_at,
             updated_at=datetime.now(timezone.utc),
+            **metrics.as_entity_fields(),
         )
 
         updated = await self._skills.update(entity)
-
-        capabilities = await self._links.list_for_skill(
-            skill_id
-        )
 
         return build_skill_detail(updated, capabilities)
 
@@ -220,7 +243,7 @@ class SkillServiceImpl(SkillService):
             request: SkillCapabilityUpdate,
     ) -> list[CapabilityRef]:
 
-        await self._require_skill(skill_id)
+        current = await self._require_skill(skill_id)
 
         wanted = list(dict.fromkeys(request.capability_ids))
 
@@ -247,6 +270,21 @@ class SkillServiceImpl(SkillService):
 
         capabilities = await self._links.list_for_skill(
             skill_id
+        )
+
+        # 能力清单会进 render_prompt()，绑定一变 prompt_tokens 就得重算。
+        # 用 model_copy 沿用原 updated_at：换绑定不是改 skill 定义，
+        # 不应该让列表页的「更新于」跟着跳。
+        metrics = measure_skill_tokens(
+            skill_key=current.skill_key,
+            name=current.name,
+            description=current.description,
+            instructions=current.instructions,
+            capabilities=self._capability_pairs(capabilities),
+        )
+
+        await self._skills.update(
+            current.model_copy(update=metrics.as_entity_fields())
         )
 
         return self._to_refs(capabilities)
@@ -292,6 +330,14 @@ class SkillServiceImpl(SkillService):
             raise ValueError(f"{field} 不能为 null。")
 
         return value
+
+    @staticmethod
+    def _capability_pairs(
+            capabilities: list[CapabilityEntity],
+    ) -> list[tuple[str, str]]:
+        """能力实体 -> 渲染 prompt 用的 (code, name) 序列。"""
+
+        return [(c.code, c.name or "") for c in capabilities]
 
     @staticmethod
     def _to_refs(

@@ -166,6 +166,47 @@ class SkillSummary(APIModel):
 
     updated_at: datetime = Field(description="最后更新时间。")
 
+    # --------------------------------------------------------
+    # 容量度量：只读派生值
+    # --------------------------------------------------------
+    # 只出现在响应里。SkillCreate / SkillUpdate 是
+    # additionalProperties: false —— 这四个字段**绝不能**加到写请求上，
+    # 否则客户端一旦回填就会 422。
+    #
+    # 字符数不在这里：前端用 instructions.length 实时算，不落库。
+    # token 必须后端算，因为口径（编码名）只有后端知道，且必须和
+    # 数字一起存下来才能解释。
+
+    # 刻意**不给 default**：响应契约里这四项是 required（与 skill.yaml
+    # 和前端 SkillSummary 一致），组装层漏带一个就该当场报错，而不是
+    # 静默吐一个看起来像「测过了」的 0。未测量态由实体/DB 的默认值
+    # 表达，不是靠 DTO 缺省。
+
+    instructions_tokens: int = Field(
+        ge=0,
+        description="仅 instructions 原文的 token 数。",
+    )
+
+    prompt_tokens: int = Field(
+        ge=0,
+        description=(
+            "注入子 agent 的完整 prompt 的 token 数：标题 + description "
+            "+ instructions + 能力清单。与 SkillSnapshot.render_prompt() "
+            "同口径。"
+        ),
+    )
+
+    token_encoding: str = Field(
+        description=(
+            "实测口径：o200k_base（精确）/ heuristic:3.0（降级）/ "
+            "unmeasured（尚未测量）。"
+        ),
+    )
+
+    token_computed_at: datetime | None = Field(
+        description="最近一次测量时间（UTC）；null 表示尚未测量。",
+    )
+
 
 class SkillDetail(SkillSummary):
     """详情页：摘要 + A2A 元数据 + 提示词 + 能力绑定。"""

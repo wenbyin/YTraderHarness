@@ -82,3 +82,39 @@ class Skill(BaseModel):
     updated_at: datetime = Field(
         description="最后更新时间。",
     )
+
+    # ========================================================
+    # 容量度量（派生列，只读）
+    # ========================================================
+    #
+    # 由服务层在写路径测量后落库，不来自任何写请求。四个字段给默认值，
+    # 让「建表前就存在的老行 / 手工构造的实体」也能安全反序列化成
+    # 「未测量」态，而不是在读取时直接 ValidationError。
+
+    instructions_tokens: int = Field(
+        default=0,
+        ge=0,
+        description="仅 instructions 原文的 token 数。",
+    )
+
+    prompt_tokens: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "渲染后完整 prompt 的 token 数（标题 + description + "
+            "instructions + 能力清单）。"
+        ),
+    )
+
+    token_encoding: str = Field(
+        default="unmeasured",
+        description=(
+            "实测口径：o200k_base / heuristic:3.0 / unmeasured。"
+            "数字必须和口径一起读，否则无法解释。"
+        ),
+    )
+
+    token_computed_at: datetime | None = Field(
+        default=None,
+        description="最近一次测量时间（UTC）；None 表示从未测量。",
+    )

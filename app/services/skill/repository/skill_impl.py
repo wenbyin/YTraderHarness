@@ -39,6 +39,11 @@ class SkillRepositoryImpl(SkillRepository):
             status=skill.status.value,
             created_at=skill.created_at,
             updated_at=skill.updated_at,
+            # 容量度量是服务层算好的派生值，这里只负责落库。
+            instructions_tokens=skill.instructions_tokens,
+            prompt_tokens=skill.prompt_tokens,
+            token_encoding=skill.token_encoding,
+            token_computed_at=skill.token_computed_at,
         )
 
         self._session.add(model)
@@ -68,7 +73,14 @@ class SkillRepositoryImpl(SkillRepository):
         model.examples = list(skill.examples)
         model.instructions = skill.instructions
         model.status = skill.status.value
+        # 显式赋值：换能力绑定时服务层会带上**原值**来重算 token，
+        # 此时不应让 onupdate=func.now() 把 updated_at 顺手改掉
+        # （绑定不是 skill 定义本身的变更）。
         model.updated_at = skill.updated_at
+        model.instructions_tokens = skill.instructions_tokens
+        model.prompt_tokens = skill.prompt_tokens
+        model.token_encoding = skill.token_encoding
+        model.token_computed_at = skill.token_computed_at
 
         await self._session.flush()
 

@@ -65,3 +65,85 @@ mcp:
           - list_experts
 
         deny: []
+
+    # ytrader-market 行情数据平台（Streamable HTTP）。
+    #
+    # 它是另一个 Go 服务（D:\workspace\ytrader-market，默认 :8105），
+    # MCP 端点就是 `POST /mcp`，无状态、不需要启动子进程，所以配了
+    # url 就能连；服务没起时只影响它自己的工具（启动日志会打 ERROR）。
+    #
+    # 对端默认 mcp.mode=query —— 只挂 8 个只读工具，sync_data /
+    # sync_schema 根本不注册。这里仍然显式写 allowlist + deny：
+    # 本地这份配置是最后一道闸，对端将来放开写接口也不会传下来。
+    ytrader_market:
+      enabled: true
+      transport: streamable_http
+      url: "${YTRADER_MARKET_MCP_URL:-http://127.0.0.1:8105/mcp}"
+      # 需要网关鉴权时加成 {"Authorization": "Bearer ${TOKEN}"}；
+      # 直接连 marketd 时留空即可。
+      headers: {}
+      startup_timeout_ms: 15000
+      call_timeout_ms: 120000
+
+      tools:
+        mode: allowlist
+        allow:
+          - list_datasets
+          - get_dataset_schema
+          - list_periods
+          - search_instruments
+          - query_market_data
+          - get_coverage
+          - list_boards
+          - get_board_members
+        deny:
+          - sync_data
+          - sync_schema
+          - get_task
+          - get_platform_stats
+
+    # ytrader-core 策略平台（stdio，本地 Python 子进程）。
+    #
+    # 仓库 D:\workspace\YTraderCore，入口 `python -m app.mcp`。它的
+    # MCP 是**手写 JSON-RPC**（不依赖 mcp SDK、不需要额外装包），所以
+    # 这里只给可执行文件 + 参数 + cwd 就能连。
+    #
+    # ⚠️ `cwd` 不能省：`-m app.mcp` 靠 cwd 找 `app` 包与 `app/config`
+    # 下的数据源配置。写成绝对 PYTHONPATH 也能跑，但那样 core 自己的
+    # 相对路径配置会找不到，报错信息还指不到原因。
+    #
+    # 工具集（10 个）：catalog_get / symbol_resolve / bars_get /
+    # indicator_preview / strategy_get / strategy_validate / run_report
+    # 只读；strategy_apply / strategy_publish / run_backtest 会写
+    # core 的库（策略草稿、版本、Run 与回放事件）。要只读就把后三条
+    # 从 allow 里删掉 —— 删掉后模型完全看不见它们。
+    ytrader_core:
+      enabled: true
+      transport: stdio
+      command: "${YTRADER_CORE_PYTHON:-D:/workspace/YTraderCore/.venv/Scripts/python.exe}"
+      args: ["-m", "app.mcp"]
+      cwd: "${YTRADER_CORE_HOME:-D:/workspace/YTraderCore}"
+      env: {}
+      # 冷启动约 2s（装容器 + 连库）；首次建表时更慢。
+      startup_timeout_ms: 30000
+      # 必须**大于** run_backtest 的 wait_seconds（默认 120s）：域层到点会
+      # 回滚并回一条结构化错误；传输层先掐断的话，模型只看到 timeout，
+      # 既不知道是超时也不知道该缩短区间。
+      call_timeout_ms: 180000
+
+      tools:
+        mode: allowlist
+        allow:
+          - catalog_get
+          - symbol_resolve
+          - bars_get
+          - indicator_preview
+          - strategy_get
+          - strategy_validate
+          - run_report
+          # 下面三条会写 core 库，按需保留：
+          - strategy_apply
+          - strategy_publish
+          - run_backtest
+        deny: []
+

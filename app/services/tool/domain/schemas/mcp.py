@@ -34,7 +34,7 @@ class MCPProviderSummary(APIModel):
     )
 
     transport: str = Field(
-        description="连接方式。目前只有 stdio。",
+        description="连接方式：stdio（本地子进程）/ streamable_http（HTTP 端点）。",
     )
 
     connected: bool = Field(

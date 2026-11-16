@@ -115,7 +115,7 @@ application_name: "${CASDOOR_APPLICATION_NAME:-YTraderHarness}"
 #
 # 它由配置给出、**不接收调用方传入**：让请求方自己指定 redirect_uri
 # 就是开放重定向（攻击者可以把"code 换 token"的请求引到自己的站点）。
-redirect_uri: "${CASDOOR_REDIRECT_URI:-http://localhost:8000/user/callback}"
+redirect_uri: "${CASDOOR_REDIRECT_URI:-http://localhost:3001/user/callback}"
 
 # ------------------------------------------------------------
 # 验签证书（二选一，certificate 优先）

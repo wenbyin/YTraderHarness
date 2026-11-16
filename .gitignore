@@ -18,3 +18,8 @@ __pycache__/
 /milvus_flush_probe.py
 /todolist
 /clear_runtime_data.py
+# 外部工具的本地缓存
+/data-gym-cache/
+# pytest 临时目录（本机 TMPDIR 可能落在仓库根）
+/pytest-of-*/
+/docs/*.md
