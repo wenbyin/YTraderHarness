@@ -27,6 +27,10 @@ from .tool_documentation_impl import (
 )
 from .tool_execution import ToolExecutionRepository
 from .tool_execution_impl import ToolExecutionRepositoryImpl
+from .tool_presentation import ToolPresentationRepository
+from .tool_presentation_impl import (
+    ToolPresentationRepositoryImpl,
+)
 from .tool_processor import ToolProcessorRepository
 from .tool_processor_impl import ToolProcessorRepositoryImpl
 
@@ -41,6 +45,8 @@ __all__ = [
     "ToolDocumentationRepositoryImpl",
     "ToolExecutionRepository",
     "ToolExecutionRepositoryImpl",
+    "ToolPresentationRepository",
+    "ToolPresentationRepositoryImpl",
     "ToolProcessorRepository",
     "ToolProcessorRepositoryImpl",
 ]

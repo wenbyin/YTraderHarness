@@ -459,9 +459,9 @@ async def test_trace_stage_spans_cover_real_stages() -> None:
     await builder.build(request)
 
     started = {
-        item["event_type"]
+        item["type"]
         for item in raw
-        if item["event_type"].endswith(".started")
+        if item["type"].endswith(".started")
     }
 
     assert "context.prompt_assemble.started" in started
@@ -474,11 +474,11 @@ async def test_trace_stage_spans_cover_real_stages() -> None:
     completed_spans = {
         item["span_id"]
         for item in raw
-        if item["event_type"].endswith(".completed")
+        if item["type"].endswith(".completed")
     }
     started_spans = {
         item["span_id"]
         for item in raw
-        if item["event_type"].endswith(".started")
+        if item["type"].endswith(".started")
     }
     assert started_spans <= completed_spans

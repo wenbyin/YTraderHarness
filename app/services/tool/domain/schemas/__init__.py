@@ -20,6 +20,10 @@ domain/schemas/
 ├── discovery.py
 │   └── ToolSyncRequest / ToolSyncResult
 │
+├── presentation.py
+│   └── ToolPresentation / ToolPresentationState
+│       （用户展示描述符；无行 = 不显示）
+│
 └── processor.py
     └── ProcessorDefinition / ToolProcessor / ToolProcessorChain
         及其 Create / Update / Replace / Reorder 四个请求
@@ -63,6 +67,10 @@ from .execution import (
 from .mcp import (
     MCPProviderListResponse,
     MCPProviderSummary,
+)
+from .presentation import (
+    ToolPresentation,
+    ToolPresentationState,
 )
 from .processor import (
     CreateToolProcessorRequest,
@@ -115,6 +123,8 @@ __all__ = [
     "ToolEnabledUpdate",
     "ToolDocumentationUpdate",
     "ToolManifest",
+    "ToolPresentation",
+    "ToolPresentationState",
     "ToolProcessor",
     "ToolProcessorChain",
     "ToolSummary",

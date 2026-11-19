@@ -77,7 +77,8 @@ from uuid import UUID
 
 from redis import exceptions as redis_exceptions
 
-from app.common.event import RunEventType, stream_key
+from app.common.event import stream_key
+from app.common.event.spec import EventType
 
 from .config import StreamConfig, load_stream_config
 from .reader import TERMINAL_VALUES, StreamEntry, decode as _decode
@@ -1035,7 +1036,7 @@ class RunStream:
         if event_type is None:
             return False
 
-        if event_type == RunEventType.HITL_REQUESTED.value:
+        if event_type == EventType.HITL_REQUESTED.value:
             self._hitl_seen = True
             return False
 

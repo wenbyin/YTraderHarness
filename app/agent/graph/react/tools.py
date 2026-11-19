@@ -102,7 +102,6 @@ from uuid import UUID
 
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.config import get_stream_writer
 from langgraph.prebuilt.tool_node import (
     ToolCallRequest,
     ToolRuntime,
@@ -111,6 +110,7 @@ from langgraph.runtime import Runtime
 from langgraph.types import Command
 
 from app.agent.context.processor.reference import wrap_reference
+from app.agent.event.stream import write_custom
 from app.agent.tools.hitl_tool import (
     ASK_USER_QUESTION_TOOL_KEY,
 )
@@ -119,7 +119,8 @@ from app.agent.tools.processor.context import (
     ToolCallDenied,
     ToolOutcome,
 )
-from app.common.event import TOOL_STREAM_KIND, RunEventType
+from app.common.event import TOOL_STREAM_KIND
+from app.common.event.spec import EventType
 from app.common.factories import get_service_factory
 from app.common.tool_caller import ToolCaller, tool_caller_scope
 from app.infra.agent.tool_executor import get_tool_executor
@@ -359,7 +360,7 @@ def _outcome_message(
                 tool_call_id=tool_call_id or "",
                 name=tool_key,
                 status="success",
-                additional_kwargs=extra,
+                additional_kwargs={**extra, **_duration_meta(outcome)},
             )
 
         return ToolMessage(
@@ -367,6 +368,7 @@ def _outcome_message(
             tool_call_id=tool_call_id or "",
             name=tool_key,
             status="success",
+            additional_kwargs=_duration_meta(outcome),
         )
 
     error = outcome.error
@@ -384,6 +386,7 @@ def _outcome_message(
         tool_call_id=tool_call_id or "",
         name=tool_key,
         status="error",
+        additional_kwargs=_duration_meta(outcome),
     )
 
 
@@ -410,11 +413,32 @@ def _unexposed_message(
     )
 
 
+def _runtime_stream_writer(request: Any) -> Any:
+    """
+    取**节点自己的** writer。
+
+    ⚠️ 为什么优先用它，而不是 `get_stream_writer()`
+    --------------------------------------------
+    `get_stream_writer()` 从 configvar 里摸 Runtime；Send 分支 / 工具
+    执行链上只要这条 contextvar 链断一次，它要么抛、要么返回 no-op，
+    而两种都是**静默丢事件**。`ToolRuntime.stream_writer` 是节点函数
+    拿到的 Runtime 直接传进来的（见 `_tool_request`），中间没有
+    contextvar 这一跳。
+
+    返回 None 时 `_publish_tool_event` 才回落。
+    """
+
+    runtime = getattr(request, "runtime", None)
+
+    return getattr(runtime, "stream_writer", None)
+
+
 def _publish_tool_event(
-        event_type: RunEventType,
+        event_type: EventType,
         *,
         tool_call_id: Any,
         tool_name: str,
+        writer: Any = None,
         **data: Any,
 ) -> None:
     """
@@ -431,27 +455,49 @@ def _publish_tool_event(
 
         tools 节点 --custom stream--> RunEventProjector --> Redis（SSE）
 
-    `get_stream_writer()` 在图外（直接调节点函数、单测）会抛，吞掉即可
-    —— 那种场合本来也没有订阅端。writer 本身在未请求 `custom` 模式时
-    是 no-op，不会阻塞工具执行。
+    `writer` 由调用方传入（节点 Runtime 的那个）。取不到才回落
+    `get_stream_writer()`；两者都拿不到就是图外运行（单测 / 直接调
+    节点函数），静默返回 —— 那种场合本来也没有订阅端。
+
+    ⚠️ **取不到 / 写失败都必须留日志**
+    ---------------------------------
+    这个函数以前两头都静默（取不到 writer 静默、写失败也不管），
+    症状是「工具跑了、前端一条 tool.* 都没有」，只能靠翻 Redis 猜。
+    现在：no-op writer 告警一次（它说明 `custom` 模式没被请求），
+    真正的写失败留 warning + 异常栈。
     """
 
-    try:
-        writer = get_stream_writer()
-    except Exception:  # noqa: BLE001 - 图外运行没有 writer，不是错误
-        return
-
-    writer({
+    envelope = {
         "kind": TOOL_STREAM_KIND,
         "event": event_type.value,
         "tool_call_id": tool_call_id,
         "tool_name": tool_name,
         **data,
-    })
+    }
+
+    if write_custom(envelope, writer=writer):
+        logger.debug(
+            "已写入工具事件 %s（tool=%s, call_id=%s）。",
+            event_type.value,
+            tool_name,
+            tool_call_id,
+        )
 
 
 def _tool_event_result(outcome: ToolOutcome) -> dict[str, Any]:
-    """ToolOutcome -> tool.completed 的 output / error 字段。"""
+    """
+    ToolOutcome -> tool.completed 的 output / error / duration_ms 字段。
+
+    ⚠️ `duration_ms` 从这里出，投影层优先用它
+    ----------------------------------------
+    执行器已经测了工具本身耗时（`ToolOutcome.duration_ms`），而 chat 事件
+    的信封 `duration_ms` 以前只能从 trace 的 `tools` 回调取开始时刻 ——
+    那条路在没开 trace 时根本不存在，且回调的 id 常常与 custom 流的
+    `tool_call_id` 对不上。结果就是「工具跑完了，耗时永远是空串」。
+    把执行侧的数原样带上来，是唯一不依赖 trace 的精确来源。
+    """
+
+    timing = _duration_field(outcome.duration_ms)
 
     if outcome.ok:
 
@@ -469,17 +515,46 @@ def _tool_event_result(outcome: ToolOutcome) -> dict[str, Any]:
                 "output": {
                     "goto": str(outcome.value.goto),
                     "update": update,
-                }
+                },
+                **timing,
             }
 
-        return {"output": _render(outcome.value)}
+        return {"output": _render(outcome.value), **timing}
 
     error = outcome.error
 
     if isinstance(error, ToolCallDenied):
-        return {"error": f"调用被拒绝（工具未执行）：{error}"}
+        return {
+            "error": f"调用被拒绝（工具未执行）：{error}",
+            **timing,
+        }
 
-    return {"error": f"{type(error).__name__}: {error}"}
+    return {"error": f"{type(error).__name__}: {error}", **timing}
+
+
+def _duration_field(value: Any) -> dict[str, float]:
+    """`ToolOutcome.duration_ms` -> custom 事件里的可选字段。"""
+
+    if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value >= 0
+    ):
+        return {"duration_ms": float(value)}
+
+    return {}
+
+
+def _duration_meta(outcome: ToolOutcome) -> dict[str, Any]:
+    """
+    `ToolOutcome.duration_ms` -> `ToolMessage.additional_kwargs` 的可选键。
+
+    历史侧要显示耗时，而 `ToolMessage` 没有专门的列；additional_kwargs
+    随消息进 checkpoint，落库时由 message_recorder 读出来写进
+    `tool_result` 块（ContentBlock 的额外键是契约允许的）。
+    """
+
+    return _duration_field(outcome.duration_ms)
 
 
 def _bucket(outcome: ToolOutcome) -> str:
@@ -789,9 +864,10 @@ async def _wrap_tool_call(
         # 前端需要看到工具开始/结束。见 _publish_tool_event 的说明：
         # 写自定义流，由 RunEventProjector 统一投影。
         _publish_tool_event(
-            RunEventType.TOOL_CALLED,
+            EventType.TOOL_CALLED,
             tool_call_id=tool_call_id,
             tool_name=event_name,
+            writer=_runtime_stream_writer(request),
             input=arguments,
         )
 
@@ -812,9 +888,10 @@ async def _wrap_tool_call(
             })
 
             _publish_tool_event(
-                RunEventType.TOOL_COMPLETED,
+                EventType.TOOL_COMPLETED,
                 tool_call_id=tool_call_id,
                 tool_name=event_name,
+                writer=_runtime_stream_writer(request),
                 error=f"工具 {requested!r} 不在本次暴露的工具集合中",
             )
 
@@ -864,9 +941,10 @@ async def _wrap_tool_call(
                 command = outcome.value
 
         _publish_tool_event(
-            RunEventType.TOOL_COMPLETED,
+            EventType.TOOL_COMPLETED,
             tool_call_id=tool_call_id,
             tool_name=event_name,
+            writer=_runtime_stream_writer(request),
             **_tool_event_result(outcome),
         )
 

@@ -6,7 +6,8 @@ import pytest
 
 from app.agent.event import task_events
 from app.agent.event.run_event_projector import RunEventProjector
-from app.common.event import RunEventType, TASK_STREAM_KIND
+from app.common.event import TASK_STREAM_KIND
+from app.common.event.spec import EventType
 
 __all__: list[str] = []
 
@@ -34,7 +35,7 @@ def test_plan_published_envelope(monkeypatch) -> None:
     )
 
     assert captured[0]["kind"] == TASK_STREAM_KIND
-    assert captured[0]["event"] == RunEventType.PLAN_PUBLISHED.value
+    assert captured[0]["event"] == EventType.PLAN_PUBLISHED.value
     assert captured[0]["tasks"] == [task]
     assert captured[0]["current_task_id"] is None
     assert captured[0]["publish_id"] == "plan-1:1"
@@ -64,8 +65,8 @@ def test_task_updated_and_cleared_envelopes(monkeypatch) -> None:
     )
 
     assert [item["event"] for item in captured] == [
-        RunEventType.TASK_UPDATED.value,
-        RunEventType.PLAN_CLEARED.value,
+        EventType.TASK_UPDATED.value,
+        EventType.PLAN_CLEARED.value,
     ]
     assert captured[0]["task"] == task
     assert captured[1]["reason"] == "completed"
@@ -86,7 +87,7 @@ async def test_projector_maps_task_stream_events() -> None:
         fake,
         {
             "kind": TASK_STREAM_KIND,
-            "event": RunEventType.TASK_UPDATED.value,
+            "event": EventType.TASK_UPDATED.value,
             "node": "task_listener",
             "plan_id": "p1",
             "task": {"id": "t1"},
@@ -96,7 +97,7 @@ async def test_projector_maps_task_stream_events() -> None:
 
     event_type, node, data = fake.events[0]
 
-    assert event_type is RunEventType.TASK_UPDATED
+    assert event_type is EventType.TASK_UPDATED
     assert node == "task_listener"
     assert data["task"] == {"id": "t1"}
     assert "kind" not in data

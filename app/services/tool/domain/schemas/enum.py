@@ -22,6 +22,7 @@ __all__ = [
     "SourceState",
     "SourceType",
     "ToolExecutionStatus",
+    "ToolRenderer",
 ]
 
 
@@ -82,6 +83,31 @@ class SourceState(str, Enum):
 
     ACTIVE = "ACTIVE"
     MISSING = "MISSING"
+
+
+class ToolRenderer(str, Enum):
+    """
+    工具调用在聊天流里的**渲染形态**，前端组件注册表的键。
+
+    取值是**小写**，与 tool.yaml 一致（照规格，不照本模块
+    Processor* 那批大写枚举）—— 它们已经是对外契约字面量。
+
+    ⚠️ 没有 HIDDEN
+    -------------
+    「不显示」不是一种渲染形态，而是**没有 presenter 行**。
+    因此清除展示走 DELETE /tools/{tool_id}/presentation，
+    而不是写入一个 hidden 值。
+
+    ⚠️ 闭集
+    -------
+    前端遇到不认识的值必须降级为 INLINE（没有 display_name
+    时按不显示处理）。新增取值是**加法**：后端可以先发版。
+    """
+
+    INLINE = "inline"
+    TIPS = "tips"
+    CARD = "card"
+    TABLE = "table"
 
 
 # ============================================================

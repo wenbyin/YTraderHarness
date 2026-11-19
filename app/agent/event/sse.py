@@ -61,14 +61,18 @@ def _envelope(entry: StreamEntry) -> dict[str, Any]:
 
     payload: dict[str, Any] = dict(entry.fields)
 
-    raw = payload.get("data")
+    # v2 的三个嵌套结构都以 JSON 字符串存进 Redis（Stream 字段不能嵌套）。
+    # SSE 比存储宽松，这里一并解开；解不开就原样留着（仍是字符串）——
+    # 一条坏记录不该让整帧发不出去。
+    for key in ("data", "error", "links"):
+        raw = payload.get(key)
 
-    if isinstance(raw, str):
+        if not isinstance(raw, str):
+            continue
+
         try:
-            payload["data"] = json.loads(raw)
+            payload[key] = json.loads(raw)
         except ValueError:
-            # 解不开就原样留着（仍是字符串）。一条坏记录不该让整帧发不
-            # 出去 —— 订阅端至少还能看到事件名与 id，"少一段"比"断流"好。
             pass
 
     return payload

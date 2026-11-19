@@ -1,19 +1,12 @@
 """
 Trace 事件发射器（图内 / 自有 runtime 共用）。
 
-两条发射路径
-------------
-    TraceEmitter      由 LangGraph 节点 / 自有 runtime 使用：
-                      把事件写进当前 LangGraph 的 **custom stream**，
-                      由投影层校验后再落 Redis。
-    TracePublisher    由 Run 外层（dispatch / service）使用：
-                      直接走既有 Redis 发布器。
+它把**规范 `Event`** 写进当前 LangGraph 的 custom stream，由投影层
+二次校验后交给 `EventRouter`。节点侧不再有单独的 trace 事件模型 ——
+与工具 / 任务 / 子代理事件走同一条 custom 通道、同一个规范信封。
 
-为什么分开
-----------
-提示词第 5 节要求：图内事件走 Custom Stream；Run 外层事件发生在图调用
-边界之外时，由 Run Orchestrator 用同一事件模型直接发布。把两者混在一个
-对象里会让"谁在什么上下文里能 await"变得含糊。
+Run 外层（dispatch / service）的事件不经过这里：它们在图的边界之外，
+由 `emit_event` 直接发布。
 
 线程 / 并发安全
 ---------------
@@ -35,13 +28,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
+from .spec import Event, EventType
 from .trace import (
-    EventType,
     SpanKind,
     SpanLink,
     SpanStatus,
     TraceError,
-    TraceEvent,
 )
 
 __all__ = [
@@ -89,6 +81,35 @@ def tool_span_id(trace_id: str, tool_call_id: str) -> str:
     """
 
     return stable_span_id("tool", trace_id, tool_call_id)
+
+
+def _canonical_payload(
+        event_type: EventType,
+        payload: Mapping[str, Any] | None,
+        span_name: str | None,
+) -> dict[str, Any]:
+    """
+    旧的 trace payload -> 规范 payload。
+
+    唯一需要改名的是共享事件：trace 侧用 `node_name`，规范侧统一为
+    `node_id`（原先投影层转换时的同一条映射）。其余 trace 事件直接
+    复用 `trace.py` 的 payload 模型。
+    """
+
+    data = dict(payload or {})
+
+    if event_type in (EventType.NODE_STARTED, EventType.NODE_COMPLETED):
+
+        if "node_id" not in data:
+            data["node_id"] = str(
+                data.pop("node_name", None)
+                or span_name
+                or "unknown"
+            )
+        else:
+            data.pop("node_name", None)
+
+    return data
 
 
 def error_from_exception(
@@ -187,7 +208,7 @@ class TraceSpan:
             status: SpanStatus = SpanStatus.COMPLETED,
             duration_ms: int | None = None,
             occurred_at: datetime | None = None,
-    ) -> TraceEvent | None:
+    ) -> Event | None:
         """正常结束。"""
 
         return self._end(
@@ -204,7 +225,7 @@ class TraceSpan:
             *,
             payload: Mapping[str, Any] | None = None,
             duration_ms: int | None = None,
-    ) -> TraceEvent | None:
+    ) -> Event | None:
         """失败结束。`failed_type` 缺省时退回普通结束事件 + status=failed。"""
 
         trace_error = (
@@ -238,7 +259,7 @@ class TraceSpan:
             payload: Mapping[str, Any] | None = None,
             status: SpanStatus = SpanStatus.CANCELLED,
             duration_ms: int | None = None,
-    ) -> TraceEvent | None:
+    ) -> Event | None:
         """取消 / 中断收尾（仍用普通结束事件，status 表明真相）。"""
 
         return self._end(
@@ -258,7 +279,7 @@ class TraceSpan:
             status: SpanStatus,
             duration_ms: int | None,
             occurred_at: datetime | None = None,
-    ) -> TraceEvent | None:
+    ) -> Event | None:
 
         return self._emitter._emit(
             event_type,
@@ -290,7 +311,7 @@ class TraceSpan:
 
 class TraceEmitter:
     """
-    构造并校验 TraceEvent，然后写进 custom stream。
+    构造并校验规范 `Event`，然后写进 custom stream。
 
     Parameters
     ----------
@@ -417,7 +438,7 @@ class TraceEmitter:
             error: TraceError | None = None,
             occurred_at: datetime | None = None,
             event_id: str | None = None,
-    ) -> TraceEvent | None:
+    ) -> Event | None:
         """发一条瞬时事件（first_token / transition / retry_scheduled 等）。"""
 
         return self._emit(
@@ -460,19 +481,19 @@ class TraceEmitter:
             error: TraceError | None = None,
             occurred_at: datetime | None = None,
             event_id: str | None = None,
-    ) -> TraceEvent | None:
+    ) -> Event | None:
 
         if not self.enabled:
             return None
 
         try:
-            event = TraceEvent(
+            event = Event(
                 event_id=event_id or _new_id(),
-                event_type=event_type,
+                type=event_type,
                 occurred_at=occurred_at or _now(),
                 trace_id=self.trace_id,
                 run_id=self.run_id,
-                thread_id=self.thread_id,
+                session_id=self.thread_id,
                 span_id=span_id,
                 parent_span_id=parent_span_id,
                 span_kind=span_kind,
@@ -484,8 +505,8 @@ class TraceEmitter:
                 fanout_id=fanout_id,
                 branch_id=branch_id,
                 branch_index=branch_index,
-                payload=dict(payload or {}),
                 error=error,
+                data=_canonical_payload(event_type, payload, span_name),
             )
 
             self._writer(event.model_dump(mode="json"))

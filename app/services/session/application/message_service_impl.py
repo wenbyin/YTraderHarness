@@ -6,16 +6,27 @@ MessageService 的默认实现。
 
 from __future__ import annotations
 
+import logging
+from typing import Any
 from uuid import UUID
 
+from app.agent.event.config import load_sink_configs
 from app.common.exceptions import NotFoundError
 from app.common.service.base import ServiceContext
+from app.services.tool.application.presentation_lookup import (
+    build_presentation_lookup,
+)
+from app.services.tool.repository.tool_presentation import (
+    ToolPresentationRepository,
+)
 
 from ..domain.schemas import MessagePage, decode_cursor
 from ..repository.agent_session import AgentSessionRepository
 from ..repository.message import MessageRepository
 from ._assembly import build_message_page
 from .message_service import DEFAULT_LIMIT, MessageService
+
+logger = logging.getLogger(__name__)
 
 
 class MessageServiceImpl(MessageService):
@@ -25,12 +36,18 @@ class MessageServiceImpl(MessageService):
             *,
             message_repository: MessageRepository,
             agent_session_repository: AgentSessionRepository,
+            tool_presentation_repository: (
+                ToolPresentationRepository | None
+            ) = None,
             ctx: ServiceContext | None = None,
     ) -> None:
         super().__init__(ctx)
 
         self._messages = message_repository
         self._sessions = agent_session_repository
+        #: 历史侧的展示过滤。None = 不启用（老构造点 / 单测），
+        #: 生产由工厂按仓储契约注入。
+        self._presentations = tool_presentation_repository
 
     async def list_messages(
             self,
@@ -78,10 +95,48 @@ class MessageServiceImpl(MessageService):
             )
         )
 
+        # 思维链输出开关与实时流**同一份配置**（event_stream.yaml 的
+        # sinks.chat.reasoning_enabled）。关掉时消息接口也不回推理 ——
+        # 否则「实时藏了、刷新后又能看到」还是不一致。
+        # 库里照旧保留，这是输出开关。
+        include_reasoning = load_sink_configs()[
+            "chat"
+        ].reasoning_enabled
+
+        # 工具展示过滤与实时流同一份配置表：没有 presenter 的调用块
+        # 不出现在历史里（默认隐藏），与 SSE 的门控对齐。
+        presentations = await self._presentation_lookup()
+
         return build_message_page(
             session_id=session_id,
             entities=entities,
             limit=limit,
             has_more_before=has_more_before,
             has_more_after=has_more_after,
+            include_reasoning=include_reasoning,
+            presentations=presentations,
         )
+
+    async def _presentation_lookup(self) -> dict[str, Any] | None:
+        """
+        取展示查找表；`None` = 不启用过滤。
+
+        ⚠️ 读失败按**全显示**退化（None），不是全隐藏：
+            展示是旁路，一次查询失败不该把整个会话的历史工具行清空。
+            展示本身也不是安全边界 —— 完整数据在库里和 tool_execution。
+        """
+
+        if self._presentations is None:
+            return None
+
+        try:
+            rows = await self._presentations.list_all()
+
+        except Exception:  # noqa: BLE001 - 见 docstring
+            logger.exception(
+                "读取工具展示配置失败：本次历史不做展示过滤"
+                "（未配置的工具暂时按显示处理）。"
+            )
+            return None
+
+        return build_presentation_lookup(rows)

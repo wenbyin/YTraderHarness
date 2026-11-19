@@ -41,6 +41,9 @@ from app.services.tool.application.tool_discovery_service import (
 from app.services.tool.application.tool_documentation_service import (
     ToolDocumentationService,
 )
+from app.services.tool.application.tool_presentation_service import (
+    ToolPresentationService,
+)
 from app.services.tool.application.tool_query_service import (
     ToolQueryService,
 )
@@ -54,6 +57,8 @@ from app.services.tool.domain.schemas import (
     ToolDocumentationUpdate,
     ToolEnabledState,
     ToolEnabledUpdate,
+    ToolPresentation,
+    ToolPresentationState,
     ToolSyncRequest,
     ToolSyncResult,
 )
@@ -201,6 +206,70 @@ async def set_tool_enabled(
 
     try:
         return await service.set_enabled(tool_id, request.enabled)
+
+    except ValueError as exc:
+        raise to_http_error(exc) from exc
+
+
+# ============================================================
+# Tool Presentation
+# ============================================================
+
+
+@router.put(
+    "/tools/{tool_id}/presentation",
+    response_model=ToolPresentationState,
+    tags=["Tools"],
+)
+async def set_tool_presentation(
+        tool_id: UUID,
+        request: ToolPresentation,
+        service: ToolPresentationService = Service[
+            ToolPresentationService
+        ],
+):
+    """
+    设置工具的展示描述符（整份替换）。
+
+    **它只决定「显示什么」**：这条工具调用出不出现在事件流、以什么
+    形态出现、带哪些字段。不决定模型能不能调用（那是
+    PATCH /tools/{tool_id}/enabled），也不控制时机 / 合并 / 消失
+    （那些属于客户端）。
+
+    持久层语义是"有行 = 显示"：写入即开启。没有 presenter 行时，
+    该工具的 tool.called / tool.completed 一条都不发，名字也不进
+    message.completed.tool_calls —— 默认不显示。
+
+    关闭展示走 DELETE，而不是写入某个 hidden 取值。
+    """
+
+    try:
+        return await service.set_presentation(tool_id, request)
+
+    except ValueError as exc:
+        raise to_http_error(exc) from exc
+
+
+@router.delete(
+    "/tools/{tool_id}/presentation",
+    response_model=ToolPresentationState,
+    tags=["Tools"],
+)
+async def clear_tool_presentation(
+        tool_id: UUID,
+        service: ToolPresentationService = Service[
+            ToolPresentationService
+        ],
+):
+    """
+    删除展示描述符，回到默认隐藏。
+
+    工具**仍然可以**被模型调用 —— 「不显示」不等于「下线」。
+    没有 presenter 时也成功（幂等）。
+    """
+
+    try:
+        return await service.clear_presentation(tool_id)
 
     except ValueError as exc:
         raise to_http_error(exc) from exc

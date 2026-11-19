@@ -58,11 +58,11 @@ from collections.abc import Mapping
 from typing import Any
 
 from langchain_core.messages import AIMessage
-from langgraph.config import get_stream_writer
 from langgraph.graph import END
 from langgraph.runtime import Runtime
 from langgraph.types import Send
 
+from app.agent.event.stream import resolve_stream_writer
 from app.common.event import EventType, SpanKind, SpanStatus, TraceEmitter
 from app.common.event.trace_emitter import stable_span_id, tool_span_id
 from app.infra.graph import execution_ids
@@ -471,7 +471,8 @@ def _emit_fanout_trace(
         trace_id=trace_id,
         run_id=str(run_id) if run_id is not None else "",
         thread_id=None if session_id is None else str(session_id),
-        writer=get_stream_writer(),
+        # 与工具 / 任务事件共用同一套 writer 解析（含 no-op 识别与告警）。
+        writer=resolve_stream_writer() or (lambda _: None),
     )
 
     fanout_id = stable_span_id("fanout", trace_id, agent_task_id)

@@ -37,6 +37,7 @@ __all__ = [
     "REFERENCE_RULE",
     "escape_reference",
     "tag_name",
+    "unwrap_reference",
     "wrap_reference",
 ]
 
@@ -91,6 +92,51 @@ def wrap_reference(name: str, label: str, text: str) -> str:
         f"{REFERENCE_RULE}\n"
         f"</ref:{tag}>"
     )
+
+
+#: 开标签：`<ref:tool desc="...">` 后紧跟换行（`wrap_reference` 的固定写法）。
+_OPEN_TAG = re.compile(
+    r"^\s*<ref:(?P<tag>[0-9A-Za-z_-]+)\b[^>\n]*>\s*\n"
+)
+
+
+def unwrap_reference(text: str) -> str | None:
+    """
+    `wrap_reference` 的逆操作：取出标签内的正文，去掉规则尾注。
+
+    不是 ref 块时返回 None —— 调用方据此知道"这段本来就是裸文本"。
+
+    ⚠️ 正文**不**反转义
+    -----------------
+    正文里的 `<` 被 `escape_reference` 改成 `&lt;` 过（只针对标签形状）。
+    这里不反转义：反转义会让 `</ref:tool>` 之类的文本重新具备闭合能力。
+    对 JSON 解析来说，`&lt;` 只可能出现在字符串值里，不影响结构。
+    """
+
+    source = str(text or "")
+
+    match = _OPEN_TAG.match(source)
+
+    if match is None:
+        return None
+
+    tag = match.group("tag")
+    closing = f"</ref:{tag}>"
+
+    end = source.rfind(closing)
+
+    if end == -1:
+        return None
+
+    body = source[match.end():end]
+
+    # 规则尾注与数据同处标签内（见模块 docstring），去掉最后一个。
+    rule_at = body.rfind(REFERENCE_RULE)
+
+    if rule_at != -1:
+        body = body[:rule_at]
+
+    return body.strip()
 
 
 # ============================================================

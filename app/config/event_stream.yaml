@@ -10,6 +10,9 @@
 # 用途：本地没有 Redis、或这版只想把日志压干净时，不必去改 redis.yaml。
 enabled: true
 
+# v2 写入端配置的版本。旧文件没有这一段时按 1 处理。
+schema_version: 2
+
 # 事件流的 topic。最终的键是 "<key_prefix>:<topic_id>"，
 # 即 topic=agent_run、topic_id=run_123 时键为 "agent_run:run_123"。
 key_prefix: "${AGENT_EVENT_STREAM_PREFIX:-agent_run}"
@@ -131,3 +134,54 @@ write_queue_size: 50000
 #
 # ⚠️ 必须 ≤ redis.yaml 的 sync_max_connections（每个线程一条同步连接）。
 write_workers: "${EVENT_WRITE_WORKERS:-4}"
+
+# ============================================================
+# v2 写入端（每个 sink 一份）
+# ============================================================
+#
+# 放行哪些事件**不在这里** —— 那是契约，写在
+# app/common/event/spec.py 的 CHAT_EVENT_TYPES / TRACE_EVENT_TYPES。
+# 这一段只调优队列、TTL 与写线程数。
+
+sinks:
+  chat:
+    enabled: true
+    key_prefix: "${AGENT_EVENT_STREAM_PREFIX:-agent_run}"
+
+    # 实时 UI 流：最后一次事件之后 10 分钟过期。
+    maxlen: 10000
+    ttl_seconds: 600
+
+    # 逐 token 的 delta 走这条队列；保留原来的 50000 上限。
+    write_queue_size: 50000
+    write_workers: "${EVENT_WRITE_WORKERS:-4}"
+
+    # 是否把模型的思维链推给 chat 流：
+    #   message.reasoning.delta     逐 token 的推理增量
+    #   message.reasoning.completed 推理全文（在 message.completed 之前发）
+    #
+    # ⚠️ 同时作用于两条**输出**通道：
+    #     · chat 实时事件流（上面两条事件）
+    #     · GET /sessions/{id}/messages（reasoning_content 与存量 content
+    #       里的 reasoning 块都不回）
+    #    否则「实时藏了、刷新后又能看到」还是不一致。
+    # ⚠️ 库里照旧保留原文（reasoning_content 列）—— 这是输出开关，不是
+    #    存储开关。
+    # ⚠️ 改这个值要重启进程（配置按进程缓存，与其它 yaml 一致）。
+    reasoning_enabled: false
+
+  trace:
+    enabled: true
+
+    # trace 的键形如 trace:<trace_id>:events；stress 聚合器按这个键读。
+    key_prefix: trace
+
+    maxlen: 10000
+
+    # ⚠️ 加长到 7 天：stress 是 Campaign 结束后才批量读，600 秒会丢尾巴。
+    # maxlen 限制单条 stream 的长度，TTL 限制键的数量，两者都要。
+    ttl_seconds: 604800
+
+    # trace 的事件量比 chat 大，但它不承载逐 token 正文，队列可以小一些。
+    write_queue_size: 20000
+    write_workers: 2

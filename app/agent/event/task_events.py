@@ -8,7 +8,7 @@
         ...
     })
 
-RunEventProjector 把它投影成 RunEventType.PLAN_PUBLISHED /
+RunEventProjector 把它投影成 EventType.PLAN_PUBLISHED /
 TASK_UPDATED / PLAN_CLEARED，再经 publish_run_event 进 Redis / SSE。
 
 为什么走 custom stream
@@ -21,7 +21,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.common.event import TASK_STREAM_KIND, RunEventType
+from app.common.event import TASK_STREAM_KIND
+from app.common.event.spec import EventType
 
 from .stream import write_custom
 
@@ -58,7 +59,7 @@ def publish_plan_published(
 
     _write({
         "kind": TASK_STREAM_KIND,
-        "event": RunEventType.PLAN_PUBLISHED.value,
+        "event": EventType.PLAN_PUBLISHED.value,
         "node": node,
         "plan_id": plan_id,
         "revision": revision,
@@ -82,7 +83,7 @@ def publish_task_updated(
 
     _write({
         "kind": TASK_STREAM_KIND,
-        "event": RunEventType.TASK_UPDATED.value,
+        "event": EventType.TASK_UPDATED.value,
         "node": node,
         "plan_id": plan_id,
         "revision": revision,
@@ -102,7 +103,7 @@ def publish_plan_cleared(
 
     _write({
         "kind": TASK_STREAM_KIND,
-        "event": RunEventType.PLAN_CLEARED.value,
+        "event": EventType.PLAN_CLEARED.value,
         "node": node,
         "plan_id": plan_id,
         "revision": revision,

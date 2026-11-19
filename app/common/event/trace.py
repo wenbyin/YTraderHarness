@@ -1,17 +1,15 @@
 """
-Trace 事件的**词汇与校验**（纯契约，不碰 Redis / LangGraph）。
+Trace 侧的**事件名与 payload 校验**（纯契约，不碰 Redis / LangGraph）。
 
-来源：`design_agent_eval/agent_eval_codegen_prompt.md` 第一阶段。
+事件模型已经统一为 `app/common/event/spec.py` 的 `Event`：trace 与 chat
+共用同一个信封。本模块只保留：
 
-与本仓库既有 `RunEvent` 的关系
-------------------------------
-两条流、两套词汇，刻意不合并：
+    EventType（trace 侧词表，内部用于 _PAYLOAD_MODELS 键）
+    SpanKind / SpanStatus / SpanLink / TraceError
+    每种 trace 事件的严格 payload 模型（spec.py 复用它们）
 
-    RunEvent      聊天窗事件（含逐 token delta）   topic=agent_run
-    TraceEvent    执行观测事件（无 delta）          key=trace:{trace_id}:events
-
-共同的实现只有"怎么把一条事件写进 Redis"（复用 `RedisEventPublisher`
-的队列与 sink），事件模型本身各自独立。
+旧的 `TraceEvent` 与 v1 写线程已经删除；本模块只保留 trace 词表与
+payload 模型。
 
 ⚠️ 与提示词的一处刻意偏离
 --------------------------
@@ -30,12 +28,10 @@ trace_id 为准**，它可以跨 run / 跨 session。因此这里额外保留 `r
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
     "DECISION_VALUES",
@@ -44,7 +40,6 @@ __all__ = [
     "SpanLink",
     "SpanStatus",
     "TraceError",
-    "TraceEvent",
     "trace_stream_key",
 ]
 
@@ -526,113 +521,6 @@ _FAILED_EVENTS: frozenset[EventType] = frozenset({
     EventType.FANOUT_FAILED,
     EventType.APPROVAL_FAILED,
 })
-
-
-# ============================================================
-# TraceEvent
-# ============================================================
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-class TraceEvent(BaseModel):
-    """一条 Trace 事件。字段语义见提示词第 2 节。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    schema_version: Literal["1.0"] = "1.0"
-
-    event_id: str = Field(min_length=1)
-    event_type: EventType
-    occurred_at: datetime = Field(default_factory=_utc_now)
-
-    #: 聚合键（前端传入）。同一 trace 可跨 run / session。
-    trace_id: str = Field(min_length=1)
-
-    #: 本项目的补充字段（见模块 docstring 的偏离说明）。
-    run_id: str = Field(min_length=1)
-
-    #: 会话 ID（业务 session_id），不是 langgraph 内部 thread_id。
-    thread_id: str | None = None
-
-    span_id: str = Field(min_length=1)
-    parent_span_id: str | None = None
-    span_kind: SpanKind
-    span_name: str = Field(min_length=1)
-
-    status: SpanStatus | None = None
-    attempt: int = Field(default=1, ge=1)
-    duration_ms: int | None = Field(default=None, ge=0)
-
-    links: list[SpanLink] = Field(default_factory=list)
-
-    fanout_id: str | None = None
-    branch_id: str | None = None
-    branch_index: int | None = Field(default=None, ge=0)
-
-    payload: dict[str, Any] = Field(default_factory=dict)
-    error: TraceError | None = None
-
-    @field_validator("occurred_at")
-    @classmethod
-    def _require_tz(cls, value: datetime) -> datetime:
-        if value.tzinfo is None:
-            raise ValueError("occurred_at 必须带时区（UTC）")
-        return value.astimezone(timezone.utc)
-
-    @model_validator(mode="after")
-    def _validate_payload(self) -> "TraceEvent":
-        model = _PAYLOAD_MODELS[self.event_type]
-        validated = model.model_validate(self.payload)
-        self.payload = validated.model_dump(exclude_none=True)
-
-        if self.event_type in _FAILED_EVENTS and self.error is None:
-            raise ValueError(f"{self.event_type.value} 必须带 error")
-
-        return self
-
-    # ----------------------------------------------------------
-    # Redis Stream 形状
-    # ----------------------------------------------------------
-
-    @property
-    def topic(self) -> str:
-        """固定 topic。"""
-
-        return "trace"
-
-    @property
-    def topic_id(self) -> str:
-        """键的右半段：`<trace_id>:events`（见提示词第 6 节）。"""
-
-        return f"{self.trace_id}:events"
-
-    def to_fields(self) -> dict[str, str]:
-        """
-        扁平化成 Redis Stream 的字段。
-
-        常用字段平铺（便于 XRANGE 后直接看），完整事件再序列化进 `data`。
-        Redis Stream 的字段值只能是标量，所以这里全部转字符串。
-        """
-
-        return {
-            "event": self.event_type.value,
-            "event_id": self.event_id,
-            "trace_id": self.trace_id,
-            "run_id": self.run_id,
-            "span_id": self.span_id,
-            "parent_span_id": self.parent_span_id or "",
-            "span_kind": self.span_kind.value,
-            "span_name": self.span_name,
-            "occurred_at": self.occurred_at.isoformat(),
-            "data": json.dumps(
-                self.model_dump(mode="json"),
-                ensure_ascii=False,
-                default=str,
-            ),
-        }
 
 
 def trace_stream_key(trace_id: str) -> str:

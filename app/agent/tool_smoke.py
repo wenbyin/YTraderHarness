@@ -299,6 +299,26 @@ class FakeDefinitionStateRepository:
         return existed
 
 
+class FakePresentationRepository:
+    """内存版展示描述符：字典里有 key = 该工具展示。"""
+
+    def __init__(self):
+        self.presentations: dict[str, object] = {}
+
+    async def map_for_keys(self, tool_keys):
+        return {
+            key: self.presentations[key]
+            for key in tool_keys
+            if key in self.presentations
+        }
+
+    async def get(self, tool_key):
+        return self.presentations.get(tool_key)
+
+    async def list_all(self):
+        return list(self.presentations.values())
+
+
 class FakeDocumentationRepository:
     def __init__(self):
         self.docs: dict[UUID, dict] = {}
@@ -622,6 +642,7 @@ async def main() -> int:
     discoverer = ToolDiscoverer([_OwnToolsScanner(registry)])
     definitions = FakeDefinitionRepository()
     definition_states = FakeDefinitionStateRepository()
+    presentations = FakePresentationRepository()
     documentations = FakeDocumentationRepository()
 
     # 一份假数据同时喂给两个契约：能力树本体（capability 模块）与
@@ -636,6 +657,7 @@ async def main() -> int:
     query = ToolQueryServiceImpl(
         tool_definition_repository=definitions,
         tool_definition_state_repository=definition_states,
+        tool_presentation_repository=presentations,
         tool_documentation_repository=documentations,
         tool_classification_repository=store,
     )

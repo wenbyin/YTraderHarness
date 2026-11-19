@@ -46,7 +46,6 @@ from redis.exceptions import (
 from app.agent.event import (
     HEARTBEAT,
     NullEventPublisher,
-    RedisEventPublisher,
     RedisStreamSink,
     RunStreamRegistry,
     StreamConfig,
@@ -54,18 +53,26 @@ from app.agent.event import (
     build_event_publisher,
     build_run_stream_registry,
     close_event_publisher,
+    emit_event,
     get_event_publisher,
     get_run_stream_registry,
     is_terminal,
     load_stream_config,
-    publish_run_event,
     reset_event_publisher,
     reset_run_stream_registry,
     sse_frame,
     start_event_publisher,
     stream_key,
 )
-from app.common.event import TERMINAL_EVENT_TYPES, RunEvent, RunEventType
+from app.agent.event.config import SinkConfig
+from app.agent.event.routing import RouterEventPublisher
+from app.common.event import (
+    TERMINAL_EVENT_TYPES,
+    SpanStatus,
+)
+from app.common.event.spec import CHAT_EVENT_TYPES
+from app.common.event.spec import Event as CanonicalEvent
+from app.common.event.spec import EventType as CanonicalEventType
 
 # ============================================================
 # 断言工具
@@ -473,12 +480,11 @@ async def main() -> int:
         stream_key("agent_run", "run_123") == "agent_run:run_123",
     )
 
-    event = RunEvent(
-        type=RunEventType.MESSAGE_DELTA,
-        topic=config.key_prefix,
-        topic_id="run_123",
-        data={"delta": "你好，世界"},
+    event = CanonicalEvent(
+        type=CanonicalEventType.MESSAGE_DELTA,
+        run_id="run_123",
         node="agent",
+        data={"delta": "你好，世界"},
     )
 
     fields = event.to_fields()
@@ -486,9 +492,9 @@ async def main() -> int:
     check(
         "信封字段平铺在顶层（订阅方不解 JSON 就能筛 run）",
         fields["event"] == "message.delta"
-        and fields["topic"] == "agent_run"
-        and fields["topic_id"] == "run_123"
-        and fields["node"] == "agent",
+        and fields["run_id"] == "run_123"
+        and fields["node"] == "agent"
+        and fields["schema_version"] == "2.0",
     )
     check(
         "data 是 JSON **字符串**（Stream 的字段值不能嵌套）",
@@ -505,60 +511,94 @@ async def main() -> int:
     )
     check(
         "node 缺省是空串，不是 'None'",
-        RunEvent(
-            type=RunEventType.RUN_STARTED,
-            topic="agent_run",
-            topic_id="run_123",
+        CanonicalEvent(
+            type=CanonicalEventType.RUN_STARTED,
+            run_id="run_123",
+            data={"agent_type": "react", "graph_name": "react"},
         ).to_fields()["node"] == "",
     )
     check(
-        "十二个事件名一个不多一个不少",
-        [item.value for item in RunEventType] == [
+        "chat 放行集合一个不多一个不少",
+        {item.value for item in CHAT_EVENT_TYPES} == {
             "run.started",
             "run.completed",
             "run.failed",
+            "run.cancelled",
             "node.started",
             "node.completed",
             "message.started",
             "message.delta",
             "message.completed",
+            "message.reasoning.delta",
+            "message.reasoning.completed",
             "tool.called",
             "tool.completed",
+            "plan.published",
+            "task.updated",
+            "plan.cleared",
+            "subagent.created",
+            "subagent.claimed",
+            "subagent.task.updated",
+            "subagent.completed",
             "hitl.requested",
             "hitl.resolved",
-        ],
+        },
     )
     check(
-        "终止事件只有 completed / failed",
+        "终止事件 = completed / failed / cancelled",
         {item.value for item in TERMINAL_EVENT_TYPES}
-        == {"run.completed", "run.failed"},
+        == {"run.completed", "run.failed", "run.cancelled"},
     )
+
+    def sink_configs(*, queue: int = 100):
+        return {
+            "chat": SinkConfig(
+                enabled=True,
+                key_prefix="agent_run",
+                maxlen=config.maxlen,
+                ttl_seconds=config.ttl_seconds,
+                write_queue_size=queue,
+                write_workers=1,
+            ),
+            "trace": SinkConfig(
+                enabled=True,
+                key_prefix="trace",
+                maxlen=config.maxlen,
+                ttl_seconds=604_800,
+                write_queue_size=queue,
+                write_workers=1,
+            ),
+        }
 
     # --------------------------------------------------------
 
     section("2. 投递 = 入队，写入发生在**写线程**里")
 
     sink = FakeSink()
-    publisher = RedisEventPublisher(sink, config)
+    publisher = RouterEventPublisher(sink, configs=sink_configs())
     publisher.start()
 
     check("装了真 sink 后 enabled 为真", publisher.enabled is True)
-    check("入队成功返回 True", await publisher.publish(event) is True)
+    check(
+        "入队成功返回 chat=True",
+        await publisher.emit(event) == {"chat": True},
+    )
     check("入队就好 —— 此刻可能还没写出去", len(sink.writes) <= 1)
 
     await publisher.drain()
 
     check("drain 之后真的写出去了", len(sink.writes) == 1)
     check(
-        "写在名为 event-publisher 的线程上（不是事件循环线程）",
-        sink.threads == ["event-publisher"],
+        "写在 event-sink 写线程上（不是事件循环线程）",
+        len(sink.threads) == 1
+        and sink.threads[0].startswith("event-sink-chat"),
     )
 
     key_written, fields_written, maxlen_written, ttl_written = sink.writes[0]
 
     check("键是 agent_run:run_123", key_written == "agent_run:run_123")
     check(
-        "内容在入队那一刻就冻结了（字段与 event.to_fields() 一致）",
+        "内容在入队那一刻就冻结了（v2 字段）",
         fields_written["event"] == "message.delta"
         and json.loads(fields_written["data"]) == {"delta": "你好，世界"},
     )
@@ -568,18 +608,14 @@ async def main() -> int:
     )
     check("TTL 用的是配置值", ttl_written == config.ttl_seconds)
 
-    # ⚠️ 这条守的是"publish() 里不许有 await"这条不变量（见 publisher.py
-    # 模块 docstring）：没有 await，它相对事件循环就是不可分割的一个回合，
-    # 与 aclose() 的"置停止位"天然串行，不需要锁。
-    # 判据：await 它的时候，别的就绪任务拿不到执行机会。
     yielded: list[int] = []
 
     async def _other() -> None:
         yielded.append(1)
 
     pending = asyncio.create_task(_other())
-    await publisher.publish(event)
-    check("publish() 不让出事件循环（体内没有 await）", yielded == [])
+    await publisher.emit(event)
+    check("emit() 不让出事件循环（路由体内没有 await）", yielded == [])
     await pending
 
     await publisher.aclose()
@@ -641,31 +677,36 @@ async def main() -> int:
     section("4. 写入失败**不上抛**（事件是旁路）；队列满则拒收")
 
     broken_sink = FakeSink(fail=True)
-    broken = RedisEventPublisher(broken_sink, config)
+    broken = RouterEventPublisher(broken_sink, configs=sink_configs())
     broken.start()
 
-    accepted = await broken.publish(event)
+    accepted = await broken.emit(event)
 
-    check("入队本身是成功的（返回 True）", accepted is True)
+    check("入队本身是成功的（chat=True）", accepted.get("chat") is True)
 
     await broken.drain()
 
     check("写入失败被计数", broken.failures == 1)
     check("一条都没写出去", broken_sink.writes == [])
-    check("失败没把写线程搞死（后续投递照常入队）",
-          await broken.publish(event) is True)
+    check(
+        "失败没把写线程搞死（后续投递照常入队）",
+        (await broken.emit(event)).get("chat") is True,
+    )
 
     await broken.aclose()
 
-    # 队列满：拒收**最新**那条，已接收的照常写出（连续前缀，正文不留空洞）
     slow_sink = FakeSink(slow=0.1)
-    bounded = RedisEventPublisher(slow_sink, config, queue_size=2)
+    bounded = RouterEventPublisher(slow_sink, configs=sink_configs(queue=2))
     bounded.start()
 
-    results = [await bounded.publish(event) for _ in range(4)]
+    results = [await bounded.emit(event) for _ in range(4)]
+    chat_results = [result.get("chat") for result in results]
 
-    check("队列满之后拒绝入队（而不是无限吃下）", results[:2] == [True, True]
-          and results[2:] == [False, False])
+    check(
+        "队列满之后拒绝入队（而不是无限吃下）",
+        chat_results[:2] == [True, True]
+        and chat_results[2:] == [False, False],
+    )
     check("被拒的条数单独计数", bounded.rejected == 2)
 
     await bounded.drain()
@@ -673,11 +714,12 @@ async def main() -> int:
     check("已接收的那两条照常写出去（顺序不变）", len(slow_sink.writes) == 2)
     check("写入失败与拒收分开计数", bounded.failures == 0)
 
-    # 没起线程 = 没人消费，最该防的就是"入队成功却没人写"
-    idle = RedisEventPublisher(FakeSink(), config)
+    idle = RouterEventPublisher(FakeSink(), configs=sink_configs())
 
-    check("没 start() 时拒收（而不是静默排进没人消费的队列）",
-          await idle.publish(event) is False)
+    check(
+        "没 start() 时拒收（而不是静默排进没人消费的队列）",
+        (await idle.emit(event)).get("chat") is False,
+    )
 
     await bounded.aclose()
 
@@ -688,7 +730,7 @@ async def main() -> int:
     null = NullEventPublisher()
 
     check("空发布器 enabled 为假", null.enabled is False)
-    check("空发布器 publish 返回 False", await null.publish(event) is False)
+    check("空发布器 emit 返回空表", await null.emit(event) == {})
 
     reset_event_publisher()
 
@@ -699,7 +741,7 @@ async def main() -> int:
 
     # --------------------------------------------------------
 
-    section("6. 最常用入口 publish_run_event 自带 topic")
+    section("6. 规范事件入口 emit_event 由路由决定落哪条流")
 
     reset_event_publisher()
 
@@ -714,24 +756,29 @@ async def main() -> int:
     check("探活通过并起了写线程", started is True)
     check("探活真的打了（一次）", wired_sink.pings == 1)
 
-    sent = await publish_run_event(
-        RunEventType.NODE_STARTED,
-        "run_999",
+    sent = await emit_event(CanonicalEvent(
+        type=CanonicalEventType.NODE_STARTED,
+        run_id="run_999",
         node="agent",
+        status=SpanStatus.RUNNING,
         data={"node_id": "agent"},
-    )
+    ))
 
-    check("投递成功", sent is True)
+    check("投递成功", sent.get("chat") is True)
 
     await get_event_publisher().drain()
 
     sent_key, sent_fields = wired_sink.writes[0][0], wired_sink.writes[0][1]
 
     check(
-        "topic 由配置填，调用方不必传",
-        sent_fields["topic"] == config.key_prefix,
+        "v2 信封带 schema_version",
+        sent_fields["schema_version"] == "2.0",
     )
-    check("topic_id 就是 run id", sent_fields["topic_id"] == "run_999")
+    check("run_id 就是 run id", sent_fields["run_id"] == "run_999")
+    check(
+        "v2 不再写 topic / topic_id（路由只在键上）",
+        "topic" not in sent_fields and "topic_id" not in sent_fields,
+    )
     check("键拼成 agent_run:run_999", sent_key == "agent_run:run_999")
 
     await close_event_publisher()
@@ -757,8 +804,13 @@ async def main() -> int:
         isinstance(get_event_publisher(), NullEventPublisher),
     )
     check(
-        "探活失败 -> 投递直接返回 False，且一条都没发",
-        await publish_run_event(RunEventType.RUN_STARTED, "run_999") is False
+        "探活失败 -> 投递没有通道（空结果），且一条都没发",
+        await emit_event(CanonicalEvent(
+            type=CanonicalEventType.RUN_STARTED,
+            run_id="run_999",
+            status=SpanStatus.RUNNING,
+            data={"agent_type": "", "graph_name": ""},
+        )) == {}
         and dead_sink.writes == [],
     )
 
@@ -1000,7 +1052,7 @@ async def main() -> int:
     body = json.loads(frame.split("data: ", 1)[1].split("\n")[0])
 
     check(
-        "data: 放整个信封（含 topic_id 等信封字段）",
+        "data: 放整个信封（schema_version / run_id / data 等）",
         body["topic_id"] == str(run_id),
     )
     check(
@@ -1045,18 +1097,27 @@ async def main() -> int:
             # 清掉上一次跑剩下的，免得断言数到旧记录。
             await client.delete(key)
 
-            await publish_run_event(RunEventType.RUN_STARTED, topic_id)
-            await publish_run_event(
-                RunEventType.MESSAGE_DELTA,
-                topic_id,
+            await emit_event(CanonicalEvent(
+                type=CanonicalEventType.RUN_STARTED,
+                run_id=topic_id,
+                status=SpanStatus.RUNNING,
+                data={
+                    "agent_type": "assistant",
+                    "graph_name": "agent_react",
+                },
+            ))
+            await emit_event(CanonicalEvent(
+                type=CanonicalEventType.MESSAGE_DELTA,
+                run_id=topic_id,
                 node="agent",
                 data={"delta": "真·增量"},
-            )
-            await publish_run_event(
-                RunEventType.RUN_COMPLETED,
-                topic_id,
-                data={"status": "completed"},
-            )
+            ))
+            await emit_event(CanonicalEvent(
+                type=CanonicalEventType.RUN_COMPLETED,
+                run_id=topic_id,
+                status=SpanStatus.COMPLETED,
+                data={},
+            ))
 
             # ⚠️ 写在线程里，所以下面数 xlen / ttl 之前必须等队列排空 ——
             # 不等就会偶发地数到 0 条，而且看起来像"发布端坏了"。

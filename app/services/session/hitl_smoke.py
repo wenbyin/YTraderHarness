@@ -153,29 +153,25 @@ class _SessionStub:
 
 
 class _Recorder:
-    """接住 `publish_run_event`，好让用例断言事件而不碰 Redis。"""
+    """接住 `emit_event`，好让用例断言事件而不碰 Redis。"""
 
     def __init__(self) -> None:
         self.events: list[tuple[str, str, dict[str, Any]]] = []
 
-    async def __call__(
-            self,
-            event_type: Any,
-            topic_id: str,
-            *,
-            data: Any = None,
-            node: str | None = None,
-    ) -> bool:
+    async def __call__(self, event: Any) -> dict[str, bool]:
 
         self.events.append(
             (
-                getattr(event_type, "value", str(event_type)),
-                str(topic_id),
-                dict(data or {}),
+                event.type.value,
+                str(event.run_id),
+                dict(event.data),
             )
         )
 
-        return True
+        return {
+            "chat": True,
+            "trace": bool(event.trace_id),
+        }
 
     def types(self) -> list[str]:
         return [name for name, _, _ in self.events]
@@ -358,7 +354,7 @@ async def main() -> int:
     import app.services.session.application.agent_run_dispatch as _dispatch_module
 
     recorder = _Recorder()
-    _dispatch_module.publish_run_event = recorder
+    _dispatch_module.emit_event = recorder
 
     # --------------------------------------------------------
     section("图停在审批上：waiting_input + hitl.requested")

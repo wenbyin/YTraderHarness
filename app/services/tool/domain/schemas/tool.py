@@ -20,6 +20,7 @@ from app.services.capability.domain.schemas import Capability
 
 from .documentation import ToolDocumentation
 from .enum import SourceState, SourceType
+from .presentation import ToolPresentation
 
 __all__ = [
     "PagedToolSummaryResponse",
@@ -129,6 +130,13 @@ class ToolSummary(APIModel):
         ),
     )
 
+    presented: bool = Field(
+        description=(
+            "展示开关。false（默认）= 没有 presenter 行"
+            "（tool_presentation），该工具的调用不进事件流。"
+        ),
+    )
+
     description: str | None = Field(
         default=None,
         description=(
@@ -152,6 +160,14 @@ class ToolDefinitionDetail(APIModel):
         description=(
             "运行期开关。与 manifest 分开：manifest 只装代码侧事实，"
             "这个字段来自 tool_definition_state（有行 = 禁用）。"
+        ),
+    )
+
+    presentation: ToolPresentation | None = Field(
+        default=None,
+        description=(
+            "展示描述符；null = 不显示（默认）。"
+            "与 enabled 分开：它是库里的行，不在 manifest 里。"
         ),
     )
 

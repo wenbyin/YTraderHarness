@@ -66,11 +66,13 @@ cancelled 的。那之后信封仍可能被投进来 —— handler 在 `_load_r
        user 行，因此"失败后重试"会留下两条一模一样的用户消息。要治就得
        与 a 一起治（同一个去重决定），不能只治一边 —— 库里重复而
        checkpoint 不重复（或反过来）比两处都重复更难查。
-    d. **"本轮新增"是按条数切出来的，前提是 add_messages 只追加**。
-       它还支持 RemoveMessage 墓碑与按 id 替换，那时下标会移位、切片就切
-       错了。今天没有节点发墓碑（compaction 只写 summary 通道），所以成立；
-       真要用上墓碑时，message_recorder.new_assistant_messages 必须改成
-       按消息 id 做差集。
+    d. **"本轮新增"按消息 id 做差集**。以前按条数切片，前提是新增消息
+       永远追加在尾部 —— 审批恢复（resume）会打破它：重跑的分支把
+       ToolMessage 插在已存在的 pending write **之前**，下标整体后移，
+       结果漏掉新插入的那条、重写已落库的那条（实测：有 call 无 result +
+       同一 tool_call_id 两条 result）。现在比较 id 集合，位置变化无影响。
+       剩下的假设只有"状态里的消息都带 id"（add_messages 会给缺省 id
+       补一个）；没有 id 的消息按"没见过"处理，宁可多写不静默丢。
     e. **模型生成到一半报错，那段文字丢了**。agent_node 整段生成完才产出
        AIMessage，中途抛异常时已生成的内容随异常消失。所以"失败"的
        assistant 消息只在**图确实产出过消息**时才有。详见 message_recorder
@@ -83,6 +85,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 from uuid import UUID
@@ -90,16 +93,18 @@ from uuid import UUID
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
-from app.agent.event import (
-    RunEventType,
-    publish_run_event,
-    publish_trace_event,
-)
-from app.common.event import EventType as TraceEventType
+from app.agent.event import emit_event
 from app.common.event import SpanKind, SpanLink, SpanStatus, TraceError
+from app.common.event.spec import Event as CanonicalEvent
+from app.common.event.spec import EventType as CanonicalEventType
 from app.common.event.trace import LinkRelation
 from app.common.event.trace_emitter import stable_span_id, tool_span_id
+from app.agent.event.config import load_sink_configs
 from app.agent.event.run_event_projector import projector_factory
+from app.services.tool.registry.selection import wire_name
+from app.services.tool.repository.tool_presentation import (
+    ToolPresentationRepository,
+)
 from app.agent.graph.react.catalog import (
     AGENT_BUILDER_NODE,
     AGENT_NODE,
@@ -140,6 +145,41 @@ from .message_recorder import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+#: 每个运行已经公告过的 `tool_call_id`（上限按运行条数，不按调用条数）。
+#:
+#: ⚠️ 为什么要跨投影实例共享
+#: ------------------------
+#: 审批中断后 resume 会让 LangGraph **从节点开头重跑**那个工具分支
+#: （见 agent/graph/react/tools.py 的模块 docstring），而工具节点在执行
+#: 前就发了 `tool.called`。重跑发生在新的一次 `astream_events` 里，
+#: 投影器也换了新实例 —— 只靠实例状态挡不住，于是前端会在同一个 id 上
+#: 收到第二条「开始」。这里按 run_id 留一份，投影器只读这一个集合。
+#:
+#: 进程重启会丢（waiting_input 跨重启后 resume 仍可能重发一次）；
+#: 这是有意的取舍：它只是降噪，不是正确性边界。条数上限防止长期运行
+#: 的进程攒着已结束运行的集合。
+_ANNOUNCED_TOOL_CALLS: OrderedDict[str, set[str]] = OrderedDict()
+_ANNOUNCED_TOOL_CALLS_MAX_RUNS = 512
+
+
+def _announced_tool_calls(run_id: str) -> set[str]:
+    """取（或建立）一个 run 的已公告集合；超出上限时丢最旧的 run。"""
+
+    calls = _ANNOUNCED_TOOL_CALLS.get(run_id)
+
+    if calls is None:
+        calls = set()
+        _ANNOUNCED_TOOL_CALLS[run_id] = calls
+
+        while len(_ANNOUNCED_TOOL_CALLS) > _ANNOUNCED_TOOL_CALLS_MAX_RUNS:
+            _ANNOUNCED_TOOL_CALLS.popitem(last=False)
+
+    else:
+        _ANNOUNCED_TOOL_CALLS.move_to_end(run_id)
+
+    return calls
 
 
 async def _submit_memory_tasks(
@@ -510,30 +550,26 @@ def build_dispatch_handler(
             # 事件与库里的状态**同时**成为事实：上面那一行提交之后，
             # "它确实开始过"才成立，这条事件才有依据。
             #
-            # 发失败不影响运行 —— publish_run_event 从不抛（见
+            # v2：一次 emit，由 EventRouter 决定写哪几条流。同一个根
+            # span_id（run_id）贯穿整次运行；resume 时会再发一次，表示
+            # "这一段又开始跑了"。
+            #
+            # 发失败不影响运行 —— emit_event 从不抛（见
             # app/common/event/publisher.py 的契约）。
-            await publish_run_event(
-                RunEventType.RUN_STARTED,
-                str(run_id),
-                data={"status": RunStatus.RUNNING.value},
-            )
-
-            # trace 的 run.started。同一个根 span_id（run_id）贯穿整次
-            # 运行；resume 时会再发一次，表示"这一段又开始跑了"。
-            await publish_trace_event(
-                TraceEventType.RUN_STARTED,
-                trace_id=run.trace_id,
+            await emit_event(CanonicalEvent(
+                type=CanonicalEventType.RUN_STARTED,
                 run_id=str(run_id),
-                thread_id=str(run.session_id),
+                trace_id=run.trace_id,
+                session_id=str(run.session_id),
                 span_id=str(run_id),
                 span_kind=SpanKind.RUN,
                 span_name="run",
                 status=SpanStatus.RUNNING,
-                payload={
+                data={
                     "agent_type": AGENT_TYPE,
                     "graph_name": REACT_GRAPH_NAME,
                 },
-            )
+            ))
 
             if resume is not None:
                 # 审批被回答了 —— 与这次运行"确实又开始跑了"同一时刻成为
@@ -607,19 +643,25 @@ def build_dispatch_handler(
                 )
 
             # ------------------------------------------------
-            # 3.5 图跑之前，先数一下这条 thread 上已经有多少条消息。
+            # 3.5 图跑之前，先记下这条 thread 上已有的消息 id。
             #
             # messages 通道是**整条 thread 的历史**（checkpointer 累积的），
-            # 不是本轮增量 —— 本轮产出的是这之后的那些。不先数一下，写库时
-            # 会把前几轮的消息重复写一遍。见 message_recorder 的说明。
+            # 不是本轮增量 —— 本轮产出的是终态里**不在这个集合**的那些。
+            # 不先记一下，写库时会把前几轮的消息重复写一遍。
             #
-            # 数不出来（checkpointer 读失败）就按 0 处理：那会让本轮的消息
-            # 多写几条重复行，但不会让这次运行失败 —— 而一次读不出来的
+            # ⚠️ 记 id，不记条数
+            # ------------------
+            # 审批恢复时，重跑的分支会把 ToolMessage 插在已存在的 pending
+            # write **之前**，下标整体后移。按条数切片会同时造成"漏一条 +
+            # 重复一条"（见 message_recorder.new_assistant_messages 的说明）。
+            #
+            # 读不出来（checkpointer 读失败）就按空集合处理：那会让本轮的
+            # 消息多写几条重复行，但不会让这次运行失败 —— 而一次读不出来的
             # checkpointer，下面的 invoke 马上就会以更明确的方式报出来。
             # ------------------------------------------------
 
             t_before_count = time.monotonic()
-            prior_count = await _message_count(compiled, config)
+            prior_message_ids = await _message_ids(compiled, config)
             t_after_count = time.monotonic()
 
             if t_after_count - t_before_count > 0.5:
@@ -631,6 +673,22 @@ def build_dispatch_handler(
                 )
 
             error: BaseException | None = None
+
+            # 展示配置按 run 解析一次，之后投影器完全在内存里判断，
+            # 不再查库。
+            #
+            # ⚠️ 读失败 -> 空表 = **全部隐藏**（产品默认值），而不是
+            #    让这次运行失败。展示是旁路，不该有能力搞砸一次对话。
+            tool_presentations, displayed_wire_names = (
+                await _load_tool_presentations(repository_factory)
+            )
+
+            # 思维链输出开关（event_stream.yaml 的
+            # sinks.chat.reasoning_enabled）。lru_cache，无 IO；改值要重启。
+            # 只影响 message.reasoning.*，正文、边界事件与历史落库都不变。
+            reasoning_enabled = load_sink_configs()[
+                "chat"
+            ].reasoning_enabled
 
             # 驱动值：一轮新输入传 state，恢复传 `Command`。
             # ⚠️ 恢复时 `state` 是 None（见第 1 步），**不能**退化成传 None ——
@@ -652,8 +710,8 @@ def build_dispatch_handler(
                 #   1. 下面第 4 步读终态时，最后一个 super-step 的
                 #      AIMessage 可能还没写进 checkpointer —— 那条回复
                 #      就丢了（而运行显示 completed）。
-                #   2. 更要紧的是**下一轮**：新运行的 prior_count 是读
-                #      checkpoint 数出来的，读到旧快照就意味着数少了，
+                #   2. 更要紧的是**下一轮**：新运行的 prior_message_ids 是
+                #      读 checkpoint 取的，读到旧快照就意味着少一批 id，
                 #      于是上一轮的消息又被写一遍。
                 #
                 # 代价是每个 super-step 多等一次 checkpoint 落盘。这条
@@ -710,6 +768,8 @@ def build_dispatch_handler(
                             run_id=str(run_id),
                             message_nodes={AGENT_NODE},
                             message_roles={MODEL_ROLE},
+                            # 思维链是否进实时流（配置开关）。
+                            reasoning_enabled=reasoning_enabled,
                             # 节点目录里的身份字段（node_id / label /
                             # group / sequence）。以前只注入了 agent 一个，
                             # trace 需要给每个 node.* 都带上。
@@ -719,6 +779,17 @@ def build_dispatch_handler(
                             # tools 通道、不写 trace topic。
                             trace_id=run.trace_id or None,
                             session_id=str(run.session_id),
+                            # 用户展示：没有 presenter 的工具，chat 与
+                            # trace 都不产事件（见项目的展开口径）。
+                            tool_presentations=tool_presentations,
+                            displayed_tool_wire_names=(
+                                displayed_wire_names
+                            ),
+                            # 跨投影实例共享：resume 重跑工具分支时，
+                            # tool.called 不重复公告（见该集合的说明）。
+                            announced_tool_calls=_announced_tool_calls(
+                                str(run_id)
+                            ),
                         ),
                     ],
                 )
@@ -865,7 +936,7 @@ def build_dispatch_handler(
                 repository_factory,
                 compiled,
                 config,
-                prior_count,
+                prior_message_ids,
                 session_id=run.session_id,
                 run_id=run_id,
                 status=terminal_status,
@@ -1179,12 +1250,14 @@ async def _publish_hitl_requested(
 
         data["interrupt_id"] = interrupt_id
 
-        await publish_run_event(
-            RunEventType.HITL_REQUESTED,
-            str(run_id),
-            data=data,
+        await emit_event(CanonicalEvent(
+            type=CanonicalEventType.HITL_REQUESTED,
+            run_id=str(run_id),
+            trace_id=trace_id,
+            session_id=None if session_id is None else str(session_id),
             node=TOOLS_NODE,
-        )
+            data=data,
+        ))
 
         if not trace_id:
             continue
@@ -1207,31 +1280,34 @@ async def _publish_hitl_requested(
             )
         )
 
-        await publish_trace_event(
-            TraceEventType.HITL_APPROVAL_REQUESTED,
-            trace_id=trace_id,
+        await emit_event(CanonicalEvent(
+            event_id=stable_span_id(
+                "event", trace_id, interrupt_id, "approval_requested"
+            ),
+            type=CanonicalEventType.HITL_APPROVAL_REQUESTED,
             run_id=str(run_id),
-            thread_id=None if session_id is None else str(session_id),
+            trace_id=trace_id,
+            session_id=None if session_id is None else str(session_id),
             span_id=approval_span_id,
             parent_span_id=approval_parent,
             span_kind=SpanKind.APPROVAL,
             span_name="approval",
             status=SpanStatus.RUNNING,
-            payload={
+            data={
                 "approval_id": interrupt_id,
                 "action_name": tool_name,
             },
-            event_id=stable_span_id(
-                "event", trace_id, interrupt_id, "approval_requested"
-            ),
-        )
+        ))
 
         if tool_call_id is not None:
-            await publish_trace_event(
-                TraceEventType.TOOL_INTERRUPTED,
-                trace_id=trace_id,
+            await emit_event(CanonicalEvent(
+                event_id=stable_span_id(
+                    "event", trace_id, interrupt_id, "tool_interrupted"
+                ),
+                type=CanonicalEventType.TOOL_INTERRUPTED,
                 run_id=str(run_id),
-                thread_id=None if session_id is None else str(session_id),
+                trace_id=trace_id,
+                session_id=None if session_id is None else str(session_id),
                 span_id=tool_span_id(str(trace_id), str(tool_call_id)),
                 parent_span_id=(
                     str(failed_task_id)
@@ -1241,15 +1317,12 @@ async def _publish_hitl_requested(
                 span_kind=SpanKind.TOOL,
                 span_name=tool_name or "tool",
                 status=SpanStatus.INTERRUPTED,
-                payload={
+                data={
                     "tool_name": tool_name,
                     "tool_call_id": str(tool_call_id),
                     "interrupt_id": interrupt_id,
                 },
-                event_id=stable_span_id(
-                    "event", trace_id, interrupt_id, "tool_interrupted"
-                ),
-            )
+            ))
 
 
 async def _publish_hitl_resolved(
@@ -1275,12 +1348,14 @@ async def _publish_hitl_resolved(
 
     for interrupt_id, data in resume.items():
 
-        await publish_run_event(
-            RunEventType.HITL_RESOLVED,
-            str(run_id),
-            data={"interrupt_id": interrupt_id, "data": data},
+        await emit_event(CanonicalEvent(
+            type=CanonicalEventType.HITL_RESOLVED,
+            run_id=str(run_id),
+            trace_id=trace_id,
+            session_id=None if session_id is None else str(session_id),
             node=TOOLS_NODE,
-        )
+            data={"interrupt_id": interrupt_id, "data": data},
+        ))
 
         if not trace_id:
             continue
@@ -1289,29 +1364,32 @@ async def _publish_hitl_resolved(
             "approval", trace_id, str(interrupt_id)
         )
 
-        await publish_trace_event(
-            TraceEventType.HITL_DECISION,
-            trace_id=trace_id,
+        await emit_event(CanonicalEvent(
+            event_id=stable_span_id(
+                "event", trace_id, str(interrupt_id), "hitl_decision"
+            ),
+            type=CanonicalEventType.HITL_DECISION,
             run_id=str(run_id),
-            thread_id=None if session_id is None else str(session_id),
+            trace_id=trace_id,
+            session_id=None if session_id is None else str(session_id),
             span_id=approval_span_id,
             span_kind=SpanKind.APPROVAL,
             span_name="approval",
-            payload={
+            data={
                 "approval_id": str(interrupt_id),
                 "decision": _approval_outcome(data),
                 "actor_type": "user",
             },
-            event_id=stable_span_id(
-                "event", trace_id, str(interrupt_id), "hitl_decision"
-            ),
-        )
+        ))
 
-        await publish_trace_event(
-            TraceEventType.HITL_RESUMED,
-            trace_id=trace_id,
+        await emit_event(CanonicalEvent(
+            event_id=stable_span_id(
+                "event", trace_id, str(interrupt_id), "hitl_resumed"
+            ),
+            type=CanonicalEventType.HITL_RESUMED,
             run_id=str(run_id),
-            thread_id=None if session_id is None else str(session_id),
+            trace_id=trace_id,
+            session_id=None if session_id is None else str(session_id),
             span_id=approval_span_id,
             span_kind=SpanKind.APPROVAL,
             span_name="approval",
@@ -1322,14 +1400,11 @@ async def _publish_hitl_resolved(
                     span_id=approval_span_id,
                 )
             ],
-            payload={
+            data={
                 "approval_id": str(interrupt_id),
                 "resumed_span_id": approval_span_id,
             },
-            event_id=stable_span_id(
-                "event", trace_id, str(interrupt_id), "hitl_resumed"
-            ),
-        )
+        ))
 
 
 
@@ -1468,6 +1543,46 @@ def _initial_state(run: AgentRun) -> dict[str, Any]:
     }
 
 
+async def _load_tool_presentations(
+        repository_factory: RepositoryFactory,
+) -> tuple[dict[str, Any], frozenset[str]]:
+    """
+    读展示描述符，返回 `(查找表, 展示中的 wire name 集合)`。
+
+    查找表**同时按 tool_key 与 wire_name 建键**：custom stream 里的
+    `tool_name` 是 tool_key（`app.services...`），langchain `tools`
+    回调里是 wire name（`app_services_...`）。两个通道必须命中同一份
+    描述符，否则会出现「chat 藏了、trace 还开着」这种半截状态。
+
+    读失败退化为空表：默认隐藏是产品默认值，不让旁路能力搞砸运行。
+    """
+
+    try:
+        async with repository_factory.scope(begin=False) as repos:
+            rows = await repos.create(
+                ToolPresentationRepository
+            ).list_all()
+
+    except Exception:  # noqa: BLE001 - 见 docstring
+        logger.exception(
+            "加载工具展示配置失败，本次运行按默认隐藏处理"
+            "（工具事件不进 chat / trace）。"
+        )
+        return {}, frozenset()
+
+    presentations: dict[str, Any] = {}
+    wire_names: set[str] = set()
+
+    for row in rows:
+        presentations[row.tool_key] = row
+
+        wire = wire_name(row.tool_key)
+        presentations[wire] = row
+        wire_names.add(wire)
+
+    return presentations, frozenset(wire_names)
+
+
 async def _load_run(
         repository_factory: RepositoryFactory,
         run_id: UUID,
@@ -1479,16 +1594,23 @@ async def _load_run(
         return await repos.create(AgentRunRepository).get(run_id)
 
 
-async def _message_count(
+async def _message_ids(
         compiled: Any,
         config: dict[str, Any],
-) -> int:
+) -> frozenset[str]:
     """
-    invoke 之前，这条 thread 上已有的消息条数。
+    invoke 之前，这条 thread 上已有消息的 id 集合。
 
-    读失败按 0 处理而不是往上抛：这是"为了写库不重复"而做的一次准备，让它
-    有能力**搞砸一次本来能跑通的运行**是不划算的。退化的后果只是多写几条
-    重复消息（而且下面的 invoke 十有八九会以更明确的方式报出同一个问题）。
+    ⚠️ 为什么是 id 而不是条数
+    ------------------------
+    审批恢复（resume）时，被中断分支的 ToolMessage 会插在暂停时已有的
+    pending write **之前** —— 条数对齐不了，按条数切片会漏掉新插入的那条、
+    重写已经落库的那条。id 差集不受位置变化影响。
+
+    读失败按空集合处理而不是往上抛：这是"为了写库不重复"而做的一次准备，
+    让它有能力**搞砸一次本来能跑通的运行**是不划算的。退化的后果只是多写
+    几条重复消息（而且下面的 invoke 十有八九会以更明确的方式报出同一个
+    问题）。
     """
 
     try:
@@ -1496,13 +1618,17 @@ async def _message_count(
 
     except Exception:  # noqa: BLE001 - 见 docstring
         logger.exception(
-            "读取图状态失败（thread %s），本轮消息条数按 0 处理 —— "
+            "读取图状态失败（thread %s），本轮按空集合处理 —— "
             "可能因此重复写入前面几轮的消息。",
             config.get("configurable", {}).get("thread_id"),
         )
-        return 0
+        return frozenset()
 
-    return len(snapshot.values.get("messages") or [])
+    return frozenset(
+        str(message.id)
+        for message in (snapshot.values.get("messages") or [])
+        if getattr(message, "id", None)
+    )
 
 
 async def _record_resume_interactions(
@@ -1562,6 +1688,12 @@ async def _record_resume_interactions(
             if not questions:
                 continue
 
+            # 模型当初给的调用参数（questions / metadata）与 tool_call_id
+            # 都在中断载荷里 —— 子图消息不进父图落库通道，这是唯一能补出
+            # tool_activity 那一行的来源（见 record_interaction 的说明）。
+            raw_call_id = payload.get("tool_call_id")
+            metadata = payload.get("metadata")
+
             written = await record_interaction(
                 repository_factory,
                 session_id=run.session_id,
@@ -1571,6 +1703,19 @@ async def _record_resume_interactions(
                 answers=answers,
                 annotations=annotations,
                 interrupt_id=str(interrupt_id),
+                tool_call_id=(
+                    str(raw_call_id) if raw_call_id else None
+                ),
+                tool_args={
+                    "questions": [
+                        dict(question) for question in questions
+                    ],
+                    "metadata": (
+                        dict(metadata)
+                        if isinstance(metadata, Mapping)
+                        else {}
+                    ),
+                },
             )
 
             if written:
@@ -1593,7 +1738,7 @@ async def _record_produced_messages(
         repository_factory: RepositoryFactory,
         compiled: Any,
         config: dict[str, Any],
-        prior_count: int,
+        prior_message_ids: frozenset[str],
         *,
         session_id: UUID,
         run_id: UUID,
@@ -1631,7 +1776,7 @@ async def _record_produced_messages(
         snapshot = await compiled.aget_state(config)
 
         produced = new_assistant_messages(
-            prior_count,
+            prior_message_ids,
             snapshot.values.get("messages") or [],
         )
 
@@ -1815,55 +1960,48 @@ async def _publish_terminal(
         started_at_ms: int | None = None,
 ) -> None:
     """
-    终态事件。
-
-    ⚠️ 契约里**没有** run.cancelled / run.waiting_input，因此这里有映射，
-    代价要说清楚：
+    终态事件（v2：一次 emit，两个 sink 各自决定是否接收）。
 
         completed       -> run.completed
         failed          -> run.failed
-        cancelled       -> run.failed（data 里 status=cancelled 表明真相）
+        cancelled       -> run.cancelled（chat 的 v1 过渡格式仍折成
+                           run.failed + status=cancelled）
         waiting_input   -> **不发** —— 图停下来等人，这次运行并没有结束
 
-    最后一条值得单独说：waiting_input 时流上不会有终止事件，订阅端因此
-    会继续挂着。那**是对的**（运行确实没完，后续还有 hitl.* 与恢复后的
-    事件）。它今天也产生不出来：react 图里没有 interrupt 点，见
-    `_terminal_status` 与 domain/schemas/enum.py 的标注。
+    waiting_input 时流上不会有终止事件，订阅端因此会继续挂着。那**是对的**
+    （运行确实没完，后续还有 hitl.* 与恢复后的事件）。
 
     提前退出的路径（图还没跑就被拒）同样走这里，因此会看到一条没有
     run.started 的 run.failed —— 那是事实：它确实没开始过。
     """
 
-    payload: dict[str, Any] = {"status": status.value}
-
-    if error_type is not None:
-        payload["error_type"] = error_type
-        payload["error_message"] = error_message
-
     if status is RunStatus.COMPLETED:
-        event_type = RunEventType.RUN_COMPLETED
+        event_type = CanonicalEventType.RUN_COMPLETED
+        event_status = SpanStatus.COMPLETED
+        data: dict[str, Any] = {}
 
-    elif status in (RunStatus.FAILED, RunStatus.CANCELLED):
-        event_type = RunEventType.RUN_FAILED
+    elif status is RunStatus.FAILED:
+        event_type = CanonicalEventType.RUN_FAILED
+        event_status = SpanStatus.FAILED
+        data = {}
+
+    elif status is RunStatus.CANCELLED:
+        event_type = CanonicalEventType.RUN_CANCELLED
+        event_status = SpanStatus.CANCELLED
+        data = {"reason": error_message or "cancelled"}
 
     else:
         # waiting_input（以及理论上不该出现的 queued / running）：
         # 这次运行没有结束，不发终止事件。
         return
 
-    await publish_run_event(event_type, str(run_id), data=payload)
-
-    # ---- Trace 的 run 终止事件 ----
-    #
-    # 与 run 事件的分叉点：契约里 cancelled 折叠成 run.failed，而 trace
-    # 词表有独立的 run.cancelled；waiting_input 两边都不发（这次运行没完）。
     duration_ms = (
         None
         if started_at_ms is None
         else max(0, int(time.time() * 1000) - started_at_ms)
     )
 
-    trace_error = (
+    error = (
         TraceError(
             type=error_type or "Error",
             message=error_message or "",
@@ -1872,31 +2010,16 @@ async def _publish_terminal(
         else None
     )
 
-    if status is RunStatus.COMPLETED:
-        trace_type = TraceEventType.RUN_COMPLETED
-        trace_status = SpanStatus.COMPLETED
-        trace_payload: dict[str, Any] = {}
-
-    elif status is RunStatus.CANCELLED:
-        trace_type = TraceEventType.RUN_CANCELLED
-        trace_status = SpanStatus.CANCELLED
-        trace_payload = {"reason": error_message or "cancelled"}
-
-    else:
-        trace_type = TraceEventType.RUN_FAILED
-        trace_status = SpanStatus.FAILED
-        trace_payload = {}
-
-    await publish_trace_event(
-        trace_type,
-        trace_id=trace_id,
+    await emit_event(CanonicalEvent(
+        type=event_type,
         run_id=str(run_id),
-        thread_id=None if session_id is None else str(session_id),
+        trace_id=trace_id,
+        session_id=None if session_id is None else str(session_id),
         span_id=str(run_id),
         span_kind=SpanKind.RUN,
         span_name="run",
-        status=trace_status,
+        status=event_status,
         duration_ms=duration_ms,
-        payload=trace_payload,
-        error=trace_error,
-    )
+        error=error,
+        data=data,
+    ))

@@ -34,7 +34,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.common.event import SUBAGENT_STREAM_KIND, RunEventType
+from app.common.event import SUBAGENT_STREAM_KIND
+from app.common.event.spec import EventType
 
 from .stream import write_custom
 
@@ -71,7 +72,7 @@ def publish_subagent_created(
 
     write_custom({
         "kind": SUBAGENT_STREAM_KIND,
-        "event": RunEventType.SUBAGENT_CREATED.value,
+        "event": EventType.SUBAGENT_CREATED.value,
         "node": node,
         "plan_id": plan_id,
         "revision": revision,
@@ -97,7 +98,7 @@ def publish_subagent_claimed(
 
     write_custom({
         "kind": SUBAGENT_STREAM_KIND,
-        "event": RunEventType.SUBAGENT_CLAIMED.value,
+        "event": EventType.SUBAGENT_CLAIMED.value,
         "node": node,
         "plan_id": plan_id,
         "revision": revision,
@@ -122,7 +123,7 @@ def publish_subagent_task_updated(
 
     write_custom({
         "kind": SUBAGENT_STREAM_KIND,
-        "event": RunEventType.SUBAGENT_TASK_UPDATED.value,
+        "event": EventType.SUBAGENT_TASK_UPDATED.value,
         "node": node,
         "plan_id": plan_id,
         "revision": revision,
@@ -158,7 +159,7 @@ def publish_subagent_completed(
 
     write_custom({
         "kind": SUBAGENT_STREAM_KIND,
-        "event": RunEventType.SUBAGENT_COMPLETED.value,
+        "event": EventType.SUBAGENT_COMPLETED.value,
         "node": node,
         "plan_id": plan_id,
         "revision": revision,

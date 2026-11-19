@@ -33,8 +33,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from .event import RunEvent
-from .trace import TraceEvent
+from .spec import Event
 
 __all__ = ["EventPublisher"]
 
@@ -62,23 +61,22 @@ class EventPublisher(Protocol):
 
         ...
 
-    async def publish(self, event: RunEvent | TraceEvent) -> bool:
+    async def emit(self, event: Event) -> dict[str, bool]:
         """
-        投递一条事件，返回是否**已接收**。**绝不抛异常。**
+        投递一条**规范事件**，返回 `{sink 名: 是否已接收}`。
+
+        **绝不抛异常。** 没有匹配的 sink（例如 trace-only 事件没带
+        trace_id）返回空字典 —— 那不是错误。
 
         ⚠️ 返回值是"收下了吗"，**不是**"写进存储了吗"
         ------------------------------------------
-        实现可以把写入排到后台（Redis 实现就是这么做的，见
-        app/agent/event/publisher.py），此时"已接收"与"已落库"是两件事：
-        返回 True 之后写入仍可能失败，那只会体现在实现自己的留痕/计数上。
+        实现把写入排到后台（见 app/agent/event/publisher.py），此时
+        "已接收"与"已落库"是两件事：返回 True 之后写入仍可能失败，
+        那只会体现在实现自己的留痕/计数上。
 
         之所以允许这样：要交付真实写入结果就必须等它，而"等"会把写入的
-        延迟原样搬回调用方（本仓库的调用方在模型流式输出的 token 路径
-        上）。二者只能取一个，这里取"不拖慢调用方"。
-
-        因此返回值只适合表达"通道还在不在、还收不收"：False = 没通道、
-        没启用、或通道已经不堪重负。调用方完全可以忽略它 —— 那正是这条
-        契约存在的意义。
+        延迟原样搬回调用方（调用方在模型流式输出的 token 路径上）。
+        二者只能取一个，这里取"不拖慢调用方"。
         """
 
         ...
