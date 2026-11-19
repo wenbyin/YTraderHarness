@@ -100,6 +100,38 @@ components:
   schemas:
     ContentBlock:
       type: object
+      description: >-
+        One block of message content. Block types are open
+        (`additionalProperties: true`). Known shapes:
+
+          · text         { text }
+
+          · tool_call    { id, name, args, display? } — written with the
+                         AIMessage. `name` is the tool_key (same spelling as
+                         the event stream and tool_result blocks). `display`
+                         is the resolved presentation descriptor; the key is
+                         **absent** when the tool has no presenter (default
+                         hidden).
+
+          · tool_result  { tool_call_id, name, status, output?, error?,
+                         duration_ms?, display? } — written with the
+                         ToolMessage. `output` only when status is success
+                         and the presentation has show_output=true; a failed
+                         call carries `error` instead and never `output`
+                         (nor an output-dependent `summary`). `duration_ms`
+                         is the tool's own execution time; absent on rows
+                         written before it was recorded. `display` absent
+                         when the tool has no presenter.
+                         Clients merge it into the matching tool_call by
+                         `tool_call_id` (call and result are separate
+                         messages, possibly from different runs).
+
+        ⚠️ This API applies the same default-hidden rule as the chat
+        stream: tool_call / tool_result blocks for a tool without a
+        presenter are **omitted** (a result block also drops its raw
+        text block). Old rows that lack `display` are enriched from the
+        current presentation instead of disappearing.
+
       required:
         - type
       properties:
@@ -186,6 +218,12 @@ components:
         # 推理消失。
         reasoning_content:
           type: [string, 'null']
+          description: >-
+            Model reasoning (CoT) text. Null when this message has none, or
+            when `sinks.chat.reasoning_enabled=false` — the messages API then
+            omits both this field and legacy `type=reasoning` content blocks.
+            The database still keeps the original text: the switch is an
+            output policy, not a storage policy.
 
         status:
           type: string

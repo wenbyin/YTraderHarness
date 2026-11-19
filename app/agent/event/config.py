@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -18,7 +19,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.common.utils import expand_env
 
 __all__ = [
+    "SinkConfig",
     "StreamConfig",
+    "load_sink_configs",
     "load_stream_config",
 ]
 
@@ -36,6 +39,13 @@ class StreamConfig(BaseModel):
     """整份 event_stream.yaml。"""
 
     model_config = ConfigDict(extra="forbid")
+
+    #: v2 起为 2。旧文件缺这个键时按 1 处理，读取端字段继续可用。
+    schema_version: int = Field(default=1, ge=1)
+
+    #: v2 的写入端配置。由 `load_sink_configs()` 解析；这里只收下原始
+    #: 字典，让旧的 `StreamConfig` 仍能校验整份文件（extra="forbid"）。
+    sinks: dict[str, Any] | None = None
 
     enabled: bool = Field(
         default=True,
@@ -176,3 +186,95 @@ def load_stream_config(
     raw = yaml.safe_load(file_path.read_text(encoding="utf-8")) or {}
 
     return StreamConfig.model_validate(expand_env(raw))
+
+
+# ============================================================
+# v2 写入端：每个 sink 一份
+# ============================================================
+
+
+class SinkConfig(BaseModel):
+    """
+    一个 sink 的写入参数。
+
+    `accepts`（放行哪些事件）**不在这里** —— 它是契约，写在
+    `app/common/event/spec.py` 的 `CHAT_EVENT_TYPES` / `TRACE_EVENT_TYPES`。
+    配置只调优队列、TTL、写线程数。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+
+    #: chat 的键前缀；trace 必须是 "trace"（键形如
+    #: `trace:<trace_id>:events`，stress 聚合器按这个键读）。
+    key_prefix: str = "agent_run"
+
+    maxlen: int | None = Field(default=10_000)
+    ttl_seconds: int | None = Field(default=600)
+
+    write_queue_size: int = Field(default=50_000, ge=1)
+    write_workers: int = Field(default=4, ge=1)
+
+    #: 是否把模型的思维链推给这条流
+    #: （`message.reasoning.delta` / `message.reasoning.completed`）。
+    #:
+    #: ⚠️ 只有 chat 用这个字段；trace 没有推理事件，配了也不读。
+    #:
+    #: ⚠️ 关掉同时作用于**两条输出通道**：
+    #:       · chat 事件流（message.reasoning.delta / .completed）
+    #:       · GET /sessions/{id}/messages（reasoning_content 与存量
+    #:         content 里的 reasoning 块）
+    #:    这样「实时藏了、刷新后又能看到」才不会再出现。
+    #:
+    #: ⚠️ 库里照旧保留原文（reasoning_content 列）—— 这是**输出**开关，
+    #:    不是存储开关。
+    reasoning_enabled: bool = True
+
+
+@lru_cache(maxsize=4)
+def load_sink_configs(
+        path: str | None = None,
+) -> dict[str, SinkConfig]:
+    """
+    读 `sinks.chat` / `sinks.trace`。
+
+    旧 YAML 没有 `sinks` 段时按历史默认值生成两份配置（chat 用顶层
+    字段、trace 用加长 TTL），保证升级过程中不会因为缺段直接起不来。
+    """
+
+    stream = load_stream_config(path)
+
+    raw = dict(stream.sinks or {})
+
+    chat_raw = dict(raw.get("chat") or {})
+
+    chat = SinkConfig.model_validate({
+        "enabled": stream.enabled,
+        "key_prefix": stream.key_prefix,
+        "maxlen": stream.maxlen,
+        "ttl_seconds": stream.ttl_seconds,
+        "write_queue_size": stream.write_queue_size,
+        "write_workers": stream.write_workers,
+        **chat_raw,
+    })
+
+    trace_raw = dict(raw.get("trace") or {})
+
+    trace = SinkConfig.model_validate({
+        "enabled": stream.enabled,
+        "key_prefix": "trace",
+        "maxlen": stream.maxlen,
+        "ttl_seconds": 604_800,
+        "write_queue_size": 20_000,
+        "write_workers": 2,
+        **trace_raw,
+    })
+
+    if trace.key_prefix != "trace":
+        raise ValueError(
+            "sinks.trace.key_prefix 必须是 'trace'："
+            "stress TraceAggregator 按 trace:<trace_id>:events 这个键读取。"
+        )
+
+    return {"chat": chat, "trace": trace}

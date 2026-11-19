@@ -42,15 +42,17 @@ from app.agent.event import (
     build_event_publisher,
     build_run_stream_registry,
     close_event_publisher,
+    emit_event,
     load_stream_config,
-    publish_run_event,
     reset_run_stream_registry,
     sse_frame,
     start_event_publisher,
     stream_key,
 )
 from app.api.v1.sessions import _frames
-from app.common.event import RunEventType
+from app.common.event import SpanStatus
+from app.common.event.spec import Event as CanonicalEvent
+from app.common.event.spec import EventType as CanonicalEventType
 
 # ============================================================
 # 替身
@@ -170,8 +172,8 @@ async def test_frame_carries_id_event_and_full_envelope() -> None:
         FakeEntry(
             "100-0",
             "message.delta",
-            topic="agent_run",
-            topic_id="run_1",
+            schema_version="2.0",
+            run_id="run_1",
             data='{"delta": "你"}',
         ),
     ])
@@ -183,7 +185,8 @@ async def test_frame_carries_id_event_and_full_envelope() -> None:
     assert frame.startswith("id: 100-0\n")
     assert "event: message.delta\n" in frame
     # data 段放的是**整个信封**，与直读 Redis 看到的一致。
-    assert '"topic_id": "run_1"' in frame
+    assert '"schema_version": "2.0"' in frame
+    assert '"run_id": "run_1"' in frame
     # 空行结尾 —— 少了它客户端会把两帧粘起来。
     assert frame.endswith("\n\n")
 
@@ -381,19 +384,40 @@ async def test_live_follow_against_real_redis() -> None:
         # 在验"阻塞读会在 key 被创建时醒来"。
         await asyncio.sleep(0.3)
 
-        await publish_run_event(RunEventType.RUN_STARTED, topic_id)
-        await publish_run_event(
-            RunEventType.NODE_STARTED, topic_id, node="agent"
-        )
-        await publish_run_event(
-            RunEventType.MESSAGE_DELTA, topic_id, node="agent",
+        await emit_event(CanonicalEvent(
+            type=CanonicalEventType.RUN_STARTED,
+            run_id=topic_id,
+            status=SpanStatus.RUNNING,
+            data={
+                "agent_type": "assistant",
+                "graph_name": "agent_react",
+            },
+        ))
+        await emit_event(CanonicalEvent(
+            type=CanonicalEventType.NODE_STARTED,
+            run_id=topic_id,
+            node="agent",
+            status=SpanStatus.RUNNING,
+            data={"node_id": "agent"},
+        ))
+        await emit_event(CanonicalEvent(
+            type=CanonicalEventType.MESSAGE_DELTA,
+            run_id=topic_id,
+            node="agent",
             data={"delta": "你"},
-        )
-        await publish_run_event(
-            RunEventType.MESSAGE_DELTA, topic_id, node="agent",
+        ))
+        await emit_event(CanonicalEvent(
+            type=CanonicalEventType.MESSAGE_DELTA,
+            run_id=topic_id,
+            node="agent",
             data={"delta": "好"},
-        )
-        await publish_run_event(RunEventType.RUN_COMPLETED, topic_id)
+        ))
+        await emit_event(CanonicalEvent(
+            type=CanonicalEventType.RUN_COMPLETED,
+            run_id=topic_id,
+            status=SpanStatus.COMPLETED,
+            data={},
+        ))
 
         # 收到 run.completed 后广播端自己收尾；给足余量再断言超时。
         await asyncio.wait_for(task, timeout=15)

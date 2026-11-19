@@ -26,6 +26,9 @@ from ..domain.entities import (
     ToolDocumentation as ToolDocumentationEntity,
 )
 from ..domain.entities import (
+    ToolPresentation as ToolPresentationEntity,
+)
+from ..domain.entities import (
     ToolProcessor as ToolProcessorEntity,
 )
 from ..domain.schemas import (
@@ -34,6 +37,7 @@ from ..domain.schemas import (
     ToolDefinitionDetail,
     ToolDocumentation,
     ToolManifest,
+    ToolPresentation,
     ToolProcessor,
     ToolProcessorChain,
     ToolSummary,
@@ -47,6 +51,7 @@ __all__ = [
     "build_definition_detail",
     "build_documentation",
     "build_manifest",
+    "build_presentation",
     "build_processor_definition",
     "build_summary",
     "build_tool_processor",
@@ -169,12 +174,28 @@ def build_documentation(
     )
 
 
+def build_presentation(
+        entity: ToolPresentationEntity,
+) -> ToolPresentation:
+    """展示实体 -> 对外 DTO。字段一一对应，没有计算。"""
+
+    return ToolPresentation(
+        renderer=entity.renderer,
+        display_name=entity.display_name,
+        summary=entity.summary,
+        show_input=entity.show_input,
+        show_output=entity.show_output,
+        props=dict(entity.props),
+    )
+
+
 def build_summary(
         definition: ToolDefinition,
         *,
         description_override: str | None,
         classifications: list[Capability],
         enabled: bool,
+        presented: bool,
 ) -> ToolSummary:
     """
     列表项。
@@ -184,6 +205,7 @@ def build_summary(
 
     enabled 来自 `tool_definition_state`（由服务层批量查出来），
     不来自 definition —— 它是运行期开关，不是代码侧事实。
+    presented 同理，来自 `tool_presentation`（有行 = 显示）。
     """
 
     source_raw = (definition.source_docstring or {}).get("raw")
@@ -195,6 +217,7 @@ def build_summary(
         source_type=definition.source_type,
         source_state=definition.source_state,
         enabled=enabled,
+        presented=presented,
         description=description_override or source_raw,
         classifications=[
             build_capability(item) for item in classifications
@@ -208,6 +231,7 @@ def build_definition_detail(
         classifications: list[Capability],
         *,
         enabled: bool,
+        presentation: ToolPresentation | None,
 ) -> ToolDefinitionDetail:
     """
     详情：事实 + 说明 + 能力，一次组装完。
@@ -218,6 +242,7 @@ def build_definition_detail(
 
     return ToolDefinitionDetail(
         enabled=enabled,
+        presentation=presentation,
         manifest=build_manifest(definition),
         documentation=build_documentation(definition, stored),
         classifications=[

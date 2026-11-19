@@ -45,7 +45,9 @@ docstring 写着它是"本项目里**唯一**一处知道消息长什么样"的�
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import json
+import logging
+from collections.abc import Collection, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -57,9 +59,23 @@ from app.agent.context.processor.messages import (
     is_tool_message,
     message_kind,
     message_reasoning,
+    message_text,
     tool_calls,
+    tool_message_call_id,
 )
+from app.agent.event.tool_presentation import (
+    build_display,
+    parse_tool_output,
+    shape_tool_output,
+)
+from app.agent.tools.hitl_tool import ASK_USER_QUESTION_TOOL_KEY
 from app.common.repository.factory import RepositoryFactory
+from app.services.tool.application.presentation_lookup import (
+    build_presentation_lookup,
+)
+from app.services.tool.repository.tool_presentation import (
+    ToolPresentationRepository,
+)
 
 from ..domain.entities import AgentMessage as AgentMessageEntity
 from ..domain.schemas import (
@@ -80,6 +96,8 @@ __all__ = [
     "to_entities",
 ]
 
+logger = logging.getLogger(__name__)
+
 
 #: 取消时补的那条记录的正文。
 #:
@@ -98,7 +116,7 @@ CANCELLATION_NOTICE_TEXT = "（本次运行已取消）"
 
 
 def new_assistant_messages(
-        prior_count: int,
+        prior_message_ids: Collection[str],
         final_messages: Sequence[Any],
 ) -> list[Any]:
     """
@@ -108,18 +126,34 @@ def new_assistant_messages(
     -------------------------------------
     两个判断都不直观，而且错了都不会报错：
 
-    1. **按条数切**。`ReactState.messages` 是整条 thread 的历史（checkpointer
-       累积的），不是本轮增量 —— 直接全写会把前面每一轮都重复写一遍。
-       `prior_count` 是 invoke **之前**数出来的条数，切片因此只剩本轮。
+    1. **按消息 id 做差集**。`ReactState.messages` 是整条 thread 的历史
+       （checkpointer 累积的），不是本轮增量 —— 直接全写会把前面每一轮都
+       重复写一遍。`prior_message_ids` 是 invoke **之前**从状态里取到的
+       id 集合，终态里不在这个集合中的就是本轮新增的。
 
-       ⚠️ 前提：`add_messages` 只追加。它其实还支持 RemoveMessage 墓碑与按
-       id 替换，那时下标会移位、切片就切错了。今天没有节点发墓碑
-       （compaction 只写 summary 通道），所以这条成立；真要用上墓碑时，
-       这里必须换成按消息 id 做差集。
+       ⚠️ 为什么**不能**按条数切（真实故障）
+       -------------------------------------
+       以前这里收的是 `prior_count`，取 `final_messages[prior_count:]`。
+       这只有在"本轮新增的消息永远追加在尾部"时才成立，而审批恢复
+       （resume）会打破它：
+
+           HITL 暂停时，兄弟分支的 ToolMessage 已作为 pending write 存在
+           （`aget_state` 能看到它，于是被记下来、也落过库）；
+           resume 时被中断的那个分支**重跑**，它的 ToolMessage 写回时
+           按分支下标排在这条 pending write **之前**。
+
+       结果就是终态列表中间插进了一条新消息，`prior_count` 的下标整体
+       后移一位：**新插入的那条被跳过，已落库的那条被重写一遍**。
+       症状正是"有 call 无 result" + "同一个 tool_call_id 两条 result"。
+       按 id 做差集不受位置变化影响，审批恢复与非恢复走同一条路。
+
+       剩下的前提：state 里的消息都带 id（`add_messages` 会给缺省 id 补
+       一个）。没有 id 的消息无法证明"见过"，因此一律保留 —— 宁可多写
+       一条，也不静默丢掉本轮的真实产出。
 
     2. **滤掉普通 human 与 system**。本轮的 `HumanMessage` 是
-       `_initial_state` 交给图的，而 `prior_count` 是在那之前数的 ——
-       不滤的话它一定会落在切片里。用户消息已由建运行那一步写过一条，
+       `_initial_state` 交给图的，而 `prior_message_ids` 是在那之前取的 ——
+       不滤的话它一定会落在差集里。用户消息已由建运行那一步写过一条，
        再写一次就是**同一句话两行**，而且这一行会带着
        `role=assistant`（契约里只有 user / assistant 两个取值，
        没有第三个格子给它），前端会把它渲染成模型的回复。
@@ -132,12 +166,13 @@ def new_assistant_messages(
        滤它是为了防止将来有人往 state 里塞。
     """
 
-    tail = list(final_messages)[prior_count:]
+    seen = {str(message_id) for message_id in prior_message_ids}
 
     return [
         message
-        for message in tail
-        if not is_system_message(message)
+        for message in final_messages
+        if _message_id(message) not in seen
+        and not is_system_message(message)
         and (
             not is_human_message(message)
             # 任务指令是 HumanMessage，但它不是用户说的那句话，而是
@@ -147,6 +182,19 @@ def new_assistant_messages(
             or message_kind(message) == MessageKind.TASK_INSTRUCTION.value
         )
     ]
+
+
+def _message_id(message: Any) -> str | None:
+    """
+    消息的稳定 id；没有 id 时返回 None。
+
+    None 在差集里**永远算"没见过"**（调用方按"保留"处理）：拿不到 id
+    就没法证明它已经落过库，静默丢掉本轮的真实产出比多写一条更糟。
+    """
+
+    value = getattr(message, "id", None)
+
+    return str(value) if value else None
 
 
 def message_status(run_status: RunStatus) -> str:
@@ -206,6 +254,7 @@ def to_entities(
         business_agent_id: str | None,
         reply_to_message_id: UUID | None,
         created_at: datetime,
+        presentations: Mapping[str, Any] | None = None,
 ) -> list[AgentMessageEntity]:
     """
     消息 -> 实体，seq 从 `start_seq` 起连续分配。
@@ -235,7 +284,7 @@ def to_entities(
             # 产出这条消息的**职责**（duty_key）—— 由调用方从运行行上取
             # （agent_run.duty_key），这一批消息全部用它。
             business_agent_id=business_agent_id,
-            content=_content_blocks(message),
+            content=_content_blocks(message, presentations),
             # 思维链单独一列，**不在** content 的块数组里（见 _content_blocks）。
             # 非推理模型取到 None —— 那一列因此是 NULL 而不是空串。
             reasoning_content=message_reasoning(message),
@@ -291,6 +340,11 @@ async def record_messages(
 
     resolved_status = message_status(status)
 
+    # 展示描述符单独走一次只读查询，**不能**塞进下面的写事务：
+    # 写事务里任何一次查询失败都会把事务染成 aborted，后面的 insert
+    # 一条也写不进去。展示是旁路，不该有这个权力。
+    presentations = await _load_presentations(repository_factory)
+
     async with repository_factory.scope() as repositories:
 
         message_repository = repositories.create(MessageRepository)
@@ -313,6 +367,7 @@ async def record_messages(
             business_agent_id=business_agent_id,
             reply_to_message_id=reply_to,
             created_at=datetime.now(timezone.utc),
+            presentations=presentations,
         )
 
         await message_repository.add_many(entities)
@@ -352,6 +407,8 @@ async def record_interaction(
         answers: Mapping[str, str],
         annotations: Mapping[str, Mapping[str, str]] | None = None,
         interrupt_id: str,
+        tool_call_id: str | None = None,
+        tool_args: Mapping[str, Any] | None = None,
 ) -> int:
     """
     一次 HITL 问答 -> 一条 `role=user`、`kind=interaction` 的消息。
@@ -368,6 +425,25 @@ async def record_interaction(
         text 块         人直接读的 Q/A
         interaction 块  结构化 questions / answers / annotations，给前端渲染
 
+    ⚠️ 给了 `tool_call_id` 时，额外补一条 `tool_activity` 消息
+    -----------------------------------------------------
+    `ask_user_question` 在 **planner 子图**里执行，而消息落库只读父图
+    终态（`_record_produced_messages` 的 `aget_state`）—— 子图消息永远
+    不在那里。症状是：实时流里子图的 custom 事件照常冒泡，有
+    `tool.called / tool.completed` 那一行；刷新后历史里只剩 interaction，
+    那一行凭空消失。
+
+    这行没有别的来源可以补，只能在这里用**中断载荷**（tool_call_id /
+    args）和**回答**（result）合成一条 tool_activity。它排在 interaction
+    之前，与"先调用、后回答"的时序一致。
+
+    拿不到 `tool_call_id`（不该发生，但协议没保证）时退化成只写
+    interaction —— 不能产出一条无法与调用配对的孤儿 result。
+
+    ⚠️ 如果将来 `ask_user_question` 移出 planner 子图，父图终态会自带这条
+    ToolMessage，这里的合成就会变成**重复行** —— 届时删掉这一段（或改成
+    只在子图路径下补）。
+
     Raises:
         底层异常原样抛。调用方（resume 路径）决定是否吞掉 —— 写失败不该
         阻止图 resume，但必须留下日志。
@@ -376,23 +452,14 @@ async def record_interaction(
     if not questions:
         return 0
 
-    now = datetime.now(timezone.utc)
+    # 展示描述符只在这一条 tool_activity 需要；没有 tool_call_id 就不查。
+    presentations = (
+        await _load_presentations(repository_factory)
+        if tool_call_id
+        else None
+    )
 
-    content: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": _interaction_text(questions, answers),
-        },
-        {
-            "type": "interaction",
-            "questions": [dict(question) for question in questions],
-            "answers": dict(answers),
-            "annotations": {
-                str(key): dict(value)
-                for key, value in (annotations or {}).items()
-            },
-        },
-    ]
+    now = datetime.now(timezone.utc)
 
     async with repository_factory.scope() as repositories:
 
@@ -400,30 +467,151 @@ async def record_interaction(
 
         start_seq = await message_repository.next_seq(session_id)
 
-        await message_repository.add_many([
-            AgentMessageEntity(
-                message_id=uuid4(),
-                session_id=session_id,
-                run_id=run_id,
-                seq=start_seq,
-                role=MessageRole.USER.value,
-                kind=MessageKind.INTERACTION.value,
-                business_agent_id=business_agent_id,
-                content=content,
-                reasoning_content=None,
-                status=MessageStatus.COMPLETED.value,
-                client_message_id=None,
-                reply_to_message_id=None,
-                meta={
-                    "interrupt_id": interrupt_id,
-                    "source": "ask_user_question",
-                },
-                created_at=now,
-                updated_at=now,
-            )
-        ])
+        entities = _interaction_entities(
+            session_id=session_id,
+            run_id=run_id,
+            start_seq=start_seq,
+            business_agent_id=business_agent_id,
+            questions=questions,
+            answers=answers,
+            annotations=annotations,
+            interrupt_id=interrupt_id,
+            tool_call_id=tool_call_id,
+            tool_args=tool_args,
+            presentations=presentations,
+            created_at=now,
+        )
 
-    return 1
+        await message_repository.add_many(entities)
+
+    return len(entities)
+
+
+def _interaction_entities(
+        *,
+        session_id: UUID,
+        run_id: UUID,
+        start_seq: int,
+        business_agent_id: str | None,
+        questions: Sequence[Mapping[str, Any]],
+        answers: Mapping[str, str],
+        annotations: Mapping[str, Mapping[str, str]] | None,
+        interrupt_id: str,
+        tool_call_id: str | None,
+        tool_args: Mapping[str, Any] | None,
+        presentations: Mapping[str, Any] | None,
+        created_at: datetime,
+) -> list[AgentMessageEntity]:
+    """
+    interaction 消息（+ 可选的前置 tool_activity）的纯组装。
+
+    纯函数，与 `to_entities` 同一条理由：写库前先能单测形状。
+    """
+
+    entities: list[AgentMessageEntity] = []
+
+    if tool_call_id:
+
+        args = dict(tool_args or {})
+
+        result_value = {
+            "questions": [dict(question) for question in questions],
+            "answers": dict(answers),
+            "annotations": {
+                str(key): dict(value)
+                for key, value in (annotations or {}).items()
+            },
+        }
+
+        call_block: dict[str, Any] = {
+            "type": "tool_call",
+            "id": tool_call_id,
+            "name": ASK_USER_QUESTION_TOOL_KEY,
+            "args": args,
+        }
+
+        result_block: dict[str, Any] = {
+            "type": "tool_result",
+            "tool_call_id": tool_call_id,
+            "name": ASK_USER_QUESTION_TOOL_KEY,
+            "status": "done",
+        }
+
+        presentation = (presentations or {}).get(
+            ASK_USER_QUESTION_TOOL_KEY
+        )
+
+        if presentation is not None:
+
+            # 与其它工具块同一个组合点，别在这里手拼 display。
+            call_block["display"] = build_display(
+                presentation,
+                input_value=args,
+            )
+
+            shaped = shape_tool_output(presentation, result_value)
+
+            if shaped.has_output:
+                result_block["output"] = shaped.output
+
+            result_block["display"] = shaped.display
+
+        entities.append(AgentMessageEntity(
+            message_id=uuid4(),
+            session_id=session_id,
+            run_id=run_id,
+            seq=start_seq,
+            role=MessageRole.ASSISTANT.value,
+            kind=MessageKind.TOOL_ACTIVITY.value,
+            business_agent_id=business_agent_id,
+            content=[call_block, result_block],
+            reasoning_content=None,
+            status=MessageStatus.COMPLETED.value,
+            client_message_id=None,
+            reply_to_message_id=None,
+            meta={},
+            created_at=created_at,
+            updated_at=created_at,
+        ))
+
+    entities.append(AgentMessageEntity(
+        message_id=uuid4(),
+        session_id=session_id,
+        run_id=run_id,
+        seq=start_seq + len(entities),
+        role=MessageRole.USER.value,
+        kind=MessageKind.INTERACTION.value,
+        business_agent_id=business_agent_id,
+        content=[
+            {
+                "type": "text",
+                "text": _interaction_text(questions, answers),
+            },
+            {
+                "type": "interaction",
+                "questions": [
+                    dict(question) for question in questions
+                ],
+                "answers": dict(answers),
+                "annotations": {
+                    str(key): dict(value)
+                    for key, value in (annotations or {}).items()
+                },
+            },
+        ],
+        reasoning_content=None,
+        status=MessageStatus.COMPLETED.value,
+        client_message_id=None,
+        reply_to_message_id=None,
+        meta={
+            "interrupt_id": interrupt_id,
+            "source": "ask_user_question",
+        },
+        created_at=created_at,
+        updated_at=created_at,
+    ))
+
+    return entities
 
 
 async def record_cancellation_notice(
@@ -568,7 +756,10 @@ def _meta(message: Any) -> dict[str, Any]:
     }
 
 
-def _content_blocks(message: Any) -> list[dict[str, Any]]:
+def _content_blocks(
+        message: Any,
+        presentations: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """
     消息 -> 内容块数组。
 
@@ -655,4 +846,200 @@ def _content_blocks(message: Any) -> list[dict[str, Any]]:
         if call_id:
             present.add(call_id)
 
+    # ---- 工具调用：补展示描述符 ----
+    #
+    # 已有的 tool_call 块（v3 聚合出来的那条 AIMessage）不会走上面的追加
+    # 分支，所以这里对**全部** tool_call 块统一补一次。
+    #
+    # ⚠️ 没有 presenter 就不写 `display` 键 —— 不是 null、不是空对象。
+    #    与事件载荷同一条口径：缺键。
+    if presentations:
+        for block in blocks:
+
+            if block.get("type") != "tool_call":
+                continue
+
+            if "display" in block:
+                continue
+
+            presentation = presentations.get(
+                str(block.get("name") or "")
+            )
+
+            if presentation is None:
+                continue
+
+            # 工具名统一成 tool_key：AIMessage 的 tool_calls.name 是 wire
+            # name，而事件与 tool_result 块用的是 tool_key —— 同一条历史
+            # 里两种写法会让日志/存档分裂。查找表本来就双键，展示不受影响。
+            canonical = getattr(presentation, "tool_key", None)
+
+            if isinstance(canonical, str) and canonical:
+                block["name"] = canonical
+
+            block["display"] = build_display(
+                presentation,
+                input_value=block.get("args"),
+            )
+
+    # ---- 工具结果：单独一个 tool_result 块 ----
+    #
+    # 结果不并回 tool_call 块：审批 / 中断恢复时两条消息在不同运行里
+    # 落库，而消息不可变。前端按 tool_call_id 跨消息合并。
+    if is_tool_message(message):
+
+        result = _tool_result_block(message, presentations)
+
+        if result is not None:
+            blocks.append(result)
+
     return blocks
+
+
+async def _load_presentations(
+        repository_factory: RepositoryFactory,
+) -> dict[str, Any]:
+    """
+    取 `{名字: 展示描述符}`，**同时按 tool_key 与 wire name 建键**。
+
+    两边的名字形态不一样：
+        AIMessage 的 tool_call.name      wire name（`agent_current_time`）
+        ToolMessage.name                 tool_key（`agent.current_time`）
+
+    ⚠️ 读失败 -> 空表 + 日志。展示是旁路，不能让一次查询把消息落库搞失败；
+    用独立只读 scope（begin=False），失败也不会污染后面的写事务。
+    """
+
+    try:
+        async with repository_factory.scope(begin=False) as repositories:
+            rows = await repositories.create(
+                ToolPresentationRepository
+            ).list_all()
+
+    except Exception:  # noqa: BLE001 - 见 docstring
+        logger.exception(
+            "读取工具展示配置失败：本次消息落库不带 display。"
+        )
+        return {}
+
+    return build_presentation_lookup(rows)
+
+
+def _tool_output(message: Any) -> Any:
+    """
+    ToolMessage 的结果 -> 可展示的值。
+
+    content 通常是 `_outcome_message` 写下的字符串（成功时是工具返回的
+    JSON 文本）。能解析就解析成结构，解析不了就保留原文 —— 与前端
+    `unwrapJsonField` 同一条口径。
+    """
+
+    content = getattr(message, "content", None)
+
+    if isinstance(content, Mapping):
+        return dict(content)
+
+    text = message_text(message).strip()
+
+    if not text:
+        return None
+
+    # 成功结果被 `<ref:tool>` 包了一层（带引用规则尾注）。解析口径与
+    # messages API 的旧行自愈共用 parse_tool_output，别各写一份。
+    return parse_tool_output(text)
+
+
+def _tool_duration(message: Any) -> int | None:
+    """
+    `ToolMessage.additional_kwargs.duration_ms` -> 历史块的耗时（毫秒）。
+
+    由工具节点在造 ToolMessage 时写入（`_outcome_message`），随 checkpoint
+    持久化。拿不到就是 None —— 旧行没有这个键，前端按"未知"处理。
+    """
+
+    kwargs = getattr(message, "additional_kwargs", None)
+
+    if not isinstance(kwargs, Mapping):
+        return None
+
+    value = kwargs.get("duration_ms")
+
+    if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value >= 0
+    ):
+        return int(round(value))
+
+    return None
+
+
+def _tool_result_block(
+        message: Any,
+        presentations: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """
+    ToolMessage -> `tool_result` 块（历史侧的结果事实）。
+
+    ⚠️ 不写回 tool_call 块
+    ---------------------
+    审批 / 中断恢复时，AIMessage 在前一次运行落库、ToolMessage 在恢复后
+    才出现，而消息不可变（updated_at == created_at）。用 tool_call_id
+    做键，前端在拼历史时跨消息合并即可。
+
+    ⚠️ 没有 presenter 就不写 `display` 键
+    ------------------------------------
+    没有展示配置的工具在聊天里本来就不出现，历史里也不该多一份空描述符。
+    `output` 同理：它只在 presenter 且 `show_output=true` 时才落，
+    与实时事件的裁剪口径一致。
+    """
+
+    call_id = tool_message_call_id(message)
+
+    if not call_id:
+        return None
+
+    name = str(getattr(message, "name", "") or "")
+
+    raw_status = str(getattr(message, "status", "") or "")
+    failed = raw_status == "error"
+    status = "error" if failed else "done"
+
+    # ⚠️ 失败时**不要把错误文本当 output**。`_tool_output` 解析的是
+    # ToolMessage 正文，失败时那正文就是错误消息；把它传给
+    # `build_display` 会让「共 {output.rowCount} 条」渲染成「共  条」
+    # （模板保护只认 None）。与实时侧同一条口径：失败只有 error。
+    output = None if failed else _tool_output(message)
+
+    block: dict[str, Any] = {
+        "type": "tool_result",
+        "tool_call_id": call_id,
+        "name": name,
+        "status": status,
+    }
+
+    duration_ms = _tool_duration(message)
+
+    if duration_ms is not None:
+        # ContentBlock 允许额外键（messages.yaml）；旧行没有这个键。
+        block["duration_ms"] = duration_ms
+
+    presentation = (presentations or {}).get(name)
+
+    if presentation is not None:
+
+        # 与实时投影同一个组合点（shape_tool_output），别再手拼一遍。
+        shaped = shape_tool_output(presentation, output)
+
+        if not failed and shaped.has_output:
+            block["output"] = shaped.output
+
+        block["display"] = shaped.display
+
+    if failed:
+        error_text = message_text(message).strip()
+
+        if error_text:
+            block["error"] = error_text
+
+    return block

@@ -39,6 +39,10 @@ from .tool_documentation_service_impl import (
 )
 from .tool_execution_service import ToolExecutionService
 from .tool_execution_service_impl import ToolExecutionServiceImpl
+from .tool_presentation_service import ToolPresentationService
+from .tool_presentation_service_impl import (
+    ToolPresentationServiceImpl,
+)
 from .tool_processor_service import ToolProcessorService
 from .tool_processor_service_impl import ToolProcessorServiceImpl
 from .tool_query_service import ToolQueryService
@@ -59,6 +63,8 @@ __all__ = [
     "ToolDocumentationServiceImpl",
     "ToolExecutionService",
     "ToolExecutionServiceImpl",
+    "ToolPresentationService",
+    "ToolPresentationServiceImpl",
     "ToolProcessorService",
     "ToolProcessorServiceImpl",
     "ToolQueryService",

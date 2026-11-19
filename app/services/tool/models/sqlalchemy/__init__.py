@@ -24,6 +24,7 @@ from .tool_execution import ToolExecution
 from .tool_parameter_documentation import (
     ToolParameterDocumentation,
 )
+from .tool_presentation import ToolPresentation
 from .tool_processor import ToolProcessor
 
 __all__ = [
@@ -33,5 +34,6 @@ __all__ = [
     "ToolDocumentation",
     "ToolExecution",
     "ToolParameterDocumentation",
+    "ToolPresentation",
     "ToolProcessor",
 ]

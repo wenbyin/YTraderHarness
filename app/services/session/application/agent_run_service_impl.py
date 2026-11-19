@@ -55,11 +55,13 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from app.agent.event import publish_trace_event
+from app.agent.event import emit_event
 from app.agent.graph.react.catalog import AGENT_TYPE
 from app.agent.prompt import get_prompt_provider
 from app.common.environment import current_environment
-from app.common.event import EventType, SpanKind
+from app.common.event import SpanKind
+from app.common.event.spec import Event as CanonicalEvent
+from app.common.event.spec import EventType as CanonicalEventType
 from app.common.exceptions import ConflictError, NotFoundError
 from app.common.service.base import RollbackHook, ServiceContext
 from app.infra.graph import (
@@ -299,16 +301,16 @@ class AgentRunServiceImpl(AgentRunService):
         # 事务回滚时"已接受"就是一个假事实。post-commit 保证事件与
         # 运行行同时成立。
         async def _accepted() -> None:
-            await publish_trace_event(
-                EventType.RUN_ACCEPTED,
-                trace_id=trace_id,
+            await emit_event(CanonicalEvent(
+                type=CanonicalEventType.RUN_ACCEPTED,
                 run_id=str(run_id),
-                thread_id=str(session_id),
+                trace_id=trace_id,
+                session_id=str(session_id),
                 span_id=str(run_id),
                 span_kind=SpanKind.RUN,
                 span_name="run",
-                payload={"agent_type": AGENT_TYPE},
-            )
+                data={"agent_type": AGENT_TYPE},
+            ))
 
         self._post_commit.append(_accepted)
 
@@ -726,16 +728,16 @@ class AgentRunServiceImpl(AgentRunService):
 
             # run.queued：dispatcher 已受理（进入进程内队列）。拒收时不发
             # —— 那次运行从未进过队列，发了就是伪造。
-            await publish_trace_event(
-                EventType.RUN_QUEUED,
-                trace_id=trace_id,
+            await emit_event(CanonicalEvent(
+                type=CanonicalEventType.RUN_QUEUED,
                 run_id=str(run_id),
-                thread_id=str(session_id),
+                trace_id=trace_id,
+                session_id=str(session_id),
                 span_id=str(run_id),
                 span_kind=SpanKind.RUN,
                 span_name="run",
-                payload={"queue_name": "agent_run"},
-            )
+                data={"queue_name": "agent_run"},
+            ))
 
         self._post_commit.append(_hook)
 

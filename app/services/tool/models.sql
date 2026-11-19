@@ -227,3 +227,51 @@ CREATE INDEX idx_tool_execution_tool_key
 CREATE INDEX idx_tool_execution_unsettled
     ON tool_execution(created_at)
     WHERE status IN ('PENDING', 'RUNNING');
+
+-- ============================================================
+-- tool_presentation：用户展示描述符
+-- ============================================================
+--
+-- **有行 = 显示，无行 = 不显示（默认）。**
+--
+-- 与 tool_definition_state 是两条独立规则、方向相反：
+--     tool_definition_state   有行 = 禁用（默认启用）
+--     tool_presentation       有行 = 显示（默认隐藏）
+--
+-- 合并成一张表必然要加布尔列，于是「看列还是看行在不在」
+-- 变成读写两边的共同负担。写路径也不同：下线是 DELETE，
+-- 显示是 upsert 一整份描述符。
+--
+-- 无外键：与 tool_definition_state 同一条理由 ——
+-- remove_missing=true 会物理删除 definition 行，CASCADE 会把
+-- 人工配的展示悄悄清掉。键用稳定的 tool_key。
+CREATE TABLE tool_presentation (
+    -- 稳定业务标识，与 tool_definition.tool_key 对应。
+    tool_key        VARCHAR(255) PRIMARY KEY,
+
+    -- 前端组件注册表的键：inline / tips / card / table。
+    -- ⚠️ 没有 hidden：不显示 = 没有行。
+    renderer        VARCHAR(32)  NOT NULL,
+
+    -- 给人看的标题；为空时前端回落到工具 name。
+    display_name    VARCHAR(128),
+
+    -- 点路径模板，如「已查询 {input.symbol} 共 {output.count} 条」。
+    summary         TEXT,
+
+    -- false 时事件载荷里**不出现**对应键（不是置 null）。
+    show_input      BOOLEAN NOT NULL DEFAULT FALSE,
+    show_output     BOOLEAN NOT NULL DEFAULT FALSE,
+
+    -- renderer 专属内容。共享键：fields / max_bytes。
+    props           JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    updated_by      VARCHAR(255),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT ck_tool_presentation_renderer
+        CHECK (renderer IN ('inline', 'tips', 'card', 'table')),
+
+    CONSTRAINT ck_tool_presentation_props_object
+        CHECK (jsonb_typeof(props) = 'object')
+);

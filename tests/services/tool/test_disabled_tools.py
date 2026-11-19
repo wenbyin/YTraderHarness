@@ -79,6 +79,8 @@ def _query_service(definitions, states) -> ToolQueryServiceImpl:
     return ToolQueryServiceImpl(
         tool_definition_repository=definitions,
         tool_definition_state_repository=states,
+        # 这组用例只走 tool_keys_for_capabilities，不碰展示配置。
+        tool_presentation_repository=SimpleNamespace(),
         tool_documentation_repository=SimpleNamespace(),
         tool_classification_repository=SimpleNamespace(),
     )

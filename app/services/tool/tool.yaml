@@ -153,6 +153,73 @@ paths:
           $ref: '#/components/responses/NotFound'
 
 
+  /tools/{tool_id}/presentation:
+    put:
+      tags:
+        - Tools
+      summary: Set how a tool's calls are displayed to end users
+      operationId: setToolPresentation
+
+      description: |
+        Replaces the whole presenter.
+
+        Presence of a presenter is the switch: a tool without one is
+        **not displayed at all** — its `tool.called` / `tool.completed`
+        frames are not emitted, and its name is omitted from
+        `message.completed.tool_calls`.
+
+        This endpoint controls display content only. It does not decide
+        whether the tool is exposed to the model (that is
+        PATCH /tools/{tool_id}/enabled), and it does not control timing,
+        grouping, dismissal or error escalation — those belong to the
+        client.
+
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolPresentation'
+
+      responses:
+        '200':
+          description: Stored presenter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolPresentationState'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags:
+        - Tools
+      summary: Stop displaying a tool's calls
+      operationId: clearToolPresentation
+
+      description: >
+        Deletes the presenter row. The tool becomes invisible to end
+        users again; it stays enabled for the model.
+
+      parameters:
+        - $ref: '#/components/parameters/ToolId'
+
+      responses:
+        '200':
+          description: No presenter left
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolPresentationState'
+
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+
   /tools/discovery/sync:
     post:
       tags:
@@ -570,6 +637,122 @@ components:
           readOnly: true
 
 
+    ToolPresentation:
+      description: >
+        Display content for one tool's calls. There is no "hidden"
+        renderer: hiding a tool means having no presenter row at all,
+        which is why clearing the presenter is a DELETE rather than a
+        value.
+
+        This object says *what* to show, never *when* or *whether*.
+      type: object
+      required:
+        - renderer
+        - show_input
+        - show_output
+        - props
+      properties:
+        renderer:
+          type: string
+          enum:
+            - inline
+            - tips
+            - card
+            - table
+          description: >
+            Closed set owned jointly by this spec and the frontend
+            component registry. Clients MUST degrade an unknown value
+            to `inline` (and to hidden when `display_name` is absent).
+            Adding a value is additive.
+
+        display_name:
+          type: string
+          nullable: true
+          description: >
+            Human-facing label. Falls back to the tool's `name` when
+            null. Never send `tool_key` (e.g. capability_list) to end
+            users.
+
+        summary:
+          type: string
+          nullable: true
+          description: >
+            Short sentence template rendered at projection time.
+            Placeholders are dotted paths rooted at input/output, e.g.
+            "已查询 {input.symbol} 共 {output.count} 条". A path that
+            does not resolve renders as an empty string — the projector
+            never fails a call over a template.
+
+        show_input:
+          type: boolean
+          default: false
+          description: >
+            When false the `input` key is omitted from the event
+            payload entirely (not set to null).
+
+        show_output:
+          type: boolean
+          default: false
+          description: >
+            When false the `output` key is omitted from the event
+            payload entirely (not set to null).
+
+        props:
+          type: object
+          additionalProperties: true
+          default: {}
+          description: >
+            Renderer-specific content. Keys shared by every renderer:
+
+              output_path — JSON Pointer into the tool result; the value
+                            found there becomes the emitted `output`
+                            payload. Use it when the tool wraps its rows
+                            (e.g. `{bars: [...], rowCount: N}` -> `/bars`).
+                            A missing path yields an empty array, so a
+                            table degrades to a card instead of drawing
+                            the wrapper object as one row.
+
+              max_rows    — integer cap for array outputs. Tables only
+                            render a handful of rows; raw query results
+                            may carry hundreds. The summary's total is
+                            unaffected.
+
+              fields      — array of JSON Pointers relative to the
+                            extracted output; only these may be sent.
+                            Empty means "whatever show_input/show_output
+                            allow". Note: `fields` targets objects, not
+                            array elements.
+
+              max_bytes   — integer truncation limit for the rendered
+                            payload; clients show an expand affordance.
+
+            Any other key is interpreted by the renderer and ignored by
+            clients that do not know it.
+
+
+    ToolPresentationState:
+      description: >
+        A tool's presenter as stored. `presented=false` means the tool
+        has no presenter row and its calls are not displayed.
+      type: object
+      required:
+        - tool_key
+        - presented
+      properties:
+        tool_key:
+          type: string
+          readOnly: true
+
+        presented:
+          type: boolean
+          readOnly: true
+
+        presentation:
+          oneOf:
+            - $ref: '#/components/schemas/ToolPresentation'
+            - type: 'null'
+
+
     ToolSummary:
       type: object
       required:
@@ -579,6 +762,7 @@ components:
         - source_type
         - source_state
         - enabled
+        - presented
       properties:
         id:
           type: string
@@ -607,6 +791,15 @@ components:
             PATCH /tools/{tool_id}/enabled; such a tool is skipped by
             the next tool resolution. Not part of the code-side manifest.
 
+        presented:
+          type: boolean
+          readOnly: true
+          description: >
+            Display switch. false (the default) = the tool has no
+            presenter row, so its calls are not pushed to the event
+            stream. Set via PUT /tools/{tool_id}/presentation; also
+            outside the code-side manifest.
+
         description:
           type: string
           nullable: true
@@ -623,6 +816,7 @@ components:
       type: object
       required:
         - enabled
+        - presentation
         - manifest
         - documentation
         - classifications
@@ -633,6 +827,15 @@ components:
           description: >
             Runtime switch. Kept outside `manifest` because the manifest
             is code-side fact; this flag comes from tool_definition_state.
+
+        presentation:
+          oneOf:
+            - $ref: '#/components/schemas/ToolPresentation'
+            - type: 'null'
+          description: >
+            Display descriptor, or null when the tool is not displayed.
+            Unlike `enabled`, its absence is the default state rather
+            than an anomaly.
 
         manifest:
           $ref: '#/components/schemas/ToolManifest'

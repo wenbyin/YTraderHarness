@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -13,25 +14,29 @@ from app.common.event import (
     SpanKind,
     SpanStatus,
     TraceError,
-    TraceEvent,
-    stream_key,
+    trace_stream_key,
 )
+from app.common.event.spec import Event as CanonicalEvent
+from app.common.event.spec import EventType as CanonicalEventType
 
 
-def _event(event_type: EventType, payload: dict, **overrides):
-    data = {
+def _canonical_event(event_type: EventType, data: dict, **overrides):
+    """规范 Event —— 投影层现在只收这个形状（节点侧 TraceEmitter 直接产它）。"""
+
+    payload = {
         "event_id": "e-1",
-        "event_type": event_type,
+        "type": CanonicalEventType(event_type.value),
         "trace_id": "trace-1",
         "run_id": "run-1",
-        "thread_id": "session-1",
+        "session_id": "session-1",
         "span_id": "span-1",
         "span_kind": SpanKind.MODEL,
         "span_name": "model.invoke",
-        "payload": payload,
+        "data": data,
     }
-    data.update(overrides)
-    return TraceEvent(**data)
+    payload.update(overrides)
+
+    return CanonicalEvent(**payload)
 
 
 def test_event_type_vocabulary_is_fixed() -> None:
@@ -52,7 +57,7 @@ def test_event_type_vocabulary_is_fixed() -> None:
 
 def test_payload_is_strictly_validated() -> None:
     with pytest.raises(ValidationError):
-        _event(
+        _canonical_event(
             EventType.MODEL_STARTED,
             {
                 "model_role": "reasoning",
@@ -64,7 +69,7 @@ def test_payload_is_strictly_validated() -> None:
         )
 
     with pytest.raises(ValidationError):
-        _event(
+        _canonical_event(
             EventType.MODEL_STARTED,
             {"model_role": "reasoning", "provider": "p"},
         )
@@ -72,26 +77,29 @@ def test_payload_is_strictly_validated() -> None:
 
 def test_failed_event_requires_error() -> None:
     with pytest.raises(ValidationError):
-        _event(EventType.MODEL_FAILED, {})
+        _canonical_event(
+            EventType.MODEL_FAILED,
+            {},
+            status=SpanStatus.FAILED,
+        )
 
-    event = _event(
+    event = _canonical_event(
         EventType.MODEL_FAILED,
         {},
+        status=SpanStatus.FAILED,
         error=TraceError(type="ModelTimeoutError", message="timeout"),
     )
     assert event.error is not None
 
 
 def test_redis_key_and_envelope() -> None:
-    event = _event(
+    event = _canonical_event(
         EventType.MODEL_COMPLETED,
         {"output_tokens": 3},
         status=SpanStatus.COMPLETED,
     )
 
-    assert event.topic == "trace"
-    assert event.topic_id == "trace-1:events"
-    assert stream_key(event.topic, event.topic_id) == "trace:trace-1:events"
+    assert trace_stream_key("trace-1") == "trace:trace-1:events"
 
     fields = event.to_fields()
 
@@ -99,10 +107,9 @@ def test_redis_key_and_envelope() -> None:
     assert fields["run_id"] == "run-1"
     assert fields["span_id"] == "span-1"
     assert fields["event"] == "model.completed"
+    assert fields["schema_version"] == "2.0"
 
-    decoded = json.loads(fields["data"])
-    assert decoded["payload"]["output_tokens"] == 3
-    assert decoded["schema_version"] == "1.0"
+    assert json.loads(fields["data"]) == {"output_tokens": 3}
 
 
 @pytest.mark.asyncio
@@ -119,68 +126,40 @@ async def test_unknown_custom_payload_is_ignored() -> None:
 
 
 @pytest.mark.asyncio
-async def test_redis_publisher_writes_the_trace_key() -> None:
-    from app.agent.event.publisher import RedisEventPublisher
-    from app.agent.event.config import StreamConfig
-
-    class _Sink:
-        def __init__(self) -> None:
-            self.writes: list[tuple[str, dict]] = []
-
-        def ping(self) -> bool:
-            return True
-
-        def write(self, key, fields, *, maxlen, ttl_seconds) -> None:
-            self.writes.append((key, dict(fields)))
-
-    sink = _Sink()
-    publisher = RedisEventPublisher(
-        sink,
-        config=StreamConfig(enabled=True, maxlen=100, ttl_seconds=60),
-        queue_size=10,
-    )
-    publisher.start()
-
-    try:
-        event = _event(
-            EventType.RUN_COMPLETED,
-            {},
-            status=SpanStatus.COMPLETED,
-        )
-        assert await publisher.publish(event) is True
-        await publisher.drain(timeout=2)
-
-    finally:
-        await publisher.aclose(timeout=2)
-
-    assert sink.writes
-    key, fields = sink.writes[0]
-
-    assert key == "trace:trace-1:events"
-    assert fields["trace_id"] == "trace-1"
-    assert fields["event_id"] == "e-1"
-
-
-@pytest.mark.asyncio
 async def test_fanout_bookkeeping_and_tool_span_alignment(
         monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from app.agent.event import run_event_projector as pm
     from app.common.event import TraceEmitter
 
-    published: list[TraceEvent] = []
+    published: list[Any] = []
 
-    async def fake_publish(self: Any, event: TraceEvent) -> bool:
-        published.append(event)
-        return True
+    async def fake_emit(event: Any) -> dict[str, bool]:
+        if event.trace_id:
+            published.append(SimpleNamespace(
+                event_type=EventType(event.type.value),
+                trace_id=event.trace_id,
+                run_id=event.run_id,
+                thread_id=event.session_id,
+                span_id=event.span_id,
+                parent_span_id=event.parent_span_id,
+                span_kind=event.span_kind,
+                span_name=event.span_name,
+                status=event.status,
+                duration_ms=event.duration_ms,
+                payload=dict(event.data),
+                error=event.error,
+                event_id=event.event_id,
+                fanout_id=event.fanout_id,
+                branch_id=event.branch_id,
+                branch_index=event.branch_index,
+                attempt=event.attempt,
+                links=list(event.links),
+            ))
 
-    async def fake_run_event(*args: Any, **kwargs: Any) -> bool:
-        return True
+        return {"chat": True, "trace": bool(event.trace_id)}
 
-    monkeypatch.setattr(
-        pm.RedisTracePublisher, "publish", fake_publish
-    )
-    monkeypatch.setattr(pm, "publish_run_event", fake_run_event)
+    monkeypatch.setattr(pm, "emit_event", fake_emit)
 
     projector = RunEventProjector(
         scope=(),
@@ -227,9 +206,26 @@ async def test_fanout_bookkeeping_and_tool_span_alignment(
 
     # event writer 是空的：直接拿 emitter 构造的事件喂给投影层。
     # （这里复用不到 emitter 的内部队列，所以重新构造等价事件。）
+    #
+    # ⚠️ 顺序必须与真实运行一致：先 fanout.started 建好记账状态，
+    #    再 branch_created 才会走到 `branches.add(...)` 那条路。
+    started_event = _canonical_event(
+        EventType.FANOUT_STARTED,
+        {
+            "fanout_type": "tool_calls",
+            "dispatch_mode": "parallel",
+            "expected_branch_count": 2,
+        },
+        event_id="fanout-started",
+        span_id="fanout-1",
+        span_kind=SpanKind.FANOUT,
+        span_name="tool_fanout",
+    )
+    await projector._on_custom(started_event.model_dump(mode="json"), 0)
+
     for scope in ("scope-1", "scope-2"):
         index = 0 if scope == "scope-1" else 1
-        event = _event(
+        event = _canonical_event(
             EventType.FANOUT_BRANCH_CREATED,
             {
                 "branch_id": scope,
@@ -244,20 +240,6 @@ async def test_fanout_bookkeeping_and_tool_span_alignment(
             span_name="tool_fanout",
         )
         await projector._on_custom(event.model_dump(mode="json"), 0)
-
-    started_event = _event(
-        EventType.FANOUT_STARTED,
-        {
-            "fanout_type": "tool_calls",
-            "dispatch_mode": "parallel",
-            "expected_branch_count": 2,
-        },
-        event_id="fanout-started",
-        span_id="fanout-1",
-        span_kind=SpanKind.FANOUT,
-        span_name="tool_fanout",
-    )
-    await projector._on_custom(started_event.model_dump(mode="json"), 0)
 
     # 两个 tools 分支：start -> result。
     for index, scope in enumerate(("scope-1", "scope-2"), start=1):

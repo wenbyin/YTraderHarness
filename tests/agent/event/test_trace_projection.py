@@ -13,6 +13,7 @@ metadata / custom 模式都只在真运行里才成立）。只把 Redis 发布�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Annotated, Any, TypedDict
 
 import pytest
@@ -43,7 +44,6 @@ from app.common.event import (
     SpanKind,
     SpanStatus,
     TraceEmitter,
-    TraceEvent,
 )
 from app.infra.graph import execution_ids
 
@@ -170,15 +170,41 @@ def _model_graph() -> Any:
     return builder.compile()
 
 
-async def _run_model_graph() -> list[TraceEvent]:
-    recorded: list[TraceEvent] = []
+def _trace_like(event: Any) -> SimpleNamespace:
+    """把规范事件转成测试断言用的 TraceEvent 形状。"""
 
-    async def fake_publish(self: Any, event: TraceEvent) -> bool:
-        recorded.append(event)
-        return True
+    return SimpleNamespace(
+        event_type=EventType(event.type.value),
+        trace_id=event.trace_id,
+        run_id=event.run_id,
+        thread_id=event.session_id,
+        span_id=event.span_id,
+        parent_span_id=event.parent_span_id,
+        span_kind=event.span_kind,
+        span_name=event.span_name,
+        status=event.status,
+        duration_ms=event.duration_ms,
+        payload=dict(event.data),
+        error=event.error,
+        event_id=event.event_id,
+        fanout_id=event.fanout_id,
+        branch_id=event.branch_id,
+        branch_index=event.branch_index,
+        attempt=event.attempt,
+        links=list(event.links),
+    )
 
-    original = projector_module.RedisTracePublisher.publish
-    projector_module.RedisTracePublisher.publish = fake_publish
+
+async def _run_model_graph() -> list[Any]:
+    recorded: list[Any] = []
+
+    async def fake_emit(event: Any) -> dict[str, bool]:
+        if event.trace_id:
+            recorded.append(_trace_like(event))
+        return {"chat": True, "trace": bool(event.trace_id)}
+
+    original = projector_module.emit_event
+    projector_module.emit_event = fake_emit
 
     try:
         run_stream = await _model_graph().astream_events(
@@ -205,7 +231,7 @@ async def _run_model_graph() -> list[TraceEvent]:
             await run_stream.output()
 
     finally:
-        projector_module.RedisTracePublisher.publish = original
+        projector_module.emit_event = original
 
     return recorded
 
@@ -239,15 +265,19 @@ async def test_model_runtime_events_and_first_token() -> None:
     assert first_token.payload["ttft_ms"] >= 0
 
 
-async def _run(trace_id: str | None) -> list[TraceEvent]:
-    recorded: list[TraceEvent] = []
+async def _run(trace_id: str | None) -> list[Any]:
+    recorded: list[Any] = []
 
-    async def fake_publish(self: Any, event: TraceEvent) -> bool:
-        recorded.append(event)
-        return True
+    async def fake_emit(event: Any) -> dict[str, bool]:
+        # v2：所有出站事件走规范事件。这里只收 trace 目的地的记录；
+        # 没有 trace_id 时，这些事件只属于 chat，测试里不应出现。
+        if event.trace_id:
+            recorded.append(_trace_like(event))
 
-    original = projector_module.RedisTracePublisher.publish
-    projector_module.RedisTracePublisher.publish = fake_publish
+        return {"chat": True, "trace": bool(event.trace_id)}
+
+    original_emit = projector_module.emit_event
+    projector_module.emit_event = fake_emit
 
     try:
         run_stream = await _graph().astream_events(
@@ -272,7 +302,7 @@ async def _run(trace_id: str | None) -> list[TraceEvent]:
             await run_stream.output()
 
     finally:
-        projector_module.RedisTracePublisher.publish = original
+        projector_module.emit_event = original_emit
 
     return recorded
 

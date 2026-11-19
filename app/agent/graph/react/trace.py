@@ -16,8 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from langgraph.config import get_stream_writer
-
+from app.agent.event.stream import resolve_stream_writer
 from app.common.event import TraceEmitter
 from app.infra.graph import execution_ids
 
@@ -51,7 +50,8 @@ def node_trace(runtime: Any) -> tuple[TraceEmitter, str]:
         trace_id=trace_id,
         run_id=str(run_id) if run_id is not None else "",
         thread_id=None if session_id is None else str(session_id),
-        writer=get_stream_writer(),
+        # 统一走共享解析：no-op writer 会被识别并告警（不再静默丢 trace）。
+        writer=resolve_stream_writer() or (lambda _: None),
     )
 
     return emitter, span_id

@@ -31,7 +31,14 @@ from ..repository.tool_definition_state import (
 from ..repository.tool_documentation import (
     ToolDocumentationRepository,
 )
-from ._assembly import build_definition_detail, build_summary
+from ..repository.tool_presentation import (
+    ToolPresentationRepository,
+)
+from ._assembly import (
+    build_definition_detail,
+    build_presentation,
+    build_summary,
+)
 from .tool_query_service import ToolQueryService
 
 logger = logging.getLogger(__name__)
@@ -46,6 +53,9 @@ class ToolQueryServiceImpl(ToolQueryService):
             tool_definition_state_repository: (
                 ToolDefinitionStateRepository
             ),
+            tool_presentation_repository: (
+                ToolPresentationRepository
+            ),
             tool_documentation_repository: (
                 ToolDocumentationRepository
             ),
@@ -58,6 +68,7 @@ class ToolQueryServiceImpl(ToolQueryService):
 
         self._definitions = tool_definition_repository
         self._states = tool_definition_state_repository
+        self._presentations = tool_presentation_repository
         self._documentations = tool_documentation_repository
         self._classifications = tool_classification_repository
 
@@ -98,6 +109,11 @@ class ToolQueryServiceImpl(ToolQueryService):
             [d.tool_key for d in definitions]
         )
 
+        # 展示开关同理：贴着这一页的工具查，不拉全表。
+        presented = await self._presentations.map_for_keys(
+            [d.tool_key for d in definitions]
+        )
+
         # 两个批量查询，而不是在循环里逐个取 ——
         # 一页 20 条时那是 40 次多余的往返（经典的 N+1）。
         overrides = (
@@ -120,6 +136,7 @@ class ToolQueryServiceImpl(ToolQueryService):
                     definition.tool_id, []
                 ),
                 enabled=definition.tool_key not in disabled,
+                presented=definition.tool_key in presented,
             )
             for definition in definitions
         ]
@@ -155,11 +172,20 @@ class ToolQueryServiceImpl(ToolQueryService):
             [definition.tool_key]
         )
 
+        stored_presentation = await self._presentations.get(
+            definition.tool_key
+        )
+
         return build_definition_detail(
             definition,
             stored,
             classifications,
             enabled=definition.tool_key not in disabled,
+            presentation=(
+                build_presentation(stored_presentation)
+                if stored_presentation is not None
+                else None
+            ),
         )
 
     # ========================================================

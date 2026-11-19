@@ -124,6 +124,7 @@ class TraceAggregate:
         payload = payload if isinstance(payload, Mapping) else {}
         run_id = str(event.get("run_id") or "")
         duration_ms = _as_float(event.get("duration_ms"))
+        status = str(event.get("status") or "")
 
         if event_type == EventType.RUN_STARTED.value:
             self.counts["run_span_count"] += 1
@@ -172,7 +173,8 @@ class TraceAggregate:
             EventType.NODE_FAILED.value,
         }:
             name = str(
-                payload.get("node_name")
+                payload.get("node_id")
+                or payload.get("node_name")
                 or event.get("span_name")
                 or "unknown"
             )
@@ -198,7 +200,12 @@ class TraceAggregate:
                 or "unknown"
             )
 
-            if event_type == EventType.TOOL_FAILED.value:
+            # v1 用独立事件名表达失败；v2 把失败折进 tool.completed 的
+            # status。两种都算一次工具错误。
+            if (
+                    event_type == EventType.TOOL_FAILED.value
+                    or status == "failed"
+            ):
                 self.tool_error_count += 1
 
             if duration_ms is not None:
@@ -289,6 +296,48 @@ class TraceAggregate:
 # ============================================================
 
 
+def _json_object(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return None
+    elif isinstance(raw, Mapping):
+        parsed = dict(raw)
+    else:
+        return None
+
+    return dict(parsed) if isinstance(parsed, Mapping) else None
+
+
+def _parse_trace_fields(
+        fields: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """
+    一条 Redis trace 记录 -> 聚合器认识的事件字典。
+
+    v2 的信封字段是平铺的（`event` / `event_id` / `trace_id` /
+    `duration_ms` / `status` / `data`），v1 则把整个 `TraceEvent` dump
+    在 `data` 里。两种都转成同一形状，聚合逻辑只写一份。
+    """
+
+    if fields.get("schema_version"):
+        payload = _json_object(fields.get("data")) or {}
+
+        return {
+            "event_type": str(fields.get("event") or ""),
+            "event_id": str(fields.get("event_id") or ""),
+            "trace_id": str(fields.get("trace_id") or ""),
+            "run_id": str(fields.get("run_id") or ""),
+            "payload": payload,
+            "duration_ms": _as_float(fields.get("duration_ms")),
+            "status": str(fields.get("status") or "") or None,
+            "span_name": str(fields.get("span_name") or ""),
+        }
+
+    return _json_object(fields.get("data"))
+
+
 class TraceAggregator:
     """按 trace_id 读取 Redis Trace Stream。"""
 
@@ -373,20 +422,10 @@ class TraceAggregator:
         events: list[dict[str, Any]] = []
 
         for _, fields in entries:
-            raw = fields.get("data")
+            parsed = _parse_trace_fields(fields)
 
-            if isinstance(raw, str):
-                try:
-                    parsed = json.loads(raw)
-                except ValueError:
-                    continue
-            elif isinstance(raw, Mapping):
-                parsed = dict(raw)
-            else:
-                continue
-
-            if isinstance(parsed, Mapping):
-                events.append(dict(parsed))
+            if parsed is not None:
+                events.append(parsed)
 
         return events
 

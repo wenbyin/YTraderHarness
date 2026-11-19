@@ -270,25 +270,25 @@ def published(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
 
     events: list[Any] = []
 
-    async def _capture(
-            type: Any,
-            topic_id: str,
-            *,
-            data: Any = None,
-            node: str | None = None,
-    ) -> bool:
+    async def _capture_canonical(event: Any) -> dict[str, bool]:
+        """v2：所有出站事件都走 `emit_event`。"""
 
         events.append(
             SimpleNamespace(
-                type=getattr(type, "value", str(type)),
-                topic_id=topic_id,
-                node=node,
-                data=dict(data or {}),
+                type=event.type.value,
+                topic_id=event.run_id,
+                node=event.node,
+                data=dict(event.data),
+                status=event.status,
+                error=event.error,
+                span_id=event.span_id,
+                parent_span_id=event.parent_span_id,
+                trace_id=event.trace_id,
             )
         )
-        return True
+        return {"chat": True}
 
-    monkeypatch.setattr(projector_module, "publish_run_event", _capture)
+    monkeypatch.setattr(projector_module, "emit_event", _capture_canonical)
 
     return events
 
@@ -298,6 +298,7 @@ async def _drive(
         *,
         message_nodes: Sequence[str],
         message_roles: Sequence[str],
+        reasoning_enabled: bool = True,
 ) -> None:
     """跑完一条运行 —— transformer 只有被这个循环泵着才会拿到事件。"""
 
@@ -310,6 +311,7 @@ async def _drive(
                 run_id="run-under-test",
                 message_nodes=set(message_nodes),
                 message_roles=set(message_roles),
+                reasoning_enabled=reasoning_enabled,
             ),
         ],
     )
@@ -606,6 +608,41 @@ async def test_reasoning_events_stay_silent_when_the_role_is_not_allowed(
     assert _of(published, "message.reasoning.delta") == []
     assert _of(published, "message.reasoning.completed") == []
     assert _of(published, "message.started") != []
+
+
+async def test_reasoning_events_can_be_switched_off(
+        published: list[Any],
+) -> None:
+    """
+    `sinks.chat.reasoning_enabled=false`：推理一条都不发。
+
+    ⚠️ 只关推理，**不关正文，也不关边界事件** —— 关掉的是"输出什么"，
+    不是"有没有模型在工作"。前者让前端少一块折叠区，后者会让它一直转圈。
+    """
+
+    compiled = _compiled(
+        _registry(_fake_factory_with_reasoning),
+        node="agent",
+        roles=(ModelRole.REASONING,),
+    )
+
+    await _drive(
+        compiled,
+        message_nodes={"agent"},
+        message_roles={ModelRole.REASONING},
+        reasoning_enabled=False,
+    )
+
+    assert _of(published, "message.reasoning.delta") == []
+    assert _of(published, "message.reasoning.completed") == []
+
+    # 正文与边界事件照旧。
+    assert "".join(
+        item.data["delta"] for item in _of(published, "message.delta")
+    ) == "FINAL-ANSWER"
+    assert _of(published, "message.completed")[0].data["content"] == (
+        "FINAL-ANSWER"
+    )
 
 
 async def test_reasoning_completed_is_a_real_reconciliation_point(

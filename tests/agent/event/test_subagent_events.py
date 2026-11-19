@@ -6,7 +6,8 @@ import pytest
 
 from app.agent.event import subagent_events
 from app.agent.event.run_event_projector import RunEventProjector
-from app.common.event import RunEventType, SUBAGENT_STREAM_KIND
+from app.common.event import SUBAGENT_STREAM_KIND
+from app.common.event.spec import EventType
 
 __all__: list[str] = []
 
@@ -33,7 +34,7 @@ def test_created_envelope(monkeypatch) -> None:
     )
 
     assert captured[0]["kind"] == SUBAGENT_STREAM_KIND
-    assert captured[0]["event"] == RunEventType.SUBAGENT_CREATED.value
+    assert captured[0]["event"] == EventType.SUBAGENT_CREATED.value
     assert captured[0]["worker_id"] == "run:worker:0"
     assert captured[0]["worker_index"] == 0
     assert captured[0]["task_id"] == "p1:t1"
@@ -70,9 +71,9 @@ def test_claimed_and_progress_envelopes(monkeypatch) -> None:
     )
 
     assert [item["event"] for item in captured] == [
-        RunEventType.SUBAGENT_CLAIMED.value,
-        RunEventType.SUBAGENT_TASK_UPDATED.value,
-        RunEventType.SUBAGENT_COMPLETED.value,
+        EventType.SUBAGENT_CLAIMED.value,
+        EventType.SUBAGENT_TASK_UPDATED.value,
+        EventType.SUBAGENT_COMPLETED.value,
     ]
     assert captured[0]["task"] == task
     assert captured[0]["worker_id"] == "run:worker:0"
@@ -95,7 +96,7 @@ async def test_projector_maps_subagent_stream_events() -> None:
         fake,
         {
             "kind": SUBAGENT_STREAM_KIND,
-            "event": RunEventType.SUBAGENT_CLAIMED.value,
+            "event": EventType.SUBAGENT_CLAIMED.value,
             "node": "subagent_dispatch",
             "plan_id": "p1",
             "worker_id": "run:worker:0",
@@ -106,7 +107,7 @@ async def test_projector_maps_subagent_stream_events() -> None:
 
     event_type, node, data = fake.events[0]
 
-    assert event_type is RunEventType.SUBAGENT_CLAIMED
+    assert event_type is EventType.SUBAGENT_CLAIMED
     assert node == "subagent_dispatch"
     assert data["worker_id"] == "run:worker:0"
     assert data["task"] == {"id": "t1"}
@@ -117,11 +118,11 @@ async def test_projector_maps_subagent_stream_events() -> None:
 def test_event_values_are_stable_contract() -> None:
     """事件名是字面契约；改一个字就是破坏订阅端。"""
 
-    assert RunEventType.SUBAGENT_CREATED.value == "subagent.created"
-    assert RunEventType.SUBAGENT_CLAIMED.value == "subagent.claimed"
+    assert EventType.SUBAGENT_CREATED.value == "subagent.created"
+    assert EventType.SUBAGENT_CLAIMED.value == "subagent.claimed"
     assert (
-        RunEventType.SUBAGENT_TASK_UPDATED.value
+        EventType.SUBAGENT_TASK_UPDATED.value
         == "subagent.task.updated"
     )
-    assert RunEventType.SUBAGENT_COMPLETED.value == "subagent.completed"
+    assert EventType.SUBAGENT_COMPLETED.value == "subagent.completed"
     assert SUBAGENT_STREAM_KIND == "subagent"

@@ -3,10 +3,10 @@
 
 这里只放两样东西：
 
-    event.py      事件的**词汇**：RunEventType（运行 / 消息 / 工具 / 任务）、
-                  RunEvent（一条事件）、stream_key（键怎么拼），
-                  以及两个集合：TERMINAL_EVENT_TYPES（运行终止）
-                  与 STREAM_CLOSING_EVENT_TYPES（订阅该收尾，含暂停）
+    event.py      stream_key（键怎么拼），以及两个集合：
+                  TERMINAL_EVENT_TYPES（运行终止）与
+                  STREAM_CLOSING_EVENT_TYPES（订阅该收尾，含暂停）。
+                  事件的**统一词表与信封**在 spec.py（`EventType` / `Event`）。
     publisher.py  发布端的**抽象接口**（EventPublisher 协议）
 
 具体实现不在这里 —— 见 `app/agent/event`（Redis Stream 的发布端、
@@ -15,15 +15,14 @@
 
 调用方从**包**导入，不钻到叶子模块：
 
-    from app.common.event import RunEvent, RunEventType   ✓
-    from app.common.event.event import RunEvent           ✗
+    from app.common.event import Event, EventType      ✓
+    from app.common.event.event import EventType       ✗
 """
 
 __all__ = [
+    "Event",
     "EventPublisher",
     "EventType",
-    "RunEvent",
-    "RunEventType",
     "STREAM_CLOSING_EVENT_TYPES",
     "SUBAGENT_STREAM_KIND",
     "TASK_STREAM_KIND",
@@ -34,7 +33,6 @@ __all__ = [
     "TERMINAL_EVENT_TYPES",
     "TraceEmitter",
     "TraceError",
-    "TraceEvent",
     "TraceSpan",
     "stream_key",
     "trace_stream_key",
@@ -46,18 +44,15 @@ from .event import (
     TASK_STREAM_KIND,
     TERMINAL_EVENT_TYPES,
     TOOL_STREAM_KIND,
-    RunEvent,
-    RunEventType,
     stream_key,
 )
+from .spec import Event, EventType
 from .publisher import EventPublisher
 from .trace import (
-    EventType,
     SpanKind,
     SpanLink,
     SpanStatus,
     TraceError,
-    TraceEvent,
     trace_stream_key,
 )
 from .trace_emitter import TraceEmitter, TraceSpan

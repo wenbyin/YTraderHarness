@@ -84,10 +84,12 @@ from app.agent.event import (
     RunStreamAttachment,
     TooManyRunStreamsError,
     get_run_stream_registry,
-    publish_trace_event,
+    emit_event,
     sse_frame,
 )
-from app.common.event import EventType, SpanKind
+from app.common.event import SpanKind
+from app.common.event.spec import Event as CanonicalEvent
+from app.common.event.spec import EventType as CanonicalEventType
 from app.agent.tools.processor.context import build_caller_context
 from app.common.auth import AuthenticatedUser, current_user
 from app.common.factories import get_service_factory
@@ -735,11 +737,11 @@ async def _frames(
                 # 有多个订阅者，服务端不知道哪个才是"客户端"。
                 if await request.is_disconnected():
                     if run_id is not None:
-                        await publish_trace_event(
-                            EventType.RUN_CLIENT_DISCONNECTED,
-                            trace_id=trace_id,
+                        await emit_event(CanonicalEvent(
+                            type=CanonicalEventType.RUN_CLIENT_DISCONNECTED,
                             run_id=str(run_id),
-                            thread_id=(
+                            trace_id=trace_id,
+                            session_id=(
                                 None
                                 if session_id is None
                                 else str(session_id)
@@ -747,10 +749,10 @@ async def _frames(
                             span_id=str(run_id),
                             span_kind=SpanKind.RUN,
                             span_name="run",
-                            payload={
+                            data={
                                 "disconnect_reason": "sse_client_gone"
                             },
-                        )
+                        ))
                     return
 
                 yield HEARTBEAT

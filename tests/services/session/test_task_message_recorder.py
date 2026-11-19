@@ -44,7 +44,7 @@ def _task_result() -> AIMessage:
 def test_task_instruction_human_is_not_filtered() -> None:
     user = HumanMessage("用户消息", id="u1")
 
-    kept = new_assistant_messages(0, [user, _task_instruction()])
+    kept = new_assistant_messages(set(), [user, _task_instruction()])
 
     assert [message.id for message in kept] == [
         "task:plan-1:t1:instruction",
